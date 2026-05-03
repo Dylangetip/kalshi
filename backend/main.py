@@ -31,6 +31,8 @@ except ImportError:  # pragma: no cover
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 
@@ -592,3 +594,18 @@ async def get_city_state(code: str):
     async with httpx.AsyncClient() as client:
         state = await _build_state_cached(city, client)
     return state or {"error": "no upstream data"}
+
+
+# ── Static file serving ─────────────────────────────────────────────────────
+# Serve the prototype (Bets.html, styles.css, *.jsx) directly from the same
+# FastAPI process so a single uvicorn invocation runs the whole stack.
+# Mounted last so /api/* routes above take priority.
+REPO_ROOT = Path(__file__).parent.parent
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/Bets.html")
+
+
+app.mount("/", StaticFiles(directory=str(REPO_ROOT), html=False), name="static")

@@ -244,10 +244,14 @@ const buildOpenPositions = () => {
 };
 
 // ====== BACKEND BRIDGE ======
-// Frontend tries to fetch real data from the FastAPI backend (default
-// http://localhost:8000). On failure we silently keep using the synthetic
-// state above, so the prototype remains playable offline.
-const API_BASE = window.__BETS_API__ || 'http://localhost:8000';
+// Frontend tries to fetch real data from the FastAPI backend. Defaults to
+// a relative URL ('') so it Just Works when the page is served by the
+// same FastAPI process (which mounts the static files). Override via
+// window.__BETS_API__ = 'http://other:port' if you split frontend and
+// backend across different origins.
+// On any fetch failure we silently keep using the synthetic state, so
+// the prototype remains playable offline.
+const API_BASE = window.__BETS_API__ != null ? window.__BETS_API__ : '';
 
 async function fetchLiveState() {
   try {
