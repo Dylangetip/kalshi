@@ -102,3 +102,45 @@ def kelly_fraction(edge: float, kalshi_pct: float, fraction: float = 0.25, cap: 
     denom = max(0.01, kalshi_pct * (1 - kalshi_pct))
     raw = (edge / denom) * fraction
     return max(0.0, min(cap, raw))
+
+
+import re as _re
+
+
+def parse_climate_max_yesterday(text: Optional[str]) -> Optional[int]:
+    """Extract YESTERDAY's MAX temperature (°F) from a CLI bulletin.
+
+    CLI bodies always have a "TEMPERATURE (F)" block whose YESTERDAY column
+    contains MAXIMUM <int>. We anchor on the YESTERDAY header and grab the
+    next MAXIMUM line so we don't accidentally read TODAY's preliminary
+    high from afternoon issuances."""
+    if not text:
+        return None
+    m = _re.search(
+        r"YESTERDAY[\s\S]{0,800}?^\s*MAXIMUM\s+(-?\d{1,3})\b",
+        text,
+        _re.MULTILINE,
+    )
+    if m:
+        return int(m.group(1))
+    # Fallback: first MAXIMUM in the body — accepted only if there's no
+    # YESTERDAY anchor at all (some short CLIs).
+    if "YESTERDAY" not in text:
+        m2 = _re.search(r"^\s*MAXIMUM\s+(-?\d{1,3})\b", text, _re.MULTILINE)
+        if m2:
+            return int(m2.group(1))
+    return None
+
+
+def settle_pl(side: str, entry_cents: int, size: int, in_bracket: bool) -> float:
+    """Realized P/L using the prototype's mark-to-market formula at the
+    settlement boundary. `in_bracket` is whether the actual high fell in
+    [lo, hi] — that's the YES outcome regardless of which side was bet.
+    YES bets profit when in_bracket; NO bets profit when not — the sign
+    flip handles both. Matches the (current - entry) × size × sign × 100
+    formula used by /api/positions and the offline tick, so settlement
+    is just the same formula evaluated at the terminal price (1 or 0)."""
+    entry = entry_cents / 100.0
+    sign = 1 if side == "YES" else -1
+    yes_outcome = 1.0 if in_bracket else 0.0
+    return (yes_outcome - entry) * size * sign * 100

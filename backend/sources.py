@@ -122,6 +122,26 @@ async def fetch_afd(client: httpx.AsyncClient, office: str) -> Optional[str]:
         return None
 
 
+async def fetch_climate_report(client: httpx.AsyncClient, office: str) -> Optional[str]:
+    """Latest NWS Daily Climate Report (CLI) text for an office. CLI is
+    issued multiple times per day; the morning bulletin includes finalized
+    YESTERDAY data which we use for bet settlement."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/ld+json"}
+    try:
+        list_url = f"{NWS_API}/products/types/CLI/locations/{office}"
+        r = await client.get(list_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        graph = r.json().get("@graph") or []
+        if not graph:
+            return None
+        latest_id = graph[0]["id"]
+        r2 = await client.get(f"{NWS_API}/products/{latest_id}", headers=headers, timeout=15)
+        r2.raise_for_status()
+        return r2.json().get("productText")
+    except Exception:
+        return None
+
+
 async def fetch_nws_forecast_max(client: httpx.AsyncClient, lat: float, lon: float) -> Optional[float]:
     """Official NWS forecast max temp for tomorrow, in Fahrenheit. Two-step lookup via /points."""
     headers = {"User-Agent": USER_AGENT}

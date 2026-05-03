@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS bets (
     size          INTEGER NOT NULL,
     entry_cents   INTEGER NOT NULL,
     status        TEXT    NOT NULL DEFAULT 'open',
-    settled_pl    REAL
+    settled_pl    REAL,
+    target_date   TEXT,
+    settled_at    INTEGER,
+    settled_max_f INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);
 CREATE INDEX IF NOT EXISTS idx_bets_placed_at ON bets(placed_at DESC);
@@ -76,6 +79,15 @@ def init() -> None:
         if _conn is None:
             _conn = _connect()
             _conn.executescript(SCHEMA)
+            # Migrate older databases that pre-date the settlement columns.
+            cols = {r["name"] for r in _conn.execute("PRAGMA table_info(bets)").fetchall()}
+            for col, ddl in (
+                ("target_date",   "ALTER TABLE bets ADD COLUMN target_date TEXT"),
+                ("settled_at",    "ALTER TABLE bets ADD COLUMN settled_at INTEGER"),
+                ("settled_max_f", "ALTER TABLE bets ADD COLUMN settled_max_f INTEGER"),
+            ):
+                if col not in cols:
+                    _conn.execute(ddl)
             _conn.commit()
 
 
@@ -94,20 +106,49 @@ def insert_bet(
     side: str,
     size: int,
     entry_cents: int,
+    target_date: Optional[str] = None,
 ) -> Dict:
     c = _conn_or_init()
     with _lock:
         cur = c.execute(
             """INSERT INTO bets (
                 placed_at, city, bracket_label, bracket_lo, bracket_hi,
-                side, size, entry_cents
-            ) VALUES (?,?,?,?,?,?,?,?)""",
+                side, size, entry_cents, target_date
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
             (int(time.time() * 1000), city, bracket_label, bracket_lo, bracket_hi,
-             side, size, entry_cents),
+             side, size, entry_cents, target_date),
         )
         c.commit()
         row = c.execute("SELECT * FROM bets WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
+
+
+def list_settleable_bets(today_iso: str) -> List[Dict]:
+    """Open bets whose target_date is strictly before `today_iso` — i.e.,
+    whose settlement window has fully closed and the NWS climate report
+    should now be authoritative."""
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT * FROM bets WHERE status='open' AND target_date IS NOT NULL "
+        "AND target_date < ? ORDER BY placed_at ASC",
+        (today_iso,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def settle_bet(bet_id: int, settled_pl: float, settled_max_f: int) -> None:
+    """Mark a bet settled. Also writes a final position_mark at settled_at
+    so the equity timeline picks up the settlement-snap from the latest
+    Kalshi mark to the realized P/L."""
+    c = _conn_or_init()
+    with _lock:
+        ts = int(time.time())
+        c.execute(
+            "UPDATE bets SET status='settled', settled_pl=?, settled_at=?, "
+            "settled_max_f=? WHERE id=?",
+            (settled_pl, ts, settled_max_f, bet_id),
+        )
+        c.commit()
 
 
 def list_bets(limit: int = 200) -> List[Dict]:
@@ -177,37 +218,98 @@ def insert_position_mark(bet_id: int, ts: int, current_yes_pct: float, pl: float
 
 
 def list_equity_points(hours: float = 72.0, starting_balance: float = 10000.0) -> List[Dict]:
-    """Per-tick equity curve: starting bankroll + sum of open-position P/L
-    at each snapshot timestamp. Output shape matches the prototype's
-    history rows (date, equity, pl, drawdown, trades) so PnLView's chart
-    components consume it without reshaping."""
+    """Per-tick equity curve. At each timestamp t, equity =
+        starting_balance
+        + realized_pl    (sum of settled_pl for bets where settled_at <= t)
+        + unrealized_pl  (sum of position_marks at t for bets that were
+                          still open at t).
+
+    Tick set is the union of position_marks timestamps and settled_at
+    timestamps so the curve includes settlement-jump events even when
+    they happen between snapshot ticks. Output rows match the prototype's
+    history shape so PnLView consumes them unchanged."""
     cutoff = int(time.time() - hours * 3600)
     c = _conn_or_init()
-    rows = c.execute(
-        "SELECT ts, SUM(pl) AS total_pl, COUNT(*) AS marks "
-        "FROM position_marks WHERE ts >= ? GROUP BY ts ORDER BY ts ASC",
-        (cutoff,),
+
+    tick_rows = c.execute(
+        """SELECT DISTINCT ts FROM (
+              SELECT ts FROM position_marks WHERE ts >= ?
+              UNION
+              SELECT settled_at AS ts FROM bets
+                WHERE status='settled' AND settled_at IS NOT NULL AND settled_at >= ?
+           ) ORDER BY ts ASC""",
+        (cutoff, cutoff),
     ).fetchall()
+
+    # Settlement events: realized P/L wins / losses
+    settle_rows = c.execute(
+        "SELECT settled_at AS ts, settled_pl FROM bets "
+        "WHERE status='settled' AND settled_at IS NOT NULL "
+        "ORDER BY settled_at ASC"
+    ).fetchall()
+    settle_events = [(int(r["ts"]), float(r["settled_pl"])) for r in settle_rows]
+
     out: List[Dict] = []
     peak = starting_balance
     prev_total = 0.0
-    for r in rows:
-        total_pl = float(r["total_pl"] or 0.0)
+    for r in tick_rows:
+        ts = int(r["ts"])
+
+        realized = sum(pl for at, pl in settle_events if at <= ts)
+        # Unrealized: marks at this exact ts for bets that hadn't settled by ts
+        unreal_row = c.execute(
+            """SELECT COALESCE(SUM(pm.pl), 0.0) AS unreal,
+                      COUNT(*)               AS marks
+                 FROM position_marks pm
+                 JOIN bets b ON b.id = pm.bet_id
+                WHERE pm.ts = ?
+                  AND (b.status = 'open'
+                       OR (b.status = 'settled' AND b.settled_at > ?))""",
+            (ts, ts),
+        ).fetchone()
+        unrealized = float(unreal_row["unreal"])
+        marks = int(unreal_row["marks"])
+
+        total_pl = realized + unrealized
         eq = starting_balance + total_pl
         if eq > peak:
             peak = eq
         out.append({
-            "ts": r["ts"],
-            "date": time.strftime("%H:%M", time.localtime(r["ts"])),
+            "ts": ts,
+            "date": time.strftime("%H:%M", time.localtime(ts)),
             "equity": round(eq, 2),
             "pl": round(total_pl - prev_total, 2),
             "cumulative_pl": round(total_pl, 2),
+            "realized_pl": round(realized, 2),
+            "unrealized_pl": round(unrealized, 2),
             "drawdown": round(eq - peak, 2),
-            "trades": int(r["marks"]),
-            "winRate": 0.5,  # placeholder until settlement is wired
+            "trades": marks,
+            "winRate": 0.5,
         })
         prev_total = total_pl
     return out
+
+
+def stats_summary() -> Dict:
+    """Realized win-rate and bet counts. Cheap to compute, exposed at
+    /api/stats for the P&L view to swap in real win-rate."""
+    c = _conn_or_init()
+    row = c.execute(
+        """SELECT
+              COUNT(*) FILTER (WHERE status='settled')                       AS settled,
+              COUNT(*) FILTER (WHERE status='settled' AND settled_pl > 0)    AS won,
+              COUNT(*) FILTER (WHERE status='open')                          AS open,
+              COALESCE(SUM(settled_pl) FILTER (WHERE status='settled'), 0.0) AS realized_pl
+           FROM bets"""
+    ).fetchone()
+    settled = int(row["settled"])
+    return {
+        "settled": settled,
+        "won": int(row["won"]),
+        "open": int(row["open"]),
+        "winRate": (float(row["won"]) / settled) if settled else None,
+        "realizedPl": round(float(row["realized_pl"]), 2),
+    }
 
 
 def list_snapshots(city: str, hours: float = 24.0, limit: int = 500) -> List[Dict]:

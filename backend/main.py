@@ -19,7 +19,13 @@ mock data.
 import asyncio
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment]
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -28,10 +34,42 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .cities import CITIES
+from .model import parse_climate_max_yesterday, settle_pl
+from .sources import fetch_climate_report
+
+CITY_TZ = {
+    "ET": "America/New_York",
+    "CT": "America/Chicago",
+    "MT": "America/Denver",
+    "PT": "America/Los_Angeles",
+}
+
+
+def _city_today(city_tz: str, when: Optional[datetime] = None) -> str:
+    """City's current local date as YYYY-MM-DD."""
+    when = when or datetime.now(timezone.utc)
+    tzname = CITY_TZ.get(city_tz)
+    if ZoneInfo is None or tzname is None:
+        return when.date().isoformat()
+    return when.astimezone(ZoneInfo(tzname)).date().isoformat()
+
+
+def _city_target_date(city: Dict, when: Optional[datetime] = None) -> str:
+    """The date a bet placed now should settle against = city's local
+    tomorrow. Daily-max brackets are for the next day's settlement."""
+    when = when or datetime.now(timezone.utc)
+    tzname = CITY_TZ.get(city["tz"])
+    if ZoneInfo is None or tzname is None:
+        return (when + timedelta(days=1)).date().isoformat()
+    local = when.astimezone(ZoneInfo(tzname))
+    return (local + timedelta(days=1)).date().isoformat()
 
 SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("BETS_SNAPSHOT_INTERVAL", "300"))  # 5 min default
 SNAPSHOT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SNAPSHOT_LOOP") == "1"
+SETTLEMENT_INTERVAL_SECONDS = int(os.getenv("BETS_SETTLEMENT_INTERVAL", "3600"))  # 1 hour default
+SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 _snapshot_task: Optional[asyncio.Task] = None
+_settlement_task: Optional[asyncio.Task] = None
 from .model import (
     best_bracket,
     compute_ladder,
@@ -251,21 +289,25 @@ async def _snapshot_loop() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
-    global _snapshot_task
+    global _snapshot_task, _settlement_task
     if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
+    if not SETTLEMENT_LOOP_DISABLED and _settlement_task is None:
+        _settlement_task = asyncio.create_task(_settlement_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global _snapshot_task
-    if _snapshot_task is not None:
-        _snapshot_task.cancel()
-        try:
-            await _snapshot_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        _snapshot_task = None
+    global _snapshot_task, _settlement_task
+    for name in ("_snapshot_task", "_settlement_task"):
+        task = globals().get(name)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            globals()[name] = None
 
 
 class PlaceBetIn(BaseModel):
@@ -293,6 +335,10 @@ def _bet_row_to_log(b: Dict) -> Dict:
         "side": b["side"],
         "size": b["size"],
         "entry": b["entry_cents"] if b["side"] == "YES" else 100 - b["entry_cents"],
+        "status": b.get("status", "open"),
+        "settledPl": b.get("settled_pl"),
+        "targetDate": b.get("target_date"),
+        "settledMaxF": b.get("settled_max_f"),
     }
 
 
@@ -328,14 +374,18 @@ async def health():
 
 @app.post("/api/bets")
 def place_bet(b: PlaceBetIn):
+    city_code = b.city.upper()
+    city = next((c for c in CITIES if c["code"] == city_code), None)
+    target_date = _city_target_date(city) if city else None
     row = db.insert_bet(
-        city=b.city.upper(),
+        city=city_code,
         bracket_label=b.bracket_label,
         bracket_lo=b.bracket_lo,
         bracket_hi=b.bracket_hi,
         side=b.side,
         size=b.size,
         entry_cents=b.entry_cents,
+        target_date=target_date,
     )
     return _bet_row_to_log(row)
 
@@ -343,6 +393,78 @@ def place_bet(b: PlaceBetIn):
 @app.get("/api/bets")
 def get_bets(limit: int = 200):
     return [_bet_row_to_log(b) for b in db.list_bets(limit)]
+
+
+async def _settle_open_bets(client: httpx.AsyncClient) -> List[Dict]:
+    """Settle every open bet whose city-local target_date has passed.
+
+    Strategy: bucket settleable bets by city, fetch each office's CLI
+    once, parse the YESTERDAY MAX, then apply realized P/L per bet.
+    Bets whose target_date doesn't match the CLI's coverage day are
+    deferred to a later run."""
+    settled: List[Dict] = []
+    by_city: Dict[str, List[Dict]] = {}
+    for c in CITIES:
+        today = _city_today(c["tz"])
+        for bet in db.list_settleable_bets(today):
+            if bet["city"] == c["code"]:
+                by_city.setdefault(c["code"], []).append(bet)
+
+    for city in CITIES:
+        bets = by_city.get(city["code"], [])
+        if not bets:
+            continue
+        text = await fetch_climate_report(client, city["office"])
+        actual_max = parse_climate_max_yesterday(text)
+        if actual_max is None:
+            continue  # CLI not yet posted, try again next loop iteration
+        # CLI's YESTERDAY column is for the city-local previous day.
+        cli_covers = (
+            datetime.fromisoformat(_city_today(city["tz"])) - timedelta(days=1)
+        ).date().isoformat()
+        for bet in bets:
+            if bet["target_date"] != cli_covers:
+                continue  # CLI is for a different day than this bet
+            in_bracket = bet["bracket_lo"] <= actual_max <= bet["bracket_hi"]
+            pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
+            db.settle_bet(bet["id"], pl, actual_max)
+            settled.append({
+                "id": bet["id"],
+                "city": bet["city"],
+                "bracket": bet["bracket_label"],
+                "side": bet["side"],
+                "actual_max_f": actual_max,
+                "in_bracket": in_bracket,
+                "pl": round(pl, 2),
+            })
+    return settled
+
+
+async def _settlement_loop() -> None:
+    """Background settlement: fires hourly, idempotent. CLI bulletins for a
+    given day are typically out by mid-morning local time, so an hourly
+    cadence catches them within an hour of availability."""
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                await _settle_open_bets(client)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bets] settlement loop error: {exc}")
+        await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
+
+
+@app.post("/api/settle")
+async def settle_now():
+    """Manual trigger for the settlement job. Useful for testing and for
+    forcing a check after the morning CLI is known to have posted."""
+    async with httpx.AsyncClient() as client:
+        results = await _settle_open_bets(client)
+    return {"settled": results, "count": len(results)}
+
+
+@app.get("/api/stats")
+def get_stats():
+    return db.stats_summary()
 
 
 @app.get("/api/equity")
