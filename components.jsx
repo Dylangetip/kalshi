@@ -12,6 +12,21 @@ const ago = (ts) => {
   return Math.floor(m / 60) + 'h';
 };
 
+// Time until ts in the future. Returns "5h 23m", "2d 4h", "now", or
+// "closed" if past. Used for bet close-time countdown.
+const until = (iso) => {
+  if (!iso) return '—';
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 0) return 'closed';
+  const totalMin = Math.floor(ms / 60000);
+  if (totalMin < 60) return totalMin + 'm';
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h < 24) return `${h}h ${m}m`;
+  const d = Math.floor(h / 24);
+  return `${d}d ${h % 24}h`;
+};
+
 // Tiny sparkline
 function Sparkline({ data, width = 80, height = 22, stroke = 'currentColor', fill = false }) {
   if (!data || data.length < 2) return null;
@@ -307,5 +322,5 @@ function DistChart({ ladder, height = 140 }) {
 Object.assign(window, {
   Sparkline, Pill, Dot, FreshBars, BracketLadder, EdgePanel, AFDView, ConfMeter,
   EquityChart, PLBars, DistChart,
-  fmt, fmtSign, fmtPct, fmtUSD, ago,
+  fmt, fmtSign, fmtPct, fmtUSD, ago, until,
 });

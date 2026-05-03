@@ -309,6 +309,7 @@ function TerminalView({ state, onPlaceBet, betLog }) {
               {betLog.map((b, i) => {
                 const settled = b.status === 'settled' && b.settledPl != null;
                 const won = settled && b.settledPl > 0;
+                const closesIn = settled ? null : until(b.closeAt);
                 return (
                   <div key={i} style={{ display: 'grid', gridTemplateColumns: '60px 50px 1fr 60px 80px', padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, fontFamily: 'var(--mono)', opacity: settled ? 0.85 : 1 }}>
                     <span style={{ color: 'var(--fg-3)' }}>{b.time}</span>
@@ -318,6 +319,11 @@ function TerminalView({ state, onPlaceBet, betLog }) {
                       {settled && (
                         <span className={won ? 'pos' : 'neg'} style={{ marginLeft: 6, fontSize: 9, fontWeight: 600 }}>
                           · {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
+                        </span>
+                      )}
+                      {closesIn && (
+                        <span style={{ marginLeft: 6, fontSize: 9, color: 'var(--fg-3)' }}>
+                          · closes {closesIn}
                         </span>
                       )}
                     </span>
@@ -736,58 +742,46 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
 
       <div className="panel">
         <div className="panel-header">
-          <span>Configuration</span>
+          <span>Set total, flip on</span>
           <span className="panel-title-actions">
-            takes effect on next loop tick
+            picks the single highest-edge bracket each tick
           </span>
         </div>
-        <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr) auto', gap: 14, alignItems: 'end' }}>
+        <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 14, alignItems: 'end' }}>
           <div>
-            <div className="label" style={{ marginBottom: 6 }}>Enabled</div>
-            <button
-              className={`btn ${enabled ? 'success' : 'ghost'}`}
-              onClick={() => apply({ enabled: !enabled })}
-              disabled={busy}
-              style={{ width: '100%' }}>
-              {enabled ? 'TURN OFF' : 'TURN ON'}
-            </button>
-          </div>
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>Min edge (¢)</div>
-            <input type="number" value={minEdge} min={0} max={100}
-              onChange={(e) => setDraft(d => ({ ...d, min_edge_cents: +e.target.value }))}
-              style={{ width: '100%' }} />
-          </div>
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>Bankroll ($)</div>
+            <div className="label" style={{ marginBottom: 6 }}>
+              Bankroll ($) — max per bet auto-set to 5% (¼-Kelly cap)
+            </div>
             <input type="number" value={bankroll} min={100} step={100}
               onChange={(e) => setDraft(d => ({ ...d, bankroll: +e.target.value }))}
-              style={{ width: '100%' }} />
+              style={{ width: '100%', fontSize: 16 }} />
           </div>
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>Max / bet ($)</div>
-            <input type="number" value={maxUsd} min={1}
-              onChange={(e) => setDraft(d => ({ ...d, max_usd: +e.target.value }))}
-              style={{ width: '100%' }} />
-          </div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button className="btn primary" disabled={busy || Object.keys(draft).length === 0}
-              onClick={() => apply(draft)}>
-              Apply
-            </button>
-            <button className="btn success" disabled={busy} onClick={trigger}>
-              {busy ? 'running…' : 'Trigger Now'}
-            </button>
-          </div>
+          <button
+            className={`btn ${enabled ? 'danger' : 'success'}`}
+            onClick={() => apply({ ...draft, enabled: !enabled })}
+            disabled={busy}
+            style={{ minWidth: 120, fontSize: 13 }}>
+            {enabled ? 'TURN OFF' : 'TURN ON'}
+          </button>
+          <button className="btn primary" disabled={busy} onClick={trigger}
+            style={{ minWidth: 120 }}>
+            {busy ? 'running…' : 'Trigger Now'}
+          </button>
+        </div>
+        <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
+          edge threshold {minEdge}¢ · max-per-bet ${maxUsd.toFixed(0)} · {enabled ? `next tick in ≤${Math.round((cfg.interval_seconds || 3600)/60)}m` : 'loop idle'}
         </div>
         {lastRunResult && (
           <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-2)' }}>
-            <span className="mono">last trigger: placed {lastRunResult.count} bet{lastRunResult.count === 1 ? '' : 's'}</span>
+            <span className="mono">
+              last trigger: {lastRunResult.count > 0 ? 'placed 1 bet' : 'no eligible candidate'}
+              {lastRunResult.last_run_considered > 0 && ` (considered ${lastRunResult.last_run_considered})`}
+            </span>
             {lastRunResult.placed && lastRunResult.placed.length > 0 && (
               <div style={{ marginTop: 6 }}>
                 {lastRunResult.placed.map((p, i) => (
                   <div key={i} className="mono" style={{ fontSize: 11 }}>
-                    <span className="pos">+</span> {p.city} {p.bracket} ${p.size_usd} @ {p.entry_cents}¢
+                    <span className="pos">★</span> {p.city} {p.bracket} ${p.size_usd} @ {p.entry_cents}¢
                     <span className="pos" style={{ marginLeft: 8 }}>edge +{p.edge_cents}¢</span>
                   </div>
                 ))}
@@ -814,6 +808,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
               <tr>
                 <th>Time</th><th>City</th><th>Bracket</th><th>Side</th>
                 <th className="num-r">Size</th><th className="num-r">Entry</th>
+                <th className="num-r">Closes in</th>
                 <th>Status</th><th className="num-r">Settled P/L</th>
               </tr>
             </thead>
@@ -821,6 +816,9 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
               {recent.map(b => {
                 const settled = b.status === 'settled' && b.settledPl != null;
                 const won = settled && b.settledPl > 0;
+                const closesIn = settled ? '—' : until(b.closeAt);
+                const isClosingSoon = !settled && b.closeAt &&
+                  (new Date(b.closeAt).getTime() - Date.now()) < 3 * 3600 * 1000;
                 return (
                   <tr key={b.id}>
                     <td>{b.time}</td>
@@ -829,6 +827,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
                     <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
                     <td className="num-r">${b.size}</td>
                     <td className="num-r">{b.entry}¢</td>
+                    <td className={`num-r ${isClosingSoon ? 'warn' : ''}`}>{closesIn}</td>
                     <td>
                       {settled ? (
                         <Pill kind={won ? 'pos' : 'neg'}>

@@ -101,10 +101,15 @@ _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
     "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5")),
     "bankroll": float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")),
-    "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD", "500")),
+    # Default max-per-bet = 5% of bankroll (¼-Kelly cap). Recomputed
+    # automatically when bankroll changes via /api/auto-trade/config
+    # unless the user explicitly sets max_usd in the same request.
+    "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD",
+                               str(float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")) * 0.05))),
     "min_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50")),
-    "last_run_ts": None,    # unix seconds of last tick that actually ran
-    "last_run_placed": 0,   # bets placed on the last tick
+    "last_run_ts": None,
+    "last_run_placed": 0,
+    "last_run_considered": 0,
     "total_runs": 0,
     "total_placed": 0,
 }
@@ -426,11 +431,15 @@ def auto_trade_info():
 @app.post("/api/auto-trade/config")
 def auto_trade_config(c: AutoTradeConfigIn):
     """Update auto-trader config at runtime — takes effect on the next
-    loop tick (no restart needed). Returns the updated state."""
+    loop tick (no restart needed). When bankroll is changed without an
+    explicit max_usd in the same request, max_usd is auto-recomputed
+    as 5% of bankroll (¼-Kelly cap)."""
     for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
+    if c.bankroll is not None and c.max_usd is None:
+        _auto_trade_state["max_usd"] = round(_auto_trade_state["bankroll"] * 0.05, 2)
     return {**_auto_trade_state, "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS}
 
 
@@ -458,6 +467,28 @@ class PlaceBetIn(BaseModel):
     entry_cents: int = Field(ge=0, le=100)
 
 
+def _close_at_for_bet(b: Dict) -> Optional[str]:
+    """Kalshi market close = end-of-day on target_date in city local tz
+    (e.g. NYC 2026-05-04 → 2026-05-04T23:59-04:00). Frontend renders
+    countdown / formatted local from this ISO string."""
+    target = b.get("target_date")
+    if not target:
+        return None
+    city = next((c for c in CITIES if c["code"] == b.get("city")), None)
+    if not city:
+        return None
+    tzname = CITY_TZ.get(city["tz"])
+    try:
+        d = datetime.fromisoformat(target)
+        if ZoneInfo and tzname:
+            d = d.replace(hour=23, minute=59, second=0, tzinfo=ZoneInfo(tzname))
+        else:
+            d = d.replace(hour=23, minute=59, second=0, tzinfo=timezone.utc)
+        return d.isoformat()
+    except ValueError:
+        return None
+
+
 def _bet_row_to_log(b: Dict) -> Dict:
     """Shape used by the Terminal "Your bet log" panel."""
     placed = time.strftime("%H:%M:%S", time.localtime(b["placed_at"] / 1000))
@@ -476,6 +507,7 @@ def _bet_row_to_log(b: Dict) -> Dict:
         "status": b.get("status", "open"),
         "settledPl": b.get("settled_pl"),
         "targetDate": b.get("target_date"),
+        "closeAt": _close_at_for_bet(b),
         "settledMaxF": b.get("settled_max_f"),
     }
 
@@ -592,12 +624,14 @@ async def _settlement_loop() -> None:
 
 
 async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
-    """One iteration of the auto-trader. Reads thresholds + bankroll from
-    the runtime _auto_trade_state dict so UI toggles take effect on the
-    next tick. Idempotent across ticks AND server restarts via
-    list_bets_for_target. Returns the bets placed this tick."""
+    """One iteration of the auto-trader. Picks the SINGLE highest-edge
+    eligible bracket across all 5 cities and places a ¼-Kelly YES bet
+    on it. With a 1h interval that's ~5 bets per day spread across the
+    morning (one per city's daily event), then idle until tomorrow's
+    events open. Idempotent across ticks AND restarts via
+    list_bets_for_target."""
     cfg = _auto_trade_state
-    placed: List[Dict] = []
+    candidates: List[tuple] = []
     for city in CITIES:
         try:
             state = await _build_state_cached(city, client)
@@ -611,37 +645,50 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
             existing = db.list_bets_for_target(city["code"], target)
             if any(b["bracket_label"] == best["label"] for b in existing):
                 continue
-            kelly = state.get("kellyPct") or 0
-            size = max(cfg["min_usd"], round(kelly * cfg["bankroll"]))
-            size = int(min(cfg["max_usd"], size))
-            if size < cfg["min_usd"]:
-                continue
-            row = db.insert_bet(
-                city=city["code"],
-                bracket_label=best["label"],
-                bracket_lo=best["lo"],
-                bracket_hi=best["hi"],
-                side="YES",
-                size=size,
-                entry_cents=int(best.get("yesPrice", 0)),
-                target_date=target,
-            )
-            placed.append({
-                "id": row["id"],
-                "city": city["code"],
-                "bracket": best["label"],
-                "edge_cents": edge_cents,
-                "size_usd": size,
-                "entry_cents": row["entry_cents"],
-                "target_date": target,
-                "ts": int(time.time()),
-            })
-            print(f"[auto-trader] placed YES on {city['code']} {best['label']} "
-                  f"size=${size} entry={row['entry_cents']}¢ edge=+{edge_cents}¢")
+            candidates.append((edge_cents, city, state, best, target))
         except Exception as exc:  # noqa: BLE001
-            print(f"[auto-trader] error on {city['code']}: {exc}")
+            print(f"[auto-trader] probe error on {city['code']}: {exc}")
+
+    placed: List[Dict] = []
+    if candidates:
+        # Highest edge wins. Ties broken by city order (stable from CITIES list).
+        candidates.sort(key=lambda c: -c[0])
+        edge_cents, city, state, best, target = candidates[0]
+        kelly = state.get("kellyPct") or 0
+        size = max(cfg["min_usd"], round(kelly * cfg["bankroll"]))
+        size = int(min(cfg["max_usd"], size))
+        if size >= cfg["min_usd"]:
+            try:
+                row = db.insert_bet(
+                    city=city["code"],
+                    bracket_label=best["label"],
+                    bracket_lo=best["lo"],
+                    bracket_hi=best["hi"],
+                    side="YES",
+                    size=size,
+                    entry_cents=int(best.get("yesPrice", 0)),
+                    target_date=target,
+                )
+                placed.append({
+                    "id": row["id"],
+                    "city": city["code"],
+                    "bracket": best["label"],
+                    "edge_cents": edge_cents,
+                    "size_usd": size,
+                    "entry_cents": row["entry_cents"],
+                    "target_date": target,
+                    "ts": int(time.time()),
+                    "considered": len(candidates),
+                })
+                print(f"[auto-trader] picked {city['code']} {best['label']} "
+                      f"(+{edge_cents}¢ edge, beat {len(candidates)-1} others) — "
+                      f"size=${size} entry={row['entry_cents']}¢")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[auto-trader] insert error: {exc}")
+
     cfg["last_run_ts"] = int(time.time())
     cfg["last_run_placed"] = len(placed)
+    cfg["last_run_considered"] = len(candidates)
     cfg["total_runs"] += 1
     cfg["total_placed"] += len(placed)
     return placed
