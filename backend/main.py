@@ -20,6 +20,7 @@ import asyncio
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 
 try:
@@ -32,7 +33,28 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import db
+
+def _load_dotenv(path: Path) -> None:
+    """Tiny stdlib KEY=value loader — no python-dotenv dep needed.
+    Ignores blank lines and lines starting with `#`. Strips surrounding
+    quotes if present. Existing process env wins (so explicit exports
+    override the file)."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(Path(__file__).parent / ".env")
+
+from . import db, kalshi
 from .cities import CITIES
 from .model import parse_climate_max_yesterday, settle_pl
 from .sources import fetch_climate_report
@@ -471,6 +493,35 @@ async def settle_now():
 @app.get("/api/stats")
 def get_stats():
     return db.stats_summary()
+
+
+@app.get("/api/kalshi/info")
+def kalshi_info():
+    """Non-secret view of current Kalshi auth state. Useful as a sanity
+    check after editing backend/.env — reports whether creds are present
+    and whether we currently hold a token."""
+    return kalshi.info()
+
+
+@app.get("/api/kalshi/test")
+async def kalshi_test():
+    """Force a fresh login against Kalshi and report the result. Use
+    this to verify your creds work without restarting the server."""
+    async with httpx.AsyncClient() as client:
+        return await kalshi.login_test(client)
+
+
+@app.get("/api/kalshi/markets/{event_ticker}")
+async def kalshi_event_markets(event_ticker: str):
+    """List markets under a Kalshi event ticker. Useful for discovering
+    the bracket-market schema before wiring real prices into the ladder."""
+    if not kalshi.configured():
+        raise HTTPException(503, "Kalshi not configured (see backend/.env.example)")
+    async with httpx.AsyncClient() as client:
+        markets = await kalshi.fetch_markets(client, event_ticker)
+    if markets is None:
+        raise HTTPException(502, "Kalshi fetch failed")
+    return {"event_ticker": event_ticker, "count": len(markets), "markets": markets}
 
 
 @app.get("/api/equity")
