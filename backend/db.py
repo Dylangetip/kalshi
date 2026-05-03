@@ -59,6 +59,50 @@ CREATE TABLE IF NOT EXISTS position_marks (
     PRIMARY KEY (bet_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_marks_ts ON position_marks(ts);
+
+CREATE TABLE IF NOT EXISTS feature_snapshots (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 INTEGER NOT NULL,
+    city               TEXT    NOT NULL,
+    target_date        TEXT,                -- ISO date the prediction is for
+    -- Ensemble inputs (Fahrenheit unless noted)
+    gfs_mos_max        REAL,
+    nam_mos_max        REAL,
+    nws_forecast_max   REAL,
+    ecmwf_max          REAL,
+    om_max             REAL,
+    -- What we actually used
+    model_max          REAL    NOT NULL,
+    sigma_used         REAL,
+    obs_now            REAL,
+    -- Upper air (Celsius for pressure-level temps)
+    t850_c             REAL,
+    t700_c             REAL,
+    t500_c             REAL,
+    h500_m             INTEGER,
+    lapse_c_per_km     REAL,
+    rh850_pct          INTEGER,
+    -- Sounding observed
+    sounding_t850_obs  REAL,
+    sounding_t850_delta REAL,
+    -- AFD-derived
+    afd_conf_score     INTEGER,
+    afd_above_normal   INTEGER,
+    afd_sea_breeze     INTEGER,
+    afd_marine_layer   INTEGER,
+    afd_smoke          INTEGER,
+    afd_overcast       INTEGER,
+    afd_offshore       INTEGER,
+    -- Recommended bracket at this snapshot
+    rec_bracket_label  TEXT,
+    rec_bracket_lo     INTEGER,
+    rec_bracket_hi     INTEGER,
+    rec_edge_cents     INTEGER,
+    rec_kalshi_pct     REAL,
+    rec_model_pct      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_feat_city_ts ON feature_snapshots(city, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_feat_target_date ON feature_snapshots(target_date);
 """
 
 _lock = threading.Lock()
@@ -174,6 +218,7 @@ def reset() -> None:
         c.execute("DELETE FROM bets")
         c.execute("DELETE FROM snapshots")
         c.execute("DELETE FROM position_marks")
+        c.execute("DELETE FROM feature_snapshots")
         c.commit()
 
 
@@ -288,6 +333,66 @@ def list_equity_points(hours: float = 72.0, starting_balance: float = 10000.0) -
         })
         prev_total = total_pl
     return out
+
+
+def insert_feature_snapshot(state: Dict, ts: Optional[int] = None) -> None:
+    """Persist the full input feature vector for a city snapshot. Joining
+    this against bets.settled_max_f by (city, target_date) yields a clean
+    (features → outcome) pair for offline ML training."""
+    if ts is None:
+        ts = int(time.time())
+    flags = state.get("flags") or {}
+    upper = state.get("upperAir") or {}
+    snd = state.get("sounding") or {}
+    rec = state.get("settlementBracket") or {}
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            """INSERT INTO feature_snapshots (
+                ts, city, target_date,
+                gfs_mos_max, nam_mos_max, nws_forecast_max, ecmwf_max, om_max,
+                model_max, sigma_used, obs_now,
+                t850_c, t700_c, t500_c, h500_m, lapse_c_per_km, rh850_pct,
+                sounding_t850_obs, sounding_t850_delta,
+                afd_conf_score, afd_above_normal,
+                afd_sea_breeze, afd_marine_layer, afd_smoke, afd_overcast, afd_offshore,
+                rec_bracket_label, rec_bracket_lo, rec_bracket_hi,
+                rec_edge_cents, rec_kalshi_pct, rec_model_pct
+            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?,?,?, ?,?,?)""",
+            (
+                ts, state["city"]["code"], state.get("targetDate"),
+                state.get("mosMax"), state.get("namMos"),
+                state.get("nwsForecast"), state.get("ecmwfMax"),
+                state.get("omMax"),
+                state.get("modelMax"), state.get("sigmaUsed"),
+                state.get("obsCurrent"),
+                upper.get("t850"), upper.get("t700"), upper.get("t500"),
+                upper.get("h500"), upper.get("lapse"), upper.get("rh850"),
+                snd.get("t850Obs"), snd.get("t850Delta"),
+                state.get("afdConfScore"),
+                int(bool(state.get("afdAboveNormal"))) if state.get("afdAboveNormal") is not None else None,
+                int(bool(flags.get("seaBreeze"))),
+                int(bool(flags.get("marineLayer"))),
+                int(bool(flags.get("smoke"))),
+                int(bool(flags.get("overcast"))),
+                int(bool(flags.get("offshore"))),
+                rec.get("label"), rec.get("lo"), rec.get("hi"),
+                int(round((rec.get("edge") or 0) * 100)),
+                rec.get("kalshiPct"), rec.get("modelPct"),
+            ),
+        )
+        c.commit()
+
+
+def list_bets_for_target(city: str, target_date: str) -> List[Dict]:
+    """Bets placed for one (city, target_date) — used by the auto-trader
+    to skip placement when an open bet on the same bracket already exists."""
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT * FROM bets WHERE city = ? AND target_date = ? ORDER BY placed_at ASC",
+        (city.upper(), target_date),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def stats_summary() -> Dict:

@@ -92,8 +92,18 @@ SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("BETS_SNAPSHOT_INTERVAL", "300"))  # 5
 SNAPSHOT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SNAPSHOT_LOOP") == "1"
 SETTLEMENT_INTERVAL_SECONDS = int(os.getenv("BETS_SETTLEMENT_INTERVAL", "3600"))  # 1 hour default
 SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
+
+# Auto paper-trader. Disabled by default — opt in with BETS_AUTO_TRADE=1.
+AUTO_TRADE_ENABLED = os.getenv("BETS_AUTO_TRADE") == "1"
+AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "3600"))  # 1h
+AUTO_TRADE_MIN_EDGE_CENTS = int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5"))
+AUTO_TRADE_BANKROLL = float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000"))
+AUTO_TRADE_MAX_USD = float(os.getenv("BETS_AUTO_TRADE_MAX_USD", "500"))
+AUTO_TRADE_MIN_USD = float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50"))
+
 _snapshot_task: Optional[asyncio.Task] = None
 _settlement_task: Optional[asyncio.Task] = None
+_auto_trader_task: Optional[asyncio.Task] = None
 from .model import (
     best_bracket,
     bracket_prob,
@@ -246,6 +256,11 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     return {
         "city": {k: city[k] for k in ("code", "station", "label", "office", "tz")},
         "asof": int(time.time() * 1000),
+        "targetDate": target_iso,
+        "sigmaUsed": round(sigma, 3),
+        "ecmwfMax": round(ecmwf_max_f, 1) if ecmwf_max_f is not None else None,
+        "omMax": round(om_max_f, 1) if om_max_f is not None else None,
+        "afdAboveNormal": afd.get("above_normal", False),
         "settlementBracket": best,
         "modelMax": round(model_max, 1),
         "nwsForecast": round(nws_max_f, 1) if nws_max_f is not None else round(om_max_f, 1),
@@ -320,6 +335,7 @@ async def _snapshot_tick(client: httpx.AsyncClient, ts: Optional[int] = None) ->
     for s in states:
         if s is not None:
             db.insert_snapshot(s, ts=ts)
+            db.insert_feature_snapshot(s, ts=ts)
             state_by_city[s["city"]["code"]] = s
     if not state_by_city:
         return 0
@@ -361,17 +377,18 @@ async def _snapshot_loop() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
-    global _snapshot_task, _settlement_task
+    global _snapshot_task, _settlement_task, _auto_trader_task
     if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
     if not SETTLEMENT_LOOP_DISABLED and _settlement_task is None:
         _settlement_task = asyncio.create_task(_settlement_loop())
+    if AUTO_TRADE_ENABLED and _auto_trader_task is None:
+        _auto_trader_task = asyncio.create_task(_auto_trader_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global _snapshot_task, _settlement_task
-    for name in ("_snapshot_task", "_settlement_task"):
+    for name in ("_snapshot_task", "_settlement_task", "_auto_trader_task"):
         task = globals().get(name)
         if task is not None:
             task.cancel()
@@ -380,6 +397,21 @@ async def _shutdown() -> None:
             except (asyncio.CancelledError, Exception):
                 pass
             globals()[name] = None
+
+
+@app.post("/api/auto-trade/now")
+async def auto_trade_now():
+    """Manual one-shot trigger of the auto-trader. Same logic as the
+    background loop — useful for testing config without waiting an hour."""
+    async with httpx.AsyncClient() as client:
+        placed = await _auto_trade_tick(client)
+    return {
+        "enabled": AUTO_TRADE_ENABLED,
+        "min_edge_cents": AUTO_TRADE_MIN_EDGE_CENTS,
+        "bankroll": AUTO_TRADE_BANKROLL,
+        "placed": placed,
+        "count": len(placed),
+    }
 
 
 class PlaceBetIn(BaseModel):
@@ -523,6 +555,75 @@ async def _settlement_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[bets] settlement loop error: {exc}")
         await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
+
+
+async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
+    """One iteration of the auto-trader. For each city's recommended
+    bracket, place a ¼-Kelly paper bet if:
+      - edge ≥ BETS_AUTO_TRADE_MIN_EDGE (cents)
+      - no open bet for the same (city, bracket, target_date) yet
+    Returns a list of bets placed this tick (empty when nothing fired)."""
+    placed: List[Dict] = []
+    for city in CITIES:
+        try:
+            state = await _build_state_cached(city, client)
+            if state is None:
+                continue
+            best = state.get("settlementBracket") or {}
+            edge_cents = int(round((best.get("edge") or 0) * 100))
+            target = state.get("targetDate")
+            if target is None or edge_cents < AUTO_TRADE_MIN_EDGE_CENTS:
+                continue
+            # Skip if we've already bet this bracket for this target date —
+            # idempotency across loop ticks AND across server restarts.
+            existing = db.list_bets_for_target(city["code"], target)
+            if any(b["bracket_label"] == best["label"] for b in existing):
+                continue
+            kelly = state.get("kellyPct") or 0
+            size = max(AUTO_TRADE_MIN_USD, round(kelly * AUTO_TRADE_BANKROLL))
+            size = int(min(AUTO_TRADE_MAX_USD, size))
+            if size < AUTO_TRADE_MIN_USD:
+                continue
+            row = db.insert_bet(
+                city=city["code"],
+                bracket_label=best["label"],
+                bracket_lo=best["lo"],
+                bracket_hi=best["hi"],
+                side="YES",
+                size=size,
+                entry_cents=int(best.get("yesPrice", 0)),
+                target_date=target,
+            )
+            placed.append({
+                "id": row["id"],
+                "city": city["code"],
+                "bracket": best["label"],
+                "edge_cents": edge_cents,
+                "size_usd": size,
+                "entry_cents": row["entry_cents"],
+            })
+            print(f"[auto-trader] placed YES on {city['code']} {best['label']} "
+                  f"size=${size} entry={row['entry_cents']}¢ edge=+{edge_cents}¢")
+        except Exception as exc:  # noqa: BLE001 — never crash the loop
+            print(f"[auto-trader] error on {city['code']}: {exc}")
+    return placed
+
+
+async def _auto_trader_loop() -> None:
+    """Background auto-trader: runs every BETS_AUTO_TRADE_INTERVAL seconds
+    (default 1h). Disabled by default — opt in with BETS_AUTO_TRADE=1.
+    Idempotent: never bets twice on the same (city, bracket, target_date)."""
+    print(f"[auto-trader] loop active — interval={AUTO_TRADE_INTERVAL_SECONDS}s, "
+          f"min_edge={AUTO_TRADE_MIN_EDGE_CENTS}¢, "
+          f"bankroll=${AUTO_TRADE_BANKROLL:.0f}, "
+          f"size cap=${AUTO_TRADE_MAX_USD:.0f}")
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                await _auto_trade_tick(client)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[auto-trader] loop error: {exc}")
+        await asyncio.sleep(AUTO_TRADE_INTERVAL_SECONDS)
 
 
 @app.post("/api/settle")

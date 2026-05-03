@@ -1,6 +1,6 @@
 import re
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Dict, List, Optional
 
 import httpx
 
