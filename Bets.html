@@ -105,24 +105,46 @@ function App() {
           asof: Date.now(),
         };
       }));
-      // mark to market open positions
-      setPositions(prev => prev.map(p => {
-        const newCur = Math.max(0.01, Math.min(0.99, p.current + (Math.random() - 0.5) * 0.012));
-        const pl = (newCur - p.entry) * p.size * (p.side === 'YES' ? 1 : -1) * 100;
-        return { ...p, current: +newCur.toFixed(3), pl: +pl.toFixed(2) };
-      }));
+      // Mark open positions to market. When the backend is live the server
+      // owns the bet ledger and computes P/L against the latest cached state;
+      // we just refresh from /api/positions. Offline, we drift locally so
+      // the prototype keeps animating.
+      if (dataSource === 'live') {
+        MOCK.fetchPositions().then(rows => {
+          if (rows) setPositions(rows);
+        });
+      } else {
+        setPositions(prev => prev.map(p => {
+          const newCur = Math.max(0.01, Math.min(0.99, p.current + (Math.random() - 0.5) * 0.012));
+          const pl = (newCur - p.entry) * p.size * (p.side === 'YES' ? 1 : -1) * 100;
+          return { ...p, current: +newCur.toFixed(3), pl: +pl.toFixed(2) };
+        }));
+      }
       setTickFlash({ t: Date.now() });
     }, 4000);
     return () => clearInterval(t);
-  }, []);
+  }, [dataSource]);
+
+  // On going live, replace the local mock bet log + positions with whatever
+  // is durable on the backend.
+  useEffect(() => {
+    if (dataSource !== 'live') return;
+    let cancelled = false;
+    Promise.all([MOCK.fetchBets(), MOCK.fetchPositions()]).then(([bets, pos]) => {
+      if (cancelled) return;
+      if (bets) setBetLog(bets);
+      if (pos) setPositions(pos);
+    });
+    return () => { cancelled = true; };
+  }, [dataSource]);
 
   const focus = states.find(s => s.city.code === selectedCity) || states[0];
 
   const placeBet = (cityCode, bracket, side, size) => {
     const time = new Date().toTimeString().slice(0, 8);
     const entry = side === 'YES' ? bracket.yesPrice : 100 - bracket.yesPrice;
+    // Optimistic local update — works offline and gives instant feedback when live.
     setBetLog(log => [{ time, city: cityCode, bracket, side, size, entry }, ...log]);
-    // Add to positions
     setPositions(prev => [{
       id: 'P' + (prev.length + 100),
       city: cityCode,
@@ -133,6 +155,11 @@ function App() {
       current: entry / 100,
       pl: 0,
     }, ...prev]);
+    // When live, persist to backend — server will be the source of truth on
+    // the next tick refresh.
+    if (dataSource === 'live') {
+      MOCK.persistBet({ cityCode, bracket, side, size, entry });
+    }
   };
 
   const tabs = [

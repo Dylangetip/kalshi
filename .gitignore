@@ -5,3 +5,7 @@ __pycache__/
 venv/
 .env
 .DS_Store
+backend/bets.db
+backend/bets.db-journal
+backend/bets.db-wal
+backend/bets.db-shm

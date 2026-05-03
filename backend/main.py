@@ -21,9 +21,11 @@ import time
 from typing import Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
+from . import db
 from .cities import CITIES
 from .model import (
     best_bracket,
@@ -183,18 +185,122 @@ async def _build_state_cached(city: Dict, client: httpx.AsyncClient) -> Optional
     return state
 
 
-app = FastAPI(title="Bets — Kalshi Weather Backend", version="0.1.0")
+app = FastAPI(title="Bets — Kalshi Weather Backend", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 
+@app.on_event("startup")
+def _startup() -> None:
+    db.init()
+
+
+class PlaceBetIn(BaseModel):
+    city: str
+    bracket_label: str
+    bracket_lo: int
+    bracket_hi: int
+    side: str = Field(pattern="^(YES|NO)$")
+    size: int = Field(gt=0)
+    entry_cents: int = Field(ge=0, le=100)
+
+
+def _bet_row_to_log(b: Dict) -> Dict:
+    """Shape used by the Terminal "Your bet log" panel."""
+    placed = time.strftime("%H:%M:%S", time.localtime(b["placed_at"] / 1000))
+    return {
+        "id": b["id"],
+        "time": placed,
+        "city": b["city"],
+        "bracket": {
+            "label": b["bracket_label"],
+            "lo": b["bracket_lo"],
+            "hi": b["bracket_hi"],
+        },
+        "side": b["side"],
+        "size": b["size"],
+        "entry": b["entry_cents"] if b["side"] == "YES" else 100 - b["entry_cents"],
+    }
+
+
+def _mark_bet_to_market(b: Dict, current_yes_pct: float) -> Dict:
+    """Mark a stored bet against the latest Kalshi YES probability for its
+    bracket. Matches the prototype's sign convention: entry/current are
+    stored as YES probabilities, and P/L = (current - entry) * size * 100
+    * (+1 for YES, -1 for NO) so a NO bet profits when YES drops."""
+    entry = b["entry_cents"] / 100
+    current = current_yes_pct
+    sign = 1 if b["side"] == "YES" else -1
+    pl = (current - entry) * b["size"] * sign * 100
+    return {
+        "id": f"P{b['id']}",
+        "city": b["city"],
+        "bracket": b["bracket_label"],
+        "side": b["side"],
+        "size": b["size"],
+        "entry": round(entry, 3),
+        "current": round(current, 3),
+        "pl": round(pl, 2),
+    }
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "cities": [c["code"] for c in CITIES]}
+    return {
+        "status": "ok",
+        "cities": [c["code"] for c in CITIES],
+        "open_bets": len(db.list_open_bets()),
+    }
+
+
+@app.post("/api/bets")
+def place_bet(b: PlaceBetIn):
+    row = db.insert_bet(
+        city=b.city.upper(),
+        bracket_label=b.bracket_label,
+        bracket_lo=b.bracket_lo,
+        bracket_hi=b.bracket_hi,
+        side=b.side,
+        size=b.size,
+        entry_cents=b.entry_cents,
+    )
+    return _bet_row_to_log(row)
+
+
+@app.get("/api/bets")
+def get_bets(limit: int = 200):
+    return [_bet_row_to_log(b) for b in db.list_bets(limit)]
+
+
+@app.get("/api/positions")
+async def get_positions():
+    """Open positions marked to market against the latest cached state."""
+    open_bets = db.list_open_bets()
+    if not open_bets:
+        return []
+    async with httpx.AsyncClient() as client:
+        states = await asyncio.gather(
+            *[_build_state_cached(c, client) for c in CITIES]
+        )
+    state_by_city = {s["city"]["code"]: s for s in states if s}
+    out = []
+    for b in open_bets:
+        s = state_by_city.get(b["city"])
+        if s is None:
+            # No live data for this city — mark at entry.
+            out.append(_mark_bet_to_market(b, b["entry_cents"] / 100))
+            continue
+        bracket = next(
+            (br for br in s["brackets"] if br["label"] == b["bracket_label"]),
+            None,
+        )
+        current_yes_pct = bracket["kalshiPct"] if bracket else b["entry_cents"] / 100
+        out.append(_mark_bet_to_market(b, current_yes_pct))
+    return out
 
 
 @app.get("/api/state")

@@ -261,9 +261,54 @@ async function fetchLiveState() {
   }
 }
 
+async function fetchBets() {
+  try {
+    const r = await fetch(API_BASE + '/api/bets', { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchPositions() {
+  try {
+    const r = await fetch(API_BASE + '/api/positions', { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function persistBet({ cityCode, bracket, side, size, entry }) {
+  try {
+    // entry from frontend is in cents and side-specific (YES price for YES bets,
+    // NO price for NO bets). Backend stores YES price regardless of side.
+    const entryYesCents = side === 'YES' ? entry : 100 - entry;
+    const r = await fetch(API_BASE + '/api/bets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        city: cityCode,
+        bracket_label: bracket.label,
+        bracket_lo: bracket.lo,
+        bracket_hi: bracket.hi,
+        side,
+        size,
+        entry_cents: entryYesCents,
+      }),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 window.MOCK = {
   CITIES, SIGNAL_CATALOG,
   initialState, buildSignals, buildHistory, buildOpenPositions,
   seedRand, gauss, makeBrackets, buildCityState,
-  fetchLiveState, API_BASE,
+  fetchLiveState, fetchBets, fetchPositions, persistBet, API_BASE,
 };
