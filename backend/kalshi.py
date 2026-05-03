@@ -386,3 +386,12 @@ async def fetch_markets(
     limit: int = 100,
 ) -> Optional[List[Dict]]:
     return await _client.fetch_event_markets(client, event_ticker, limit=limit)
+
+
+async def fetch_brackets_for_city(
+    client: httpx.AsyncClient,
+    series_ticker: str,
+) -> Optional[List[Dict]]:
+    """Module-level wrapper around the singleton client. Returns today's
+    bracket markets with parsed (lo, hi) and yes_cents."""
+    return await _client.fetch_brackets_for_city(client, series_ticker)
