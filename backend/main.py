@@ -93,13 +93,21 @@ SNAPSHOT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SNAPSHOT_LOOP") == "1"
 SETTLEMENT_INTERVAL_SECONDS = int(os.getenv("BETS_SETTLEMENT_INTERVAL", "3600"))  # 1 hour default
 SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 
-# Auto paper-trader. Disabled by default — opt in with BETS_AUTO_TRADE=1.
-AUTO_TRADE_ENABLED = os.getenv("BETS_AUTO_TRADE") == "1"
-AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "3600"))  # 1h
-AUTO_TRADE_MIN_EDGE_CENTS = int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5"))
-AUTO_TRADE_BANKROLL = float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000"))
-AUTO_TRADE_MAX_USD = float(os.getenv("BETS_AUTO_TRADE_MAX_USD", "500"))
-AUTO_TRADE_MIN_USD = float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50"))
+# Auto paper-trader. Initial config from env, runtime-mutable via
+# POST /api/auto-trade/config. The loop reads from this dict on every
+# iteration so toggles take effect on the next tick (no restart needed).
+AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "3600"))
+_auto_trade_state: Dict = {
+    "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
+    "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5")),
+    "bankroll": float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")),
+    "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD", "500")),
+    "min_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50")),
+    "last_run_ts": None,    # unix seconds of last tick that actually ran
+    "last_run_placed": 0,   # bets placed on the last tick
+    "total_runs": 0,
+    "total_placed": 0,
+}
 
 _snapshot_task: Optional[asyncio.Task] = None
 _settlement_task: Optional[asyncio.Task] = None
@@ -382,7 +390,9 @@ async def _startup() -> None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
     if not SETTLEMENT_LOOP_DISABLED and _settlement_task is None:
         _settlement_task = asyncio.create_task(_settlement_loop())
-    if AUTO_TRADE_ENABLED and _auto_trader_task is None:
+    # Always start the auto-trader loop. It checks _auto_trade_state['enabled']
+    # on each iteration so users can toggle from the UI without restart.
+    if _auto_trader_task is None:
         _auto_trader_task = asyncio.create_task(_auto_trader_loop())
 
 
@@ -399,16 +409,40 @@ async def _shutdown() -> None:
             globals()[name] = None
 
 
+class AutoTradeConfigIn(BaseModel):
+    enabled: Optional[bool] = None
+    min_edge_cents: Optional[int] = Field(None, ge=0, le=100)
+    bankroll: Optional[float] = Field(None, gt=0)
+    max_usd: Optional[float] = Field(None, gt=0)
+    min_usd: Optional[float] = Field(None, ge=0)
+
+
+@app.get("/api/auto-trade/info")
+def auto_trade_info():
+    """Current runtime config + recent activity stats."""
+    return {**_auto_trade_state, "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS}
+
+
+@app.post("/api/auto-trade/config")
+def auto_trade_config(c: AutoTradeConfigIn):
+    """Update auto-trader config at runtime — takes effect on the next
+    loop tick (no restart needed). Returns the updated state."""
+    for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd"):
+        v = getattr(c, k)
+        if v is not None:
+            _auto_trade_state[k] = v
+    return {**_auto_trade_state, "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS}
+
+
 @app.post("/api/auto-trade/now")
 async def auto_trade_now():
-    """Manual one-shot trigger of the auto-trader. Same logic as the
-    background loop — useful for testing config without waiting an hour."""
+    """Manual one-shot trigger. Runs even when enabled=false — handy for
+    testing config without flipping the loop on."""
     async with httpx.AsyncClient() as client:
         placed = await _auto_trade_tick(client)
     return {
-        "enabled": AUTO_TRADE_ENABLED,
-        "min_edge_cents": AUTO_TRADE_MIN_EDGE_CENTS,
-        "bankroll": AUTO_TRADE_BANKROLL,
+        **_auto_trade_state,
+        "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS,
         "placed": placed,
         "count": len(placed),
     }
@@ -558,11 +592,11 @@ async def _settlement_loop() -> None:
 
 
 async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
-    """One iteration of the auto-trader. For each city's recommended
-    bracket, place a ¼-Kelly paper bet if:
-      - edge ≥ BETS_AUTO_TRADE_MIN_EDGE (cents)
-      - no open bet for the same (city, bracket, target_date) yet
-    Returns a list of bets placed this tick (empty when nothing fired)."""
+    """One iteration of the auto-trader. Reads thresholds + bankroll from
+    the runtime _auto_trade_state dict so UI toggles take effect on the
+    next tick. Idempotent across ticks AND server restarts via
+    list_bets_for_target. Returns the bets placed this tick."""
+    cfg = _auto_trade_state
     placed: List[Dict] = []
     for city in CITIES:
         try:
@@ -572,17 +606,15 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
             best = state.get("settlementBracket") or {}
             edge_cents = int(round((best.get("edge") or 0) * 100))
             target = state.get("targetDate")
-            if target is None or edge_cents < AUTO_TRADE_MIN_EDGE_CENTS:
+            if target is None or edge_cents < cfg["min_edge_cents"]:
                 continue
-            # Skip if we've already bet this bracket for this target date —
-            # idempotency across loop ticks AND across server restarts.
             existing = db.list_bets_for_target(city["code"], target)
             if any(b["bracket_label"] == best["label"] for b in existing):
                 continue
             kelly = state.get("kellyPct") or 0
-            size = max(AUTO_TRADE_MIN_USD, round(kelly * AUTO_TRADE_BANKROLL))
-            size = int(min(AUTO_TRADE_MAX_USD, size))
-            if size < AUTO_TRADE_MIN_USD:
+            size = max(cfg["min_usd"], round(kelly * cfg["bankroll"]))
+            size = int(min(cfg["max_usd"], size))
+            if size < cfg["min_usd"]:
                 continue
             row = db.insert_bet(
                 city=city["code"],
@@ -601,26 +633,30 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                 "edge_cents": edge_cents,
                 "size_usd": size,
                 "entry_cents": row["entry_cents"],
+                "target_date": target,
+                "ts": int(time.time()),
             })
             print(f"[auto-trader] placed YES on {city['code']} {best['label']} "
                   f"size=${size} entry={row['entry_cents']}¢ edge=+{edge_cents}¢")
-        except Exception as exc:  # noqa: BLE001 — never crash the loop
+        except Exception as exc:  # noqa: BLE001
             print(f"[auto-trader] error on {city['code']}: {exc}")
+    cfg["last_run_ts"] = int(time.time())
+    cfg["last_run_placed"] = len(placed)
+    cfg["total_runs"] += 1
+    cfg["total_placed"] += len(placed)
     return placed
 
 
 async def _auto_trader_loop() -> None:
-    """Background auto-trader: runs every BETS_AUTO_TRADE_INTERVAL seconds
-    (default 1h). Disabled by default — opt in with BETS_AUTO_TRADE=1.
-    Idempotent: never bets twice on the same (city, bracket, target_date)."""
+    """Background auto-trader. Always runs (so UI toggles take effect
+    without restart) — checks the enabled flag inside each iteration."""
     print(f"[auto-trader] loop active — interval={AUTO_TRADE_INTERVAL_SECONDS}s, "
-          f"min_edge={AUTO_TRADE_MIN_EDGE_CENTS}¢, "
-          f"bankroll=${AUTO_TRADE_BANKROLL:.0f}, "
-          f"size cap=${AUTO_TRADE_MAX_USD:.0f}")
+          f"initial state={_auto_trade_state}")
     while True:
         try:
-            async with httpx.AsyncClient() as client:
-                await _auto_trade_tick(client)
+            if _auto_trade_state["enabled"]:
+                async with httpx.AsyncClient() as client:
+                    await _auto_trade_tick(client)
         except Exception as exc:  # noqa: BLE001
             print(f"[auto-trader] loop error: {exc}")
         await asyncio.sleep(AUTO_TRADE_INTERVAL_SECONDS)

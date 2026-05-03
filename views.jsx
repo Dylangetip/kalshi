@@ -666,4 +666,190 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
   );
 }
 
-Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView });
+// ====== AUTO-TRADE ======
+function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
+  const [busy, setBusy] = useState_v(false);
+  const [lastRunResult, setLastRunResult] = useState_v(null);
+  const [draft, setDraft] = useState_v({});
+
+  // Auto-bets are the ones placed via this view's trigger / loop. We
+  // can't distinguish them from manual bets in the schema yet, so
+  // "recent" just means the live session bet log — same data the
+  // Terminal shows.
+  const recent = (bets || []).slice(0, 20);
+
+  const cfg = info || {};
+  const enabled = draft.enabled ?? cfg.enabled ?? false;
+  const minEdge = draft.min_edge_cents ?? cfg.min_edge_cents ?? 5;
+  const bankroll = draft.bankroll ?? cfg.bankroll ?? 10000;
+  const maxUsd = draft.max_usd ?? cfg.max_usd ?? 500;
+  const lastRun = cfg.last_run_ts ? ago(cfg.last_run_ts * 1000) : 'never';
+
+  const apply = async (patch) => {
+    setBusy(true);
+    await onSetConfig(patch);
+    setDraft({});
+    setBusy(false);
+  };
+  const trigger = async () => {
+    setBusy(true);
+    const r = await onTriggerNow();
+    setLastRunResult(r);
+    setBusy(false);
+  };
+
+  return (
+    <div className="pnl-layout">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
+        <div className="signal-card">
+          <div className="label">Status</div>
+          <div className={`big-num ${enabled ? 'pos' : 'neg'}`}>{enabled ? 'ON' : 'OFF'}</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            interval {Math.round((cfg.interval_seconds || 3600) / 60)}m
+          </div>
+        </div>
+        <div className="signal-card">
+          <div className="label">Min edge</div>
+          <div className="big-num">{minEdge}¢</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>fires above</div>
+        </div>
+        <div className="signal-card">
+          <div className="label">Bankroll</div>
+          <div className="big-num">{fmtUSD(bankroll)}</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>¼-Kelly base</div>
+        </div>
+        <div className="signal-card">
+          <div className="label">Last run</div>
+          <div className="big-num">{lastRun}</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            {cfg.last_run_placed != null ? `${cfg.last_run_placed} placed` : '—'}
+          </div>
+        </div>
+        <div className="signal-card">
+          <div className="label">Total placed</div>
+          <div className="big-num pos">{cfg.total_placed || 0}</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            across {cfg.total_runs || 0} runs
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">
+          <span>Configuration</span>
+          <span className="panel-title-actions">
+            takes effect on next loop tick
+          </span>
+        </div>
+        <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr) auto', gap: 14, alignItems: 'end' }}>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Enabled</div>
+            <button
+              className={`btn ${enabled ? 'success' : 'ghost'}`}
+              onClick={() => apply({ enabled: !enabled })}
+              disabled={busy}
+              style={{ width: '100%' }}>
+              {enabled ? 'TURN OFF' : 'TURN ON'}
+            </button>
+          </div>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Min edge (¢)</div>
+            <input type="number" value={minEdge} min={0} max={100}
+              onChange={(e) => setDraft(d => ({ ...d, min_edge_cents: +e.target.value }))}
+              style={{ width: '100%' }} />
+          </div>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Bankroll ($)</div>
+            <input type="number" value={bankroll} min={100} step={100}
+              onChange={(e) => setDraft(d => ({ ...d, bankroll: +e.target.value }))}
+              style={{ width: '100%' }} />
+          </div>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Max / bet ($)</div>
+            <input type="number" value={maxUsd} min={1}
+              onChange={(e) => setDraft(d => ({ ...d, max_usd: +e.target.value }))}
+              style={{ width: '100%' }} />
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="btn primary" disabled={busy || Object.keys(draft).length === 0}
+              onClick={() => apply(draft)}>
+              Apply
+            </button>
+            <button className="btn success" disabled={busy} onClick={trigger}>
+              {busy ? 'running…' : 'Trigger Now'}
+            </button>
+          </div>
+        </div>
+        {lastRunResult && (
+          <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-2)' }}>
+            <span className="mono">last trigger: placed {lastRunResult.count} bet{lastRunResult.count === 1 ? '' : 's'}</span>
+            {lastRunResult.placed && lastRunResult.placed.length > 0 && (
+              <div style={{ marginTop: 6 }}>
+                {lastRunResult.placed.map((p, i) => (
+                  <div key={i} className="mono" style={{ fontSize: 11 }}>
+                    <span className="pos">+</span> {p.city} {p.bracket} ${p.size_usd} @ {p.entry_cents}¢
+                    <span className="pos" style={{ marginLeft: 8 }}>edge +{p.edge_cents}¢</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">
+          <span>Recent bets</span>
+          <span className="panel-title-actions">
+            session log · {recent.length} shown
+          </span>
+        </div>
+        {recent.length === 0 ? (
+          <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+            no bets yet — turn auto-trade on, or hit "Trigger Now"
+          </div>
+        ) : (
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Time</th><th>City</th><th>Bracket</th><th>Side</th>
+                <th className="num-r">Size</th><th className="num-r">Entry</th>
+                <th>Status</th><th className="num-r">Settled P/L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.map(b => {
+                const settled = b.status === 'settled' && b.settledPl != null;
+                const won = settled && b.settledPl > 0;
+                return (
+                  <tr key={b.id}>
+                    <td>{b.time}</td>
+                    <td className="city-cell">{b.city}</td>
+                    <td>{b.bracket?.label || b.bracket}</td>
+                    <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
+                    <td className="num-r">${b.size}</td>
+                    <td className="num-r">{b.entry}¢</td>
+                    <td>
+                      {settled ? (
+                        <Pill kind={won ? 'pos' : 'neg'}>
+                          {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
+                        </Pill>
+                      ) : (
+                        <Pill kind="info">OPEN</Pill>
+                      )}
+                    </td>
+                    <td className={`num-r ${settled ? (won ? 'pos' : 'neg') : ''}`}>
+                      {settled ? fmtSign(b.settledPl, 0) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView });
