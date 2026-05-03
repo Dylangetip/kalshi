@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS bets (
 );
 CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);
 CREATE INDEX IF NOT EXISTS idx_bets_placed_at ON bets(placed_at DESC);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 INTEGER NOT NULL,
+    city               TEXT    NOT NULL,
+    model_max          REAL    NOT NULL,
+    best_edge_cents    INTEGER NOT NULL,
+    best_bracket_label TEXT    NOT NULL,
+    best_kalshi_pct    REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_city_ts ON snapshots(city, ts DESC);
 """
 
 _lock = threading.Lock()
@@ -111,4 +122,50 @@ def reset() -> None:
     c = _conn_or_init()
     with _lock:
         c.execute("DELETE FROM bets")
+        c.execute("DELETE FROM snapshots")
         c.commit()
+
+
+def insert_snapshot(state: Dict) -> None:
+    """Persist a city snapshot. Pulls model_max + recommended bracket from
+    the same response shape /api/state returns, so the caller doesn't need
+    to reshape data."""
+    best = state["settlementBracket"]
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            """INSERT INTO snapshots (
+                ts, city, model_max, best_edge_cents,
+                best_bracket_label, best_kalshi_pct
+            ) VALUES (?,?,?,?,?,?)""",
+            (
+                int(time.time()),
+                state["city"]["code"],
+                float(state["modelMax"]),
+                int(state["bestEdgeCents"]),
+                str(best["label"]),
+                float(best["kalshiPct"]),
+            ),
+        )
+        c.commit()
+
+
+def list_snapshots(city: str, hours: float = 24.0, limit: int = 500) -> List[Dict]:
+    cutoff = int(time.time() - hours * 3600)
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT ts, model_max, best_edge_cents, best_bracket_label, best_kalshi_pct "
+        "FROM snapshots WHERE city = ? AND ts >= ? ORDER BY ts ASC, id ASC LIMIT ?",
+        (city.upper(), cutoff, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_snapshot(city: str) -> Optional[Dict]:
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT ts, model_max, best_edge_cents, best_bracket_label, best_kalshi_pct "
+        "FROM snapshots WHERE city = ? ORDER BY ts DESC, id DESC LIMIT 1",
+        (city.upper(),),
+    ).fetchone()
+    return dict(row) if row else None

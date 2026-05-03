@@ -281,6 +281,16 @@ async function fetchPositions() {
   }
 }
 
+async function fetchEdgeHistory(cityCode, hours = 4) {
+  try {
+    const r = await fetch(`${API_BASE}/api/snapshots/${cityCode}?hours=${hours}`, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 async function persistBet({ cityCode, bracket, side, size, entry }) {
   try {
     // entry from frontend is in cents and side-specific (YES price for YES bets,
@@ -310,5 +320,5 @@ window.MOCK = {
   CITIES, SIGNAL_CATALOG,
   initialState, buildSignals, buildHistory, buildOpenPositions,
   seedRand, gauss, makeBrackets, buildCityState,
-  fetchLiveState, fetchBets, fetchPositions, persistBet, API_BASE,
+  fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, persistBet, API_BASE,
 };

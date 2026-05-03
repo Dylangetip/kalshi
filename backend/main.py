@@ -17,6 +17,7 @@ mock data.
 """
 
 import asyncio
+import os
 import time
 from typing import Dict, List, Optional
 
@@ -27,6 +28,10 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .cities import CITIES
+
+SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("BETS_SNAPSHOT_INTERVAL", "300"))  # 5 min default
+SNAPSHOT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SNAPSHOT_LOOP") == "1"
+_snapshot_task: Optional[asyncio.Task] = None
 from .model import (
     best_bracket,
     compute_ladder,
@@ -194,9 +199,43 @@ app.add_middleware(
 )
 
 
+async def _snapshot_loop() -> None:
+    """Persist a snapshot of every city's state on a fixed cadence so the
+    frontend can render real edge-history sparklines. Snapshots are skipped
+    when upstream is unreachable (state is None) so we never poison the
+    time series with synthetic fallback data."""
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                states = await asyncio.gather(
+                    *[_build_state_cached(c, client) for c in CITIES]
+                )
+            for s in states:
+                if s is not None:
+                    db.insert_snapshot(s)
+        except Exception as exc:  # noqa: BLE001 — best-effort background task
+            print(f"[bets] snapshot loop error: {exc}")
+        await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     db.init()
+    global _snapshot_task
+    if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
+        _snapshot_task = asyncio.create_task(_snapshot_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _snapshot_task
+    if _snapshot_task is not None:
+        _snapshot_task.cancel()
+        try:
+            await _snapshot_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _snapshot_task = None
 
 
 class PlaceBetIn(BaseModel):
@@ -274,6 +313,24 @@ def place_bet(b: PlaceBetIn):
 @app.get("/api/bets")
 def get_bets(limit: int = 200):
     return [_bet_row_to_log(b) for b in db.list_bets(limit)]
+
+
+@app.get("/api/snapshots/{code}")
+def get_snapshots(code: str, hours: float = 24.0, limit: int = 500):
+    """Edge / model-max history for one city. `hours` controls the window;
+    default 24h. Returns rows ordered oldest → newest for direct sparkline
+    consumption."""
+    rows = db.list_snapshots(code, hours=hours, limit=limit)
+    return [
+        {
+            "ts": r["ts"],
+            "modelMax": r["model_max"],
+            "bestEdgeCents": r["best_edge_cents"],
+            "bestBracket": r["best_bracket_label"],
+            "kalshiPct": r["best_kalshi_pct"],
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/positions")

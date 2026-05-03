@@ -34,6 +34,26 @@ const ACCENTS = {
   magenta: 'oklch(0.7 0.18 330)',
 };
 
+// Tiny inline trendline for the ticker. Inherits color from its parent so
+// the line picks up .pos / .neg from the surrounding edge cell. Renders
+// nothing when there are fewer than 2 data points.
+function MiniSpark({ data, width = 44, height = 14 }) {
+  if (!data || data.length < 2) return null;
+  const lo = Math.min(...data), hi = Math.max(...data);
+  const range = hi - lo || 1;
+  const step = width / (data.length - 1);
+  const pts = data.map((v, i) =>
+    `${(i * step).toFixed(1)},${(height - ((v - lo) / range) * height).toFixed(1)}`
+  ).join(' ');
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`}
+         style={{ display: 'inline-block', verticalAlign: 'middle', marginRight: 6, opacity: 0.7 }}>
+      <polyline points={pts} fill="none" stroke="currentColor" strokeWidth="1.2"
+                strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function App() {
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [tab, setTab] = useState('opportunities');
@@ -46,6 +66,7 @@ function App() {
   const [now, setNow] = useState(new Date());
   const [tickFlash, setTickFlash] = useState({});
   const [dataSource, setDataSource] = useState('synthetic'); // 'live' | 'synthetic'
+  const [edgeHistory, setEdgeHistory] = useState({}); // {NYC: [{ts, bestEdgeCents}, ...], ...}
 
   // Theme + accent
   useEffect(() => {
@@ -138,6 +159,24 @@ function App() {
     return () => { cancelled = true; };
   }, [dataSource]);
 
+  // Edge-history sparklines. Backend writes a snapshot per city every 5 min;
+  // we pull the last 4h for each and render a tiny trendline next to the
+  // ticker edge value. Empty / single-point histories render nothing.
+  useEffect(() => {
+    if (dataSource !== 'live') return;
+    let cancelled = false;
+    const refresh = async () => {
+      const results = await Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4)));
+      if (cancelled) return;
+      const map = {};
+      MOCK.CITIES.forEach((c, i) => { if (results[i]) map[c.code] = results[i]; });
+      setEdgeHistory(map);
+    };
+    refresh();
+    const t = setInterval(refresh, 60_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [dataSource]);
+
   const focus = states.find(s => s.city.code === selectedCity) || states[0];
 
   const placeBet = (cityCode, bracket, side, size) => {
@@ -198,22 +237,27 @@ function App() {
       <div className="main">
         {/* City ticker — present on all tabs */}
         <div className="ticker">
-          {states.map(s => (
-            <div key={s.city.code}
-              className={`ticker-item ${selectedCity === s.city.code ? 'active' : ''}`}
-              onClick={() => setSelectedCity(s.city.code)}>
-              <div className="ticker-row">
-                <span className="ticker-city">{s.city.code} · {s.city.label}</span>
-                <span className={`ticker-edge ${s.bestEdgeCents > 0 ? 'pos' : 'neg'}`}>
-                  {fmtSign(s.bestEdgeCents)}¢
-                </span>
+          {states.map(s => {
+            const hist = edgeHistory[s.city.code] || [];
+            const sparkData = hist.map(h => h.bestEdgeCents);
+            return (
+              <div key={s.city.code}
+                className={`ticker-item ${selectedCity === s.city.code ? 'active' : ''}`}
+                onClick={() => setSelectedCity(s.city.code)}>
+                <div className="ticker-row">
+                  <span className="ticker-city">{s.city.code} · {s.city.label}</span>
+                  <span className={`ticker-edge ${s.bestEdgeCents > 0 ? 'pos' : 'neg'}`}>
+                    <MiniSpark data={sparkData} />
+                    {fmtSign(s.bestEdgeCents)}¢
+                  </span>
+                </div>
+                <div className="ticker-row">
+                  <span className="ticker-station">{s.city.station} · {fmt(s.modelMax)}°F</span>
+                  <span className="ticker-meta">{s.settlementBracket.label}</span>
+                </div>
               </div>
-              <div className="ticker-row">
-                <span className="ticker-station">{s.city.station} · {fmt(s.modelMax)}°F</span>
-                <span className="ticker-meta">{s.settlementBracket.label}</span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <div className="view">
