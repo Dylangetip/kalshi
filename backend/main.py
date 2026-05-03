@@ -573,6 +573,34 @@ async def kalshi_events(series_ticker: Optional[str] = None, status: str = "open
     return {"count": len(events), "events": events}
 
 
+@app.get("/api/kalshi/debug/{code}")
+async def kalshi_debug(code: str):
+    """Bypass the state cache: directly probe what fetch_brackets_for_city
+    returns for one city. Surfaces any silent failures."""
+    city = next((c for c in CITIES if c["code"] == code.upper()), None)
+    if not city:
+        raise HTTPException(404, f"unknown city {code}")
+    if not kalshi.configured():
+        raise HTTPException(503, "Kalshi not configured")
+    series = city.get("kalshi_series")
+    async with httpx.AsyncClient() as client:
+        event = await kalshi._client.fetch_active_event(client, series)
+        markets = (
+            await kalshi._client.fetch_event_markets(client, event["event_ticker"])
+            if event else None
+        )
+        brackets = await kalshi.fetch_brackets_for_city(client, series)
+    return {
+        "city": city["code"],
+        "series": series,
+        "active_event": event["event_ticker"] if event else None,
+        "raw_market_count": len(markets) if markets is not None else None,
+        "parsed_bracket_count": len(brackets) if brackets is not None else None,
+        "brackets": brackets,
+        "last_error": kalshi._client.last_error,
+    }
+
+
 @app.get("/api/kalshi/series")
 async def kalshi_series(category: Optional[str] = None, limit: int = 100):
     """List Kalshi series. Pass ?category=Weather to narrow to weather
@@ -647,10 +675,12 @@ async def get_state():
 
 
 @app.get("/api/state/{code}")
-async def get_city_state(code: str):
+async def get_city_state(code: str, refresh: bool = False):
     city = next((c for c in CITIES if c["code"] == code.upper()), None)
     if not city:
         return {"error": f"unknown city {code}"}
+    if refresh:
+        _state_cache.pop(city["code"], None)
     async with httpx.AsyncClient() as client:
         state = await _build_state_cached(city, client)
     return state or {"error": "no upstream data"}
