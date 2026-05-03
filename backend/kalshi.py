@@ -1,93 +1,161 @@
 """Kalshi REST client.
 
-Auth: email + password → bearer token. Tokens are documented as 30-min
-lifetime, refreshed automatically on 401 or after ~25 minutes.
+Auth: RSA-PSS signed requests using an API key generated from your
+Kalshi account. (The legacy email/password /login endpoint was removed
+in late 2024/2025 — API keys are the only supported auth now.)
+
+Per Kalshi docs, every request needs three headers:
+    KALSHI-ACCESS-KEY:       <key id from your account>
+    KALSHI-ACCESS-TIMESTAMP: <unix epoch ms, as string>
+    KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS-SHA256(timestamp + method + path))
+
+Where path is the request path INCLUDING the /trade-api/v2 prefix and
+EXCLUDING the query string.
 
 Configuration (read from process env or backend/.env):
-    KALSHI_API_BASE     defaults to demo (paper-trading) endpoint
-    KALSHI_EMAIL        your account email
-    KALSHI_PASSWORD     your account password
+    KALSHI_API_BASE          defaults to api.elections.kalshi.com
+    KALSHI_API_KEY_ID        the key ID string from the Kalshi UI
+    KALSHI_API_KEY_PEM_PATH  path to the downloaded .pem private key
+                             (or KALSHI_API_KEY_PEM with the literal
+                             PEM contents inline)
 
-Production base:  https://trading-api.kalshi.com/trade-api/v2
-Demo / paper:     https://demo-api.kalshi.co/trade-api/v2
-
-Falls back silently to "not configured" when env vars are missing, so
+Falls back to "not configured" silently when env vars are missing, so
 the rest of the backend stays unaffected when you haven't set creds.
 """
 
 import asyncio
+import base64
 import os
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import httpx
 
-DEFAULT_BASE = "https://demo-api.kalshi.co/trade-api/v2"
-TOKEN_LIFETIME_SECONDS = 1500  # refresh after 25 min — Kalshi tokens last ~30
+DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+def _load_private_key():
+    """Read the RSA private key from PEM_PATH or PEM env. Returns the
+    cryptography key object or None if not configured."""
+    pem_inline = os.getenv("KALSHI_API_KEY_PEM")
+    pem_path = os.getenv("KALSHI_API_KEY_PEM_PATH")
+    pem_bytes: Optional[bytes] = None
+    if pem_inline:
+        pem_bytes = pem_inline.encode("utf-8")
+    elif pem_path:
+        p = Path(pem_path).expanduser()
+        if p.exists():
+            pem_bytes = p.read_bytes()
+    if not pem_bytes:
+        return None
+    try:
+        from cryptography.hazmat.primitives import serialization
+        return serialization.load_pem_private_key(pem_bytes, password=None)
+    except Exception:
+        return None
+
+
+def _sign(private_key, timestamp_ms: int, method: str, path: str) -> str:
+    """Produce the base64 RSA-PSS-SHA256 signature for one request."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    msg = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
+    sig = private_key.sign(
+        msg,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(sig).decode("ascii")
 
 
 class KalshiClient:
     def __init__(self) -> None:
-        self.token: Optional[str] = None
-        self.token_obtained_at: float = 0.0
-        self.member_id: Optional[str] = None
         self.last_error: Optional[str] = None
-        self._login_lock = asyncio.Lock()
+        self._key_cache = None
+        self._key_pem_signature: Optional[str] = None  # detect env changes
 
     @property
     def base(self) -> str:
         return os.getenv("KALSHI_API_BASE", DEFAULT_BASE).rstrip("/")
 
     @property
-    def email(self) -> Optional[str]:
-        return os.getenv("KALSHI_EMAIL") or None
+    def base_path(self) -> str:
+        """Path prefix used in the signature (e.g. /trade-api/v2)."""
+        # Take the path component of base, ensure it starts with "/".
+        from urllib.parse import urlparse
+        p = urlparse(self.base).path or ""
+        return p if p.startswith("/") else "/" + p
 
     @property
-    def password(self) -> Optional[str]:
-        return os.getenv("KALSHI_PASSWORD") or None
+    def key_id(self) -> Optional[str]:
+        return os.getenv("KALSHI_API_KEY_ID") or None
+
+    def _private_key(self):
+        # Hot-reload the key on env changes (so editing .env doesn't require
+        # bouncing the worker).
+        sig = (
+            os.getenv("KALSHI_API_KEY_PEM_PATH", "")
+            + "|"
+            + os.getenv("KALSHI_API_KEY_PEM", "")
+        )
+        if sig != self._key_pem_signature:
+            self._key_cache = _load_private_key()
+            self._key_pem_signature = sig
+        return self._key_cache
 
     def configured(self) -> bool:
-        return bool(self.email and self.password)
+        return bool(self.key_id and self._private_key())
 
-    async def _login(self, client: httpx.AsyncClient) -> Optional[str]:
-        """Exchange creds for a bearer token. Returns the token (also caches
-        it on the instance) or None on failure. Last-error details are
-        kept on the instance for the /test endpoint."""
-        if not self.configured():
+    def _signed_headers(self, method: str, path: str) -> Optional[Dict[str, str]]:
+        key = self._private_key()
+        if not key or not self.key_id:
             return None
-        async with self._login_lock:
-            try:
-                r = await client.post(
-                    f"{self.base}/login",
-                    json={"email": self.email, "password": self.password},
-                    timeout=15,
-                )
-            except Exception as exc:  # network / DNS / TLS
-                self.last_error = f"network: {type(exc).__name__}: {exc}"
-                return None
-            if r.status_code != 200:
-                body = r.text[:300] if r.text else ""
-                self.last_error = f"HTTP {r.status_code}: {body}"
-                return None
-            try:
-                data = r.json()
-            except Exception:
-                self.last_error = f"non-JSON response: {r.text[:200]}"
-                return None
-            token = data.get("token")
-            if not token:
-                self.last_error = f"no token in response: {data}"
-                return None
-            self.token = token
-            self.member_id = data.get("member_id")
-            self.token_obtained_at = time.time()
-            self.last_error = None
-            return token
+        ts_ms = int(time.time() * 1000)
+        try:
+            sig = _sign(key, ts_ms, method, path)
+        except Exception as exc:
+            self.last_error = f"sign error: {type(exc).__name__}: {exc}"
+            return None
+        return {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "Accept": "application/json",
+        }
 
-    async def _ensure_token(self, client: httpx.AsyncClient) -> Optional[str]:
-        if self.token and (time.time() - self.token_obtained_at) < TOKEN_LIFETIME_SECONDS:
-            return self.token
-        return await self._login(client)
+    async def _signed_get(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        params: Optional[Dict] = None,
+    ) -> Optional[httpx.Response]:
+        """GET <base><path> with signed headers. `path` is appended verbatim
+        to base_path for signing — pass e.g. '/markets', not the full URL."""
+        if not self.configured():
+            self.last_error = (
+                "API key not configured (set KALSHI_API_KEY_ID and "
+                "KALSHI_API_KEY_PEM_PATH in backend/.env)"
+            )
+            return None
+        full_path = self.base_path + path
+        headers = self._signed_headers("GET", full_path)
+        if headers is None:
+            return None
+        try:
+            r = await client.get(
+                f"{self.base}{path}",
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+            return r
+        except Exception as exc:
+            self.last_error = f"network: {type(exc).__name__}: {exc}"
+            return None
 
     async def fetch_event_markets(
         self,
@@ -95,33 +163,35 @@ class KalshiClient:
         event_ticker: str,
         limit: int = 100,
     ) -> Optional[List[Dict]]:
-        """List all markets under an event (e.g. KXHIGHNY-25MAY03). Returns
-        None on failure (incl. not-configured); empty list when no
-        markets match."""
-        token = await self._ensure_token(client)
-        if not token:
+        """List all markets under an event (e.g. KXHIGHNY-25MAY03)."""
+        r = await self._signed_get(
+            client, "/markets", params={"event_ticker": event_ticker, "limit": limit}
+        )
+        if r is None:
+            return None
+        if r.status_code != 200:
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
             return None
         try:
-            r = await client.get(
-                f"{self.base}/markets",
-                params={"event_ticker": event_ticker, "limit": limit},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15,
-            )
-            if r.status_code == 401:
-                # Token expired mid-flight — re-auth and retry once.
-                token = await self._login(client)
-                if not token:
-                    return None
-                r = await client.get(
-                    f"{self.base}/markets",
-                    params={"event_ticker": event_ticker, "limit": limit},
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15,
-                )
-            r.raise_for_status()
             return r.json().get("markets") or []
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"non-JSON: {exc}"
+            return None
+
+    async def fetch_exchange_status(self, client: httpx.AsyncClient) -> Optional[Dict]:
+        """Trivial signed call used by /api/kalshi/test to verify auth.
+        /exchange/status is a small public endpoint that still requires
+        valid signature headers, so a 200 confirms key + signing work."""
+        r = await self._signed_get(client, "/exchange/status")
+        if r is None:
+            return None
+        if r.status_code != 200:
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return None
+        try:
+            return r.json()
+        except Exception as exc:
+            self.last_error = f"non-JSON: {exc}"
             return None
 
 
@@ -138,32 +208,33 @@ def info() -> Dict:
     return {
         "configured": _client.configured(),
         "base": _client.base,
-        "email": _client.email or None,
-        "logged_in": _client.token is not None,
-        "token_age_s": (
-            int(time.time() - _client.token_obtained_at)
-            if _client.token else None
-        ),
-        "member_id": _client.member_id,
+        "base_path": _client.base_path,
+        "key_id_set": bool(_client.key_id),
+        "key_id_preview": (_client.key_id[:8] + "…") if _client.key_id else None,
+        "private_key_loaded": _client._private_key() is not None,
     }
 
 
 async def login_test(client: httpx.AsyncClient) -> Dict:
-    """For /api/kalshi/test — attempts a fresh login and reports result.
-    No secrets in the response."""
+    """Round-trip a signed GET /exchange/status to verify auth.
+    A 200 means the key + signing both work."""
     if not _client.configured():
         return {
             "configured": False,
-            "error": "KALSHI_EMAIL and KALSHI_PASSWORD not set in backend/.env",
+            "error": (
+                "Set KALSHI_API_KEY_ID + KALSHI_API_KEY_PEM_PATH in "
+                "backend/.env (generate a key in your Kalshi account → "
+                "Settings → API)"
+            ),
         }
-    token = await _client._login(client)
+    status = await _client.fetch_exchange_status(client)
     return {
         "configured": True,
-        "logged_in": token is not None,
+        "logged_in": status is not None,
         "base": _client.base,
-        "email": _client.email,
-        "member_id": _client.member_id,
-        "error": None if token else (_client.last_error or "unknown error"),
+        "key_id": (_client.key_id[:8] + "…") if _client.key_id else None,
+        "exchange_status": status,
+        "error": None if status is not None else _client.last_error,
     }
 
 

@@ -9,3 +9,5 @@ backend/bets.db
 backend/bets.db-journal
 backend/bets.db-wal
 backend/bets.db-shm
+*.pem
+*.key
