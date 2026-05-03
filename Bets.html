@@ -45,6 +45,7 @@ function App() {
   const [signals, setSignals] = useState(() => MOCK.buildSignals(MOCK.CITIES.find(c => c.code === 'NYC'), 1));
   const [now, setNow] = useState(new Date());
   const [tickFlash, setTickFlash] = useState({});
+  const [dataSource, setDataSource] = useState('synthetic'); // 'live' | 'synthetic'
 
   // Theme + accent
   useEffect(() => {
@@ -56,6 +57,32 @@ function App() {
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
+  }, []);
+
+  // Backend bridge — pull real Open-Meteo / MOS / AFD data on mount and every 60s.
+  // The 4s tick below keeps jittering Kalshi prices on top of whatever base state
+  // is current, so live data and the synthetic ticker compose cleanly.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const live = await MOCK.fetchLiveState();
+      if (cancelled || !live) return;
+      // Preserve existing kalshi drift if a bracket of the same label still exists,
+      // otherwise take the backend's price as-is.
+      setStates(prev => live.map(ls => {
+        const old = prev.find(p => p.city.code === ls.city.code);
+        if (!old) return ls;
+        const merged = ls.brackets.map(nb => {
+          const ob = old.brackets.find(o => o.label === nb.label);
+          return ob ? { ...nb, kalshiPct: ob.kalshiPct, yesPrice: ob.yesPrice, edge: nb.modelPct - ob.kalshiPct } : nb;
+        });
+        return { ...ls, brackets: merged };
+      }));
+      setDataSource('live');
+    };
+    refresh();
+    const t = setInterval(refresh, 60_000);
+    return () => { cancelled = true; clearInterval(t); };
   }, []);
 
   // Live data tick — every 4s, jitter the kalshi prices a touch + recompute edges
@@ -178,7 +205,10 @@ function App() {
         <span className="sep">|</span>
         <span>34 signals · 17 categories</span>
         <span className="sep">|</span>
-        <span><span className="dot pos"></span> data: nominal</span>
+        <span>
+          <span className={`dot ${dataSource === 'live' ? 'pos' : 'warn'}`}></span>
+          {' '}data: {dataSource === 'live' ? 'live · OM/MOS/AFD' : 'synthetic'}
+        </span>
         <span className="sep">|</span>
         <span>paper trading</span>
         <span className="sep">|</span>

@@ -1,0 +1,194 @@
+"""Bets — Kalshi Weather Backend.
+
+Phase 1 ingest (per kalshi_weather_docs_v3.docx §5):
+  - Open-Meteo surface + 850/700/500mb pressure levels (HRRR/GFS seamless)
+  - Open-Meteo ECMWF IFS daily max
+  - IEM Mesonet GFS-MOS + NAM-MOS station bulletins
+  - NWS Area Forecast Discussion (AFD) text + parser
+  - NWS official daily forecast
+
+Run:
+    pip install -r requirements.txt
+    uvicorn backend.main:app --reload --port 8000
+
+The frontend (Bets.html at repo root) hits http://localhost:8000/api/state.
+If the backend is unreachable, the frontend keeps running on its built-in
+mock data.
+"""
+
+import asyncio
+import time
+from typing import Dict, List, Optional
+
+import httpx
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from .cities import CITIES
+from .model import (
+    best_bracket,
+    compute_ladder,
+    ensemble_model_max,
+    kelly_fraction,
+    parse_afd,
+)
+from .sources import (
+    fetch_afd,
+    fetch_ecmwf_max,
+    fetch_iem_mos,
+    fetch_nws_forecast_max,
+    fetch_open_meteo,
+)
+
+CACHE_TTL_SECONDS = 600  # 10 min — Open-Meteo refreshes hourly, MOS/AFD every 6h
+_state_cache: Dict[str, Dict] = {}
+
+
+def c_to_f(c: Optional[float]) -> Optional[float]:
+    return None if c is None else c * 9 / 5 + 32
+
+
+def _afternoon_index(times: List[str]) -> int:
+    """Pick the hourly index closest to 18:00 local on day index 1 (tomorrow)."""
+    target = None
+    for i, t in enumerate(times):
+        if "T18:00" in t and i >= 24:
+            return i
+    return min(36, len(times) - 1)
+
+
+async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[Dict]:
+    om, ecmwf_c, gfs_mos_f, nam_mos_f, afd_text, nws_max_f = await asyncio.gather(
+        fetch_open_meteo(client, city["lat"], city["lon"]),
+        fetch_ecmwf_max(client, city["lat"], city["lon"]),
+        fetch_iem_mos(client, city["station"], "GFS"),
+        fetch_iem_mos(client, city["station"], "NAM"),
+        fetch_afd(client, city["office"]),
+        fetch_nws_forecast_max(client, city["lat"], city["lon"]),
+    )
+
+    if not om:
+        return None
+
+    daily = om.get("daily", {})
+    hourly = om.get("hourly", {})
+    times = hourly.get("time", [])
+    if len(daily.get("temperature_2m_max") or []) < 2 or not times:
+        return None
+
+    om_max_f = c_to_f(daily["temperature_2m_max"][1])
+    obs_now_f = c_to_f(hourly["temperature_2m"][0])
+    idx = _afternoon_index(times)
+    t850_c = hourly["temperature_850hPa"][idx]
+    t700_c = hourly["temperature_700hPa"][idx]
+    t500_c = hourly["temperature_500hPa"][idx]
+    h500 = hourly["geopotential_height_500hPa"][idx]
+    rh850 = hourly["relative_humidity_850hPa"][idx]
+    wdir = hourly["wind_direction_850hPa"][idx]
+    wspd = hourly["wind_speed_850hPa"][idx]
+    ecmwf_max_f = c_to_f(ecmwf_c)
+
+    # Doc §2.1: MOS is the highest-value source; weight it accordingly.
+    model_max = ensemble_model_max([
+        (gfs_mos_f, 0.40),
+        (nam_mos_f, 0.20),
+        (nws_max_f, 0.15),
+        (om_max_f, 0.15),
+        (ecmwf_max_f, 0.10),
+    ])
+    if model_max is None:
+        return None
+
+    afd = parse_afd(afd_text)
+    # Tighter sigma when AFD says high confidence; wider when models disagree.
+    sigma = 2.4 - (afd["score"] - 3) * 0.25
+    # Doc §3.1: Kalshi center brackets are systematically overpriced — model with widening.
+    ladder = compute_ladder(model_max, model_sigma=max(1.2, sigma), kalshi_widening=1.30)
+    best = best_bracket(ladder)
+    kelly = kelly_fraction(best["edge"], best["kalshiPct"])
+
+    surface_c = c_to_f(t850_c) and t850_c  # keep C for upper-air display
+    lapse = round((c_to_f(t850_c) - obs_now_f) / -1.5, 1) if obs_now_f is not None else 6.5
+
+    return {
+        "city": {k: city[k] for k in ("code", "station", "label", "office", "tz")},
+        "asof": int(time.time() * 1000),
+        "settlementBracket": best,
+        "modelMax": round(model_max, 1),
+        "nwsForecast": round(nws_max_f, 1) if nws_max_f is not None else round(om_max_f, 1),
+        "mosMax": round(gfs_mos_f, 1) if gfs_mos_f is not None else round(model_max, 1),
+        "namMos": round(nam_mos_f, 1) if nam_mos_f is not None else round(model_max, 1),
+        "obsCurrent": round(obs_now_f, 1) if obs_now_f is not None else round(model_max - 6, 1),
+        "confidence": round(0.4 + afd["score"] * 0.1, 2),
+        "afdConfScore": afd["score"],
+        "brackets": ladder,
+        "bestEdgeCents": int(round(best["edge"] * 100)),
+        "kellyPct": round(kelly, 3),
+        "upperAir": {
+            "t850": round(t850_c, 1),
+            "t700": round(t700_c, 1),
+            "t500": round(t500_c, 1),
+            "h500": int(round(h500)),
+            "lapse": round(abs(lapse), 1),
+            "windDir": int(round(wdir)),
+            "windKt": int(round(wspd)),
+            "rh850": int(round(rh850)),
+        },
+        "sounding": {
+            "t850Obs": round(t850_c, 1),
+            "t850Delta": 0.0,
+            "lapse": round(abs(lapse), 1),
+            "depression": 3.0,
+        },
+        "afdText": afd_text or f"{city['office']} AFD unavailable. Using ensemble model output only.",
+        "flags": afd["flags"],
+        "sources": {
+            "gfsMos": gfs_mos_f is not None,
+            "namMos": nam_mos_f is not None,
+            "ecmwf": ecmwf_max_f is not None,
+            "nws": nws_max_f is not None,
+            "afd": afd_text is not None,
+        },
+    }
+
+
+async def _build_state_cached(city: Dict, client: httpx.AsyncClient) -> Optional[Dict]:
+    key = city["code"]
+    cached = _state_cache.get(key)
+    if cached and time.time() - cached["t"] < CACHE_TTL_SECONDS:
+        return cached["v"]
+    state = await _build_city_state(client, city)
+    if state is not None:
+        _state_cache[key] = {"t": time.time(), "v": state}
+    return state
+
+
+app = FastAPI(title="Bets — Kalshi Weather Backend", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "cities": [c["code"] for c in CITIES]}
+
+
+@app.get("/api/state")
+async def get_state():
+    async with httpx.AsyncClient() as client:
+        states = await asyncio.gather(*[_build_state_cached(c, client) for c in CITIES])
+    return [s for s in states if s is not None]
+
+
+@app.get("/api/state/{code}")
+async def get_city_state(code: str):
+    city = next((c for c in CITIES if c["code"] == code.upper()), None)
+    if not city:
+        return {"error": f"unknown city {code}"}
+    async with httpx.AsyncClient() as client:
+        state = await _build_state_cached(city, client)
+    return state or {"error": "no upstream data"}

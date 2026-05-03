@@ -243,8 +243,27 @@ const buildOpenPositions = () => {
   ];
 };
 
+// ====== BACKEND BRIDGE ======
+// Frontend tries to fetch real data from the FastAPI backend (default
+// http://localhost:8000). On failure we silently keep using the synthetic
+// state above, so the prototype remains playable offline.
+const API_BASE = window.__BETS_API__ || 'http://localhost:8000';
+
+async function fetchLiveState() {
+  try {
+    const r = await fetch(API_BASE + '/api/state', { cache: 'no-store' });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!Array.isArray(data) || data.length === 0) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 window.MOCK = {
   CITIES, SIGNAL_CATALOG,
   initialState, buildSignals, buildHistory, buildOpenPositions,
   seedRand, gauss, makeBrackets, buildCityState,
+  fetchLiveState, API_BASE,
 };
