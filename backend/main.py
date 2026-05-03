@@ -526,6 +526,33 @@ async def kalshi_event_markets(event_ticker: str):
     return {"event_ticker": event_ticker, "count": len(markets), "markets": markets}
 
 
+@app.get("/api/kalshi/events")
+async def kalshi_events(series_ticker: Optional[str] = None, status: str = "open", limit: int = 50):
+    """List Kalshi events. Use ?series_ticker=KXHIGHNY (or whatever the
+    real weather series ticker turns out to be) to find tomorrow's
+    daily-high event for a city."""
+    if not kalshi.configured():
+        raise HTTPException(503, "Kalshi not configured")
+    async with httpx.AsyncClient() as client:
+        events = await kalshi._client.fetch_events(client, series_ticker=series_ticker, status=status, limit=limit)
+    if events is None:
+        raise HTTPException(502, "Kalshi fetch failed")
+    return {"count": len(events), "events": events}
+
+
+@app.get("/api/kalshi/series")
+async def kalshi_series(category: Optional[str] = None, limit: int = 100):
+    """List Kalshi series. Pass ?category=Weather to narrow to weather
+    markets and find the right series tickers for each city."""
+    if not kalshi.configured():
+        raise HTTPException(503, "Kalshi not configured")
+    async with httpx.AsyncClient() as client:
+        series = await kalshi._client.fetch_series(client, category=category, limit=limit)
+    if series is None:
+        raise HTTPException(502, "Kalshi fetch failed")
+    return {"count": len(series), "series": series}
+
+
 @app.get("/api/equity")
 def get_equity(hours: float = 72.0, starting_balance: float = 10000.0):
     """Live session equity curve. Per-tick equity = starting bankroll + sum

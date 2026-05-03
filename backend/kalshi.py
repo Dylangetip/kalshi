@@ -178,6 +178,54 @@ class KalshiClient:
             self.last_error = f"non-JSON: {exc}"
             return None
 
+    async def fetch_events(
+        self,
+        client: httpx.AsyncClient,
+        series_ticker: Optional[str] = None,
+        status: str = "open",
+        limit: int = 50,
+    ) -> Optional[List[Dict]]:
+        """List events. Filter by series_ticker (e.g. KXHIGHNY) or by
+        status (open / closed / settled)."""
+        params: Dict = {"limit": limit, "status": status}
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        r = await self._signed_get(client, "/events", params=params)
+        if r is None:
+            return None
+        if r.status_code != 200:
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return None
+        try:
+            return r.json().get("events") or []
+        except Exception as exc:
+            self.last_error = f"non-JSON: {exc}"
+            return None
+
+    async def fetch_series(
+        self,
+        client: httpx.AsyncClient,
+        category: Optional[str] = None,
+        limit: int = 100,
+    ) -> Optional[List[Dict]]:
+        """List series (a series groups recurring events — e.g. all daily
+        NYC high-temp events sit under one series). Filter by category to
+        narrow to weather."""
+        params: Dict = {"limit": limit}
+        if category:
+            params["category"] = category
+        r = await self._signed_get(client, "/series", params=params)
+        if r is None:
+            return None
+        if r.status_code != 200:
+            self.last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+            return None
+        try:
+            return r.json().get("series") or []
+        except Exception as exc:
+            self.last_error = f"non-JSON: {exc}"
+            return None
+
     async def fetch_exchange_status(self, client: httpx.AsyncClient) -> Optional[Dict]:
         """Trivial signed call used by /api/kalshi/test to verify auth.
         /exchange/status is a small public endpoint that still requires
