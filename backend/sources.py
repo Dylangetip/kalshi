@@ -61,33 +61,76 @@ async def fetch_ecmwf_max(client: httpx.AsyncClient, lat: float, lon: float) -> 
 
 
 def _parse_mos_csv(text: str, target_date: datetime) -> Optional[float]:
-    """IEM MOS bulletins come back as CSV with valid_time + tmpf columns. Return max F for target date."""
+    """IEM MOS CSV. Real header from /mos/csv.php is:
+        station,model,runtime,ftime,n_x,tmp,dpt,...
+    where `n_x` holds the daily MAX (at 00Z rows, covering the previous
+    12Z→00Z UTC window — daytime in ET/CT/PT) and MIN (at 12Z rows).
+
+    For "max temperature on target_date in the city's local timezone",
+    the relevant n_x lives on the row whose ftime is at 00Z UTC on
+    target_date+1 (since the 12Z→00Z window of that day spans daytime
+    of target_date in any US timezone).
+
+    Falls back to scanning the hourly `tmp` column inside that window
+    when n_x isn't populated (older runs / partial bulletins)."""
     lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
     if len(lines) < 2:
         return None
     header = [h.strip().lower() for h in lines[0].split(",")]
     try:
-        time_col = next(i for i, h in enumerate(header) if "time" in h or "valid" in h)
-        temp_col = next(i for i, h in enumerate(header) if h in ("tmp", "tmpf", "tmp_f"))
-    except StopIteration:
+        ftime_col = header.index("ftime")
+    except ValueError:
         return None
-    target = target_date.date()
-    temps = []
+    nx_col = header.index("n_x") if "n_x" in header else None
+    tmp_col = header.index("tmp") if "tmp" in header else None
+    if nx_col is None and tmp_col is None:
+        return None
+
+    from datetime import timedelta
+    target_nx_date = (target_date + timedelta(days=1)).date()
+    window_start = datetime(target_date.year, target_date.month, target_date.day, 12, 0, tzinfo=timezone.utc)
+    window_end = window_start + timedelta(hours=12)
+
+    nx_value: Optional[float] = None
+    tmp_max: Optional[float] = None
     for line in lines[1:]:
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) <= max(time_col, temp_col):
+        if len(parts) <= ftime_col:
             continue
+        ftime_raw = parts[ftime_col].split("+")[0].strip()
         try:
-            dt = datetime.strptime(parts[time_col], "%Y-%m-%d %H:%M")
+            dt = datetime.strptime(ftime_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        if dt.date() != target:
-            continue
-        try:
-            temps.append(float(parts[temp_col]))
-        except ValueError:
-            continue
-    return max(temps) if temps else None
+
+        # Primary: n_x daily max for our target day
+        if (
+            nx_value is None
+            and nx_col is not None
+            and dt.date() == target_nx_date
+            and dt.hour == 0
+            and len(parts) > nx_col
+            and parts[nx_col]
+        ):
+            try:
+                nx_value = float(parts[nx_col])
+            except ValueError:
+                pass
+
+        # Fallback: max over hourly tmp inside the daytime window
+        if (
+            tmp_col is not None
+            and len(parts) > tmp_col
+            and parts[tmp_col]
+            and window_start <= dt <= window_end
+        ):
+            try:
+                t = float(parts[tmp_col])
+                if tmp_max is None or t > tmp_max:
+                    tmp_max = t
+            except ValueError:
+                pass
+    return nx_value if nx_value is not None else tmp_max
 
 
 async def fetch_iem_mos(client: httpx.AsyncClient, station: str, model: str = "GFS") -> Optional[float]:
