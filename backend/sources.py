@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -9,6 +9,7 @@ USER_AGENT = "kalshi-weather-bets/0.1 (research; contact: dylan@example.com)"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 IEM_MOS_URL = "https://mesonet.agron.iastate.edu/mos/csv.php"
 NWS_API = "https://api.weather.gov"
+UWYO_SOUNDING_URL = "https://weather.uwyo.edu/cgi-bin/sounding.py"
 
 
 async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) -> Optional[dict]:
@@ -139,5 +140,74 @@ async def fetch_nws_forecast_max(client: httpx.AsyncClient, lat: float, lon: flo
                 if temp is not None and p.get("temperatureUnit") == "F":
                     return float(temp)
         return None
+    except Exception:
+        return None
+
+
+def _parse_uwyo_sounding(html: str) -> Optional[dict]:
+    """Pull 850/700/500mb levels out of a U. Wyoming sounding HTML response.
+
+    The page wraps fixed-width columns in a <PRE> block:
+        PRES  HGHT  TEMP  DWPT  RELH  MIXR  DRCT  SKNT ...
+        (mb)  (m)   (C)   (C)   (%)   (g/kg) (deg) (knot)
+    Some lines have missing fields when sensors drop out — we skip those.
+    """
+    m = re.search(r"<PRE>(.*?)</PRE>", html, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    body = m.group(1)
+    targets = (850, 700, 500)
+    levels: dict[int, dict] = {}
+    for line in body.splitlines():
+        parts = line.split()
+        # Need at least PRES HGHT TEMP DWPT to be useful.
+        if len(parts) < 4:
+            continue
+        try:
+            pres = float(parts[0])
+            temp_c = float(parts[2])
+            dwpt_c = float(parts[3])
+        except (ValueError, IndexError):
+            continue
+        wdir = wspd = None
+        if len(parts) >= 8:
+            try:
+                wdir = float(parts[6])
+                wspd = float(parts[7])
+            except ValueError:
+                pass
+        for tgt in targets:
+            if tgt not in levels and abs(pres - tgt) <= 5:
+                levels[tgt] = {
+                    "temp_c": temp_c,
+                    "dwpt_c": dwpt_c,
+                    "wdir": wdir,
+                    "wspd_kt": wspd,
+                }
+    return levels or None
+
+
+async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional[dict]:
+    """Pull the most recent 12Z radiosonde sounding from U. Wyoming.
+
+    12Z launches at 7 AM ET / 4 AM PT and are typically posted by 13Z.
+    Per the v3.0 doc §2.4, the 12Z sounding is the highest-value reading —
+    it captures the morning atmospheric state before afternoon heating.
+    """
+    now = datetime.now(timezone.utc)
+    # If we're past 13Z, today's 12Z is fresh; otherwise reach back to yesterday.
+    target = now if now.hour >= 13 else now - timedelta(days=1)
+    params = {
+        "TYPE": "TEXT:LIST",
+        "YEAR": target.strftime("%Y"),
+        "MONTH": target.strftime("%m"),
+        "FROM": target.strftime("%d") + "12",
+        "TO": target.strftime("%d") + "12",
+        "STNM": station_id,
+    }
+    try:
+        r = await client.get(UWYO_SOUNDING_URL, params=params, timeout=20)
+        r.raise_for_status()
+        return _parse_uwyo_sounding(r.text)
     except Exception:
         return None

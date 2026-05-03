@@ -38,6 +38,7 @@ from .sources import (
     fetch_iem_mos,
     fetch_nws_forecast_max,
     fetch_open_meteo,
+    fetch_sounding,
 )
 
 CACHE_TTL_SECONDS = 600  # 10 min — Open-Meteo refreshes hourly, MOS/AFD every 6h
@@ -58,13 +59,14 @@ def _afternoon_index(times: List[str]) -> int:
 
 
 async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[Dict]:
-    om, ecmwf_c, gfs_mos_f, nam_mos_f, afd_text, nws_max_f = await asyncio.gather(
+    om, ecmwf_c, gfs_mos_f, nam_mos_f, afd_text, nws_max_f, sounding = await asyncio.gather(
         fetch_open_meteo(client, city["lat"], city["lon"]),
         fetch_ecmwf_max(client, city["lat"], city["lon"]),
         fetch_iem_mos(client, city["station"], "GFS"),
         fetch_iem_mos(client, city["station"], "NAM"),
         fetch_afd(client, city["office"]),
         fetch_nws_forecast_max(client, city["lat"], city["lon"]),
+        fetch_sounding(client, city["sounding"]),
     )
 
     if not om:
@@ -107,8 +109,24 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     best = best_bracket(ladder)
     kelly = kelly_fraction(best["edge"], best["kalshiPct"])
 
-    surface_c = c_to_f(t850_c) and t850_c  # keep C for upper-air display
     lapse = round((c_to_f(t850_c) - obs_now_f) / -1.5, 1) if obs_now_f is not None else 6.5
+
+    # Doc §2.4 — observed 12Z sounding gives ground-truth atmospheric state.
+    # The 850mb obs-vs-model delta is one of the highest-value edge signals.
+    s850 = (sounding or {}).get(850) if sounding else None
+    s700 = (sounding or {}).get(700) if sounding else None
+    if s850:
+        snd_t850_obs = s850["temp_c"]
+        snd_t850_delta = round(s850["temp_c"] - t850_c, 2)
+        snd_depression = round(s850["temp_c"] - s850["dwpt_c"], 1)
+    else:
+        snd_t850_obs = t850_c
+        snd_t850_delta = 0.0
+        snd_depression = 3.0
+    snd_lapse = abs(lapse)
+    if s850 and s700:
+        # Observed lapse rate between 700 and 850mb (~1.5 km layer), °C/km.
+        snd_lapse = round(abs(s700["temp_c"] - s850["temp_c"]) / 1.5, 1)
 
     return {
         "city": {k: city[k] for k in ("code", "station", "label", "office", "tz")},
@@ -135,10 +153,11 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             "rh850": int(round(rh850)),
         },
         "sounding": {
-            "t850Obs": round(t850_c, 1),
-            "t850Delta": 0.0,
-            "lapse": round(abs(lapse), 1),
-            "depression": 3.0,
+            "t850Obs": round(snd_t850_obs, 1),
+            "t850Delta": snd_t850_delta,
+            "lapse": snd_lapse,
+            "depression": snd_depression,
+            "available": s850 is not None,
         },
         "afdText": afd_text or f"{city['office']} AFD unavailable. Using ensemble model output only.",
         "flags": afd["flags"],
@@ -148,6 +167,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             "ecmwf": ecmwf_max_f is not None,
             "nws": nws_max_f is not None,
             "afd": afd_text is not None,
+            "sounding": s850 is not None,
         },
     }
 
