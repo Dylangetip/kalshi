@@ -10,6 +10,7 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 IEM_MOS_URL = "https://mesonet.agron.iastate.edu/mos/csv.php"
 NWS_API = "https://api.weather.gov"
 UWYO_SOUNDING_URL = "https://weather.uwyo.edu/cgi-bin/sounding.py"
+AVWX_METAR_URL = "https://aviationweather.gov/api/data/metar"
 
 
 async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) -> Optional[dict]:
@@ -205,6 +206,39 @@ def _parse_uwyo_sounding(html: str) -> Optional[dict]:
                     "wspd_kt": wspd,
                 }
     return levels or None
+
+
+async def fetch_metar(client: httpx.AsyncClient, station: str, hours: int = 6) -> Optional[dict]:
+    """Latest METAR observation(s) for an ASOS station from
+    aviationweather.gov. Returns the freshest reading plus a short
+    history for trend computation. Doc §5 step 8: hyper-local signal at
+    the exact station Kalshi settles against."""
+    params = {"ids": station, "format": "json", "hours": str(hours)}
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = await client.get(AVWX_METAR_URL, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        # aviationweather returns newest first; keep that ordering for `history`.
+        latest = data[0]
+        if latest.get("temp") is None:
+            return None
+        return {
+            "temp_c": float(latest["temp"]),
+            "dewp_c": float(latest["dewp"]) if latest.get("dewp") is not None else None,
+            "wind_dir": latest.get("wdir"),
+            "wind_kt": latest.get("wspd"),
+            "obs_ts": latest.get("obsTime"),
+            "raw": latest.get("rawOb"),
+            "history": [
+                {"ts": d.get("obsTime"), "temp_c": d.get("temp")}
+                for d in data if d.get("temp") is not None
+            ],
+        }
+    except Exception:
+        return None
 
 
 async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional[dict]:

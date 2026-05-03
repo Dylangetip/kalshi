@@ -81,6 +81,7 @@ from .sources import (
     fetch_afd,
     fetch_ecmwf_max,
     fetch_iem_mos,
+    fetch_metar,
     fetch_nws_forecast_max,
     fetch_open_meteo,
     fetch_sounding,
@@ -104,7 +105,7 @@ def _afternoon_index(times: List[str]) -> int:
 
 
 async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[Dict]:
-    om, ecmwf_c, gfs_mos_f, nam_mos_f, afd_text, nws_max_f, sounding = await asyncio.gather(
+    om, ecmwf_c, gfs_mos_f, nam_mos_f, afd_text, nws_max_f, sounding, metar = await asyncio.gather(
         fetch_open_meteo(client, city["lat"], city["lon"]),
         fetch_ecmwf_max(client, city["lat"], city["lon"]),
         fetch_iem_mos(client, city["station"], "GFS"),
@@ -112,6 +113,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         fetch_afd(client, city["office"]),
         fetch_nws_forecast_max(client, city["lat"], city["lon"]),
         fetch_sounding(client, city["sounding"]),
+        fetch_metar(client, city["station"]),
     )
 
     if not om:
@@ -124,7 +126,10 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         return None
 
     om_max_f = c_to_f(daily["temperature_2m_max"][1])
-    obs_now_f = c_to_f(hourly["temperature_2m"][0])
+    # Prefer the METAR reading at the exact ASOS station — it's what Kalshi
+    # settles against. Fall back to Open-Meteo's blended hourly when METAR
+    # is unavailable (e.g., outage or upstream timeout).
+    obs_now_f = c_to_f(metar["temp_c"]) if metar else c_to_f(hourly["temperature_2m"][0])
     idx = _afternoon_index(times)
     t850_c = hourly["temperature_850hPa"][idx]
     t700_c = hourly["temperature_700hPa"][idx]
@@ -213,6 +218,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             "nws": nws_max_f is not None,
             "afd": afd_text is not None,
             "sounding": s850 is not None,
+            "metar": metar is not None,
         },
     }
 
