@@ -34,6 +34,43 @@ import httpx
 
 DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
+# Bracket ranges in Kalshi market metadata can come in three shapes:
+#   1. floor_strike / cap_strike numeric fields (cleanest, when present)
+#   2. subtitle text like "67-68°" / "67 to 68°F" / "between 67 and 68"
+#   3. open-ended brackets: "above 80°", "below 50°"
+import re as _re
+_RANGE_RE = _re.compile(r"(-?\d+)\s*(?:°F|°|F)?\s*(?:to|-|–|—|and)\s*(-?\d+)", _re.IGNORECASE)
+_ABOVE_RE = _re.compile(r"(?:above|over|≥|>=|>)\s*(-?\d+)", _re.IGNORECASE)
+_BELOW_RE = _re.compile(r"(?:below|under|≤|<=|<)\s*(-?\d+)", _re.IGNORECASE)
+
+
+def parse_bracket_range(market: Dict) -> Optional[tuple]:
+    """Extract (lo, hi) integer Fahrenheit bounds from a Kalshi market.
+    Open-ended brackets ('above 90°') are mapped to a wide bound at the
+    relevant edge so they can still slot into the ladder."""
+    floor = market.get("floor_strike")
+    cap = market.get("cap_strike")
+    if floor is not None and cap is not None:
+        try:
+            return int(round(float(floor))), int(round(float(cap)))
+        except (TypeError, ValueError):
+            pass
+    for field in ("yes_sub_title", "sub_title", "subtitle", "rules_primary"):
+        text = market.get(field)
+        if not text:
+            continue
+        m = _RANGE_RE.search(text)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            return (min(lo, hi), max(lo, hi))
+        m = _ABOVE_RE.search(text)
+        if m:
+            return (int(m.group(1)), int(m.group(1)) + 20)
+        m = _BELOW_RE.search(text)
+        if m:
+            return (int(m.group(1)) - 20, int(m.group(1)))
+    return None
+
 
 def _load_private_key():
     """Read the RSA private key from PEM_PATH or PEM env. Returns the
@@ -201,6 +238,63 @@ class KalshiClient:
         except Exception as exc:
             self.last_error = f"non-JSON: {exc}"
             return None
+
+    async def fetch_active_event(
+        self,
+        client: httpx.AsyncClient,
+        series_ticker: str,
+    ) -> Optional[Dict]:
+        """Most recently opened active event under this series. For
+        daily-frequency weather series this is today's market."""
+        events = await self.fetch_events(
+            client, series_ticker=series_ticker, status="open", limit=5
+        )
+        if not events:
+            return None
+        # Kalshi returns events newest first; the daily-high event is
+        # whichever is currently open and unsettled.
+        return events[0]
+
+    async def fetch_brackets_for_city(
+        self,
+        client: httpx.AsyncClient,
+        series_ticker: str,
+    ) -> Optional[List[Dict]]:
+        """One-shot helper: find today's active event for this series and
+        return its bracket markets with parsed (lo, hi) ranges and current
+        YES prices in cents."""
+        event = await self.fetch_active_event(client, series_ticker)
+        if not event:
+            return None
+        markets = await self.fetch_event_markets(client, event["event_ticker"])
+        if not markets:
+            return None
+        out: List[Dict] = []
+        for m in markets:
+            rng = parse_bracket_range(m)
+            if rng is None:
+                continue
+            lo, hi = rng
+            # Prefer last_price (real fill price); fall back to ask, then bid.
+            yes_cents = (
+                m.get("last_price")
+                or m.get("yes_ask")
+                or m.get("yes_bid")
+            )
+            if yes_cents is None:
+                continue
+            out.append({
+                "ticker": m.get("ticker"),
+                "lo": lo,
+                "hi": hi,
+                "yes_cents": int(yes_cents),
+                "yes_bid": m.get("yes_bid"),
+                "yes_ask": m.get("yes_ask"),
+                "volume": m.get("volume", 0) or 0,
+                "open_interest": m.get("open_interest", 0) or 0,
+            })
+        out.sort(key=lambda b: b["lo"])
+        return out or None
 
     async def fetch_series(
         self,

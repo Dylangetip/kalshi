@@ -98,6 +98,7 @@ from .model import (
     best_bracket,
     compute_ladder,
     ensemble_model_max,
+    gauss,
     kelly_fraction,
     parse_afd,
 )
@@ -178,8 +179,39 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     afd = parse_afd(afd_text)
     # Tighter sigma when AFD says high confidence; wider when models disagree.
     sigma = 2.4 - (afd["score"] - 3) * 0.25
-    # Doc §3.1: Kalshi center brackets are systematically overpriced — model with widening.
-    ladder = compute_ladder(model_max, model_sigma=max(1.2, sigma), kalshi_widening=1.30)
+    sigma = max(1.2, sigma)
+
+    # Try real Kalshi prices first. When the API key is configured and the
+    # bracket fetch succeeds, use the live market structure (Kalshi's own
+    # bracket bounds + their YES prices) and compute model probabilities
+    # over the same brackets via the same gauss centered on model_max.
+    # Doc §3.1: Kalshi center brackets are systematically overpriced — the
+    # synthetic ladder modeled this with a widening factor; with real
+    # prices we just use them directly.
+    kalshi_brackets = None
+    if kalshi.configured() and city.get("kalshi_series"):
+        kalshi_brackets = await kalshi.fetch_brackets_for_city(client, city["kalshi_series"])
+
+    if kalshi_brackets:
+        ladder = []
+        for b in kalshi_brackets:
+            mid = (b["lo"] + b["hi"]) / 2
+            width = max(1, b["hi"] - b["lo"] + 1)
+            model_pct = gauss(mid, model_max, sigma) * width
+            kalshi_pct = b["yes_cents"] / 100
+            ladder.append({
+                "lo": b["lo"], "hi": b["hi"],
+                "label": f"{b['lo']}–{b['hi']}°F",
+                "modelPct": round(model_pct, 4),
+                "kalshiPct": round(kalshi_pct, 4),
+                "edge": round(model_pct - kalshi_pct, 4),
+                "yesPrice": b["yes_cents"],
+                "volume": b["volume"],
+                "kalshiTicker": b["ticker"],
+            })
+    else:
+        ladder = compute_ladder(model_max, model_sigma=sigma, kalshi_widening=1.30)
+
     best = best_bracket(ladder)
     kelly = kelly_fraction(best["edge"], best["kalshiPct"])
 
@@ -243,6 +275,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             "afd": afd_text is not None,
             "sounding": s850 is not None,
             "metar": metar is not None,
+            "kalshi": kalshi_brackets is not None,
         },
     }
 
