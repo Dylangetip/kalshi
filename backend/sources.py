@@ -333,40 +333,50 @@ async def fetch_metar(client: httpx.AsyncClient, station: str, hours: int = 6) -
         return None
 
 
+def _sounding_param_variants(station_id: str, target: datetime) -> List[Dict]:
+    """Param sets to try against UWyo's various endpoints. The new wsgi
+    endpoint expects `id` instead of `STNM`; date format may also have
+    changed. Try the most-likely-modern set first."""
+    yyyy = target.strftime("%Y")
+    mm = target.strftime("%m")
+    dd = target.strftime("%d")
+    return [
+        # Modern wsgi schema (from "'id' is not specified" error message)
+        {"id": station_id, "type": "TEXT:LIST", "datetime": f"{yyyy}-{mm}-{dd} 12:00"},
+        {"id": station_id, "type": "TEXT:LIST", "year": yyyy, "month": mm,
+         "from": dd + "12", "to": dd + "12"},
+        # Legacy uppercase-keys schema (worked on the old cgi-bin URL)
+        {"STNM": station_id, "TYPE": "TEXT:LIST", "YEAR": yyyy, "MONTH": mm,
+         "FROM": dd + "12", "TO": dd + "12"},
+    ]
+
+
 async def fetch_sounding_raw(client: httpx.AsyncClient, station_id: str) -> dict:
-    """Same upstream call as fetch_sounding, but returns the URL,
-    HTTP status, response length, and a short body excerpt for each
-    candidate URL — never None. Tries each URL in UWYO_SOUNDING_URLS
-    and reports per-URL outcomes."""
+    """Probe every (URL, param-set) combination and report what each
+    returned, so we can see which schema the current UWyo endpoint
+    actually accepts."""
     now = datetime.now(timezone.utc)
     target = now if now.hour >= 13 else now - timedelta(days=1)
-    params = {
-        "TYPE": "TEXT:LIST",
-        "YEAR": target.strftime("%Y"),
-        "MONTH": target.strftime("%m"),
-        "FROM": target.strftime("%d") + "12",
-        "TO": target.strftime("%d") + "12",
-        "STNM": station_id,
-    }
     attempts = []
     parsed_final = None
     for url in UWYO_SOUNDING_URLS:
-        try:
-            r = await client.get(url, params=params, timeout=20)
-            body = r.text
-            parsed = _parse_uwyo_sounding(body)
-            attempts.append({
-                "url": str(r.request.url),
-                "status": r.status_code,
-                "body_len": len(body),
-                "body_excerpt": body[:300],
-                "has_pre_block": "<PRE>" in body or "<pre>" in body,
-                "parsed_levels": list(parsed.keys()) if parsed else None,
-            })
-            if parsed and parsed_final is None:
-                parsed_final = parsed
-        except Exception as exc:
-            attempts.append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+        for params in _sounding_param_variants(station_id, target):
+            try:
+                r = await client.get(url, params=params, timeout=20)
+                body = r.text
+                parsed = _parse_uwyo_sounding(body)
+                attempts.append({
+                    "url": str(r.request.url),
+                    "status": r.status_code,
+                    "body_len": len(body),
+                    "body_excerpt": body[:200],
+                    "parsed_levels": list(parsed.keys()) if parsed else None,
+                })
+                if parsed and parsed_final is None:
+                    parsed_final = parsed
+            except Exception as exc:
+                attempts.append({"url": url, "params": params,
+                                 "error": f"{type(exc).__name__}: {exc}"})
     return {"parsed": parsed_final, "attempts": attempts}
 
 
@@ -377,26 +387,20 @@ async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional
     Per the v3.0 doc §2.4, the 12Z sounding is the highest-value reading —
     it captures the morning atmospheric state before afternoon heating.
 
-    Tries each candidate URL in UWYO_SOUNDING_URLS in order, returns the
-    first one that parses successfully."""
+    Tries the (URL, param-schema) cartesian product and returns the first
+    combination that parses successfully — UWyo migrated from cgi-bin
+    to wsgi mid-2024 and the param keys changed at the same time."""
     now = datetime.now(timezone.utc)
     target = now if now.hour >= 13 else now - timedelta(days=1)
-    params = {
-        "TYPE": "TEXT:LIST",
-        "YEAR": target.strftime("%Y"),
-        "MONTH": target.strftime("%m"),
-        "FROM": target.strftime("%d") + "12",
-        "TO": target.strftime("%d") + "12",
-        "STNM": station_id,
-    }
     for url in UWYO_SOUNDING_URLS:
-        try:
-            r = await client.get(url, params=params, timeout=20)
-            if r.status_code != 200:
+        for params in _sounding_param_variants(station_id, target):
+            try:
+                r = await client.get(url, params=params, timeout=20)
+                if r.status_code != 200:
+                    continue
+                parsed = _parse_uwyo_sounding(r.text)
+                if parsed:
+                    return parsed
+            except Exception:
                 continue
-            parsed = _parse_uwyo_sounding(r.text)
-            if parsed:
-                return parsed
-        except Exception:
-            continue
     return None
