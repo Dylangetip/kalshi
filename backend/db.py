@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS snapshots (
     best_kalshi_pct    REAL    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_city_ts ON snapshots(city, ts DESC);
+
+CREATE TABLE IF NOT EXISTS position_marks (
+    bet_id          INTEGER NOT NULL,
+    ts              INTEGER NOT NULL,
+    current_yes_pct REAL    NOT NULL,
+    pl              REAL    NOT NULL,
+    PRIMARY KEY (bet_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_marks_ts ON position_marks(ts);
 """
 
 _lock = threading.Lock()
@@ -123,13 +132,17 @@ def reset() -> None:
     with _lock:
         c.execute("DELETE FROM bets")
         c.execute("DELETE FROM snapshots")
+        c.execute("DELETE FROM position_marks")
         c.commit()
 
 
-def insert_snapshot(state: Dict) -> None:
+def insert_snapshot(state: Dict, ts: Optional[int] = None) -> None:
     """Persist a city snapshot. Pulls model_max + recommended bracket from
     the same response shape /api/state returns, so the caller doesn't need
-    to reshape data."""
+    to reshape data. Pass `ts` explicitly to keep all cities in a snapshot
+    loop iteration synchronized to the same wall-clock second."""
+    if ts is None:
+        ts = int(time.time())
     best = state["settlementBracket"]
     c = _conn_or_init()
     with _lock:
@@ -139,7 +152,7 @@ def insert_snapshot(state: Dict) -> None:
                 best_bracket_label, best_kalshi_pct
             ) VALUES (?,?,?,?,?,?)""",
             (
-                int(time.time()),
+                ts,
                 state["city"]["code"],
                 float(state["modelMax"]),
                 int(state["bestEdgeCents"]),
@@ -148,6 +161,53 @@ def insert_snapshot(state: Dict) -> None:
             ),
         )
         c.commit()
+
+
+def insert_position_mark(bet_id: int, ts: int, current_yes_pct: float, pl: float) -> None:
+    """Mark a single open bet at a snapshot tick. INSERT OR REPLACE so reruns
+    of the same loop iteration are idempotent."""
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            "INSERT OR REPLACE INTO position_marks (bet_id, ts, current_yes_pct, pl) "
+            "VALUES (?,?,?,?)",
+            (bet_id, ts, current_yes_pct, pl),
+        )
+        c.commit()
+
+
+def list_equity_points(hours: float = 72.0, starting_balance: float = 10000.0) -> List[Dict]:
+    """Per-tick equity curve: starting bankroll + sum of open-position P/L
+    at each snapshot timestamp. Output shape matches the prototype's
+    history rows (date, equity, pl, drawdown, trades) so PnLView's chart
+    components consume it without reshaping."""
+    cutoff = int(time.time() - hours * 3600)
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT ts, SUM(pl) AS total_pl, COUNT(*) AS marks "
+        "FROM position_marks WHERE ts >= ? GROUP BY ts ORDER BY ts ASC",
+        (cutoff,),
+    ).fetchall()
+    out: List[Dict] = []
+    peak = starting_balance
+    prev_total = 0.0
+    for r in rows:
+        total_pl = float(r["total_pl"] or 0.0)
+        eq = starting_balance + total_pl
+        if eq > peak:
+            peak = eq
+        out.append({
+            "ts": r["ts"],
+            "date": time.strftime("%H:%M", time.localtime(r["ts"])),
+            "equity": round(eq, 2),
+            "pl": round(total_pl - prev_total, 2),
+            "cumulative_pl": round(total_pl, 2),
+            "drawdown": round(eq - peak, 2),
+            "trades": int(r["marks"]),
+            "winRate": 0.5,  # placeholder until settlement is wired
+        })
+        prev_total = total_pl
+    return out
 
 
 def list_snapshots(city: str, hours: float = 24.0, limit: int = 500) -> List[Dict]:

@@ -67,6 +67,7 @@ function App() {
   const [tickFlash, setTickFlash] = useState({});
   const [dataSource, setDataSource] = useState('synthetic'); // 'live' | 'synthetic'
   const [edgeHistory, setEdgeHistory] = useState({}); // {NYC: [{ts, bestEdgeCents}, ...], ...}
+  const [liveHistory, setLiveHistory] = useState(null); // session equity curve from /api/equity
 
   // Theme + accent
   useEffect(() => {
@@ -163,19 +164,27 @@ function App() {
   // we pull the last 4h for each and render a tiny trendline next to the
   // ticker edge value. Empty / single-point histories render nothing.
   useEffect(() => {
-    if (dataSource !== 'live') return;
+    if (dataSource !== 'live') { setEdgeHistory({}); setLiveHistory(null); return; }
     let cancelled = false;
     const refresh = async () => {
-      const results = await Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4)));
+      const [edges, equity] = await Promise.all([
+        Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4))),
+        MOCK.fetchEquity(72),
+      ]);
       if (cancelled) return;
       const map = {};
-      MOCK.CITIES.forEach((c, i) => { if (results[i]) map[c.code] = results[i]; });
+      MOCK.CITIES.forEach((c, i) => { if (edges[i]) map[c.code] = edges[i]; });
       setEdgeHistory(map);
+      // Fall back to synthetic until at least 2 equity points have accrued —
+      // a single-point chart is uglier than the synthetic backtest.
+      setLiveHistory(equity && equity.length >= 2 ? equity : null);
     };
     refresh();
     const t = setInterval(refresh, 60_000);
     return () => { cancelled = true; clearInterval(t); };
   }, [dataSource]);
+
+  const effectiveHistory = liveHistory || history;
 
   const focus = states.find(s => s.city.code === selectedCity) || states[0];
 
@@ -262,12 +271,12 @@ function App() {
 
         <div className="view">
           {tab === 'opportunities' && (
-            <OpportunitiesView states={states} selectedCity={selectedCity} setSelectedCity={setSelectedCity} onPlaceBet={placeBet} history={history} />
+            <OpportunitiesView states={states} selectedCity={selectedCity} setSelectedCity={setSelectedCity} onPlaceBet={placeBet} history={effectiveHistory} />
           )}
-          {tab === 'dashboard' && <DashboardView state={focus} history={history} />}
+          {tab === 'dashboard' && <DashboardView state={focus} history={effectiveHistory} />}
           {tab === 'terminal' && <TerminalView state={focus} onPlaceBet={placeBet} betLog={betLog} />}
           {tab === 'signals' && <SignalsView signals={signals} state={focus} />}
-          {tab === 'pnl' && <PnLView history={history} positions={positions} />}
+          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} liveHistory={liveHistory != null} />}
         </div>
       </div>
 

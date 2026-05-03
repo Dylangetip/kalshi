@@ -515,7 +515,7 @@ function SignalsView({ signals, state }) {
 }
 
 // ====== P&L ======
-function PnLView({ history, positions }) {
+function PnLView({ history, positions, liveHistory = false }) {
   const total = history[history.length - 1].equity;
   const start = history[0].equity;
   const ret = (total - start) / start;
@@ -536,7 +536,7 @@ function PnLView({ history, positions }) {
         <div className="signal-card">
           <div className="label">Equity</div>
           <div className="big-num">{fmtUSD(total)}</div>
-          <div className={`mono ${ret > 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{fmtSign(ret * 100, 2)}% · 60d</div>
+          <div className={`mono ${ret > 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{fmtSign(ret * 100, 2)}% · {liveHistory ? 'session' : '60d'}</div>
         </div>
         <div className="signal-card">
           <div className="label">Win rate</div>
@@ -562,7 +562,7 @@ function PnLView({ history, positions }) {
 
       <div className="panel">
         <div className="panel-header">
-          <span>Equity curve</span>
+          <span>Equity curve {liveHistory && <Pill kind="pos">LIVE · SESSION</Pill>}</span>
           <span className="panel-title-actions">
             <span><span className="dot" style={{ background: 'var(--accent)' }} /> equity</span>
             <span><span className="dot" style={{ background: 'var(--neg)' }} /> drawdown</span>

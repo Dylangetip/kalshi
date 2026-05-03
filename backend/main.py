@@ -199,20 +199,50 @@ app.add_middleware(
 )
 
 
+async def _snapshot_tick(client: httpx.AsyncClient, ts: Optional[int] = None) -> int:
+    """One iteration of the snapshot loop. Returns the count of marks
+    written. Factored out so tests can drive a single tick without the
+    sleep loop."""
+    if ts is None:
+        ts = int(time.time())
+    states = await asyncio.gather(*[_build_state_cached(c, client) for c in CITIES])
+    state_by_city: Dict[str, Dict] = {}
+    for s in states:
+        if s is not None:
+            db.insert_snapshot(s, ts=ts)
+            state_by_city[s["city"]["code"]] = s
+    if not state_by_city:
+        return 0
+    marks = 0
+    for b in db.list_open_bets():
+        cs = state_by_city.get(b["city"])
+        if not cs:
+            continue
+        bracket = next(
+            (br for br in cs["brackets"] if br["label"] == b["bracket_label"]),
+            None,
+        )
+        if not bracket:
+            continue
+        current_yes = bracket["kalshiPct"]
+        entry_yes = b["entry_cents"] / 100
+        sign = 1 if b["side"] == "YES" else -1
+        pl = (current_yes - entry_yes) * b["size"] * sign * 100
+        db.insert_position_mark(b["id"], ts, current_yes, pl)
+        marks += 1
+    return marks
+
+
 async def _snapshot_loop() -> None:
-    """Persist a snapshot of every city's state on a fixed cadence so the
-    frontend can render real edge-history sparklines. Snapshots are skipped
-    when upstream is unreachable (state is None) so we never poison the
-    time series with synthetic fallback data."""
+    """Persist a snapshot of every city's state on a fixed cadence and mark
+    every open bet against it. Snapshots are skipped when upstream is
+    unreachable (state is None) so we never poison the time series with
+    synthetic fallback data; bets without a usable snapshot for their city
+    are skipped at the same tick."""
     while True:
         try:
             async with httpx.AsyncClient() as client:
-                states = await asyncio.gather(
-                    *[_build_state_cached(c, client) for c in CITIES]
-                )
-            for s in states:
-                if s is not None:
-                    db.insert_snapshot(s)
+                await _snapshot_tick(client)
         except Exception as exc:  # noqa: BLE001 — best-effort background task
             print(f"[bets] snapshot loop error: {exc}")
         await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
@@ -313,6 +343,14 @@ def place_bet(b: PlaceBetIn):
 @app.get("/api/bets")
 def get_bets(limit: int = 200):
     return [_bet_row_to_log(b) for b in db.list_bets(limit)]
+
+
+@app.get("/api/equity")
+def get_equity(hours: float = 72.0, starting_balance: float = 10000.0):
+    """Live session equity curve. Per-tick equity = starting bankroll + sum
+    of open-position P/L at that snapshot tick. Empty until at least one
+    bet has been placed and one snapshot loop has run."""
+    return db.list_equity_points(hours=hours, starting_balance=starting_balance)
 
 
 @app.get("/api/snapshots/{code}")
