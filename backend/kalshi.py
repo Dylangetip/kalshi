@@ -31,6 +31,7 @@ class KalshiClient:
         self.token: Optional[str] = None
         self.token_obtained_at: float = 0.0
         self.member_id: Optional[str] = None
+        self.last_error: Optional[str] = None
         self._login_lock = asyncio.Lock()
 
     @property
@@ -50,24 +51,37 @@ class KalshiClient:
 
     async def _login(self, client: httpx.AsyncClient) -> Optional[str]:
         """Exchange creds for a bearer token. Returns the token (also caches
-        it on the instance) or None on failure."""
+        it on the instance) or None on failure. Last-error details are
+        kept on the instance for the /test endpoint."""
         if not self.configured():
             return None
         async with self._login_lock:
-            r = await client.post(
-                f"{self.base}/login",
-                json={"email": self.email, "password": self.password},
-                timeout=15,
-            )
-            if r.status_code != 200:
+            try:
+                r = await client.post(
+                    f"{self.base}/login",
+                    json={"email": self.email, "password": self.password},
+                    timeout=15,
+                )
+            except Exception as exc:  # network / DNS / TLS
+                self.last_error = f"network: {type(exc).__name__}: {exc}"
                 return None
-            data = r.json()
+            if r.status_code != 200:
+                body = r.text[:300] if r.text else ""
+                self.last_error = f"HTTP {r.status_code}: {body}"
+                return None
+            try:
+                data = r.json()
+            except Exception:
+                self.last_error = f"non-JSON response: {r.text[:200]}"
+                return None
             token = data.get("token")
             if not token:
+                self.last_error = f"no token in response: {data}"
                 return None
             self.token = token
             self.member_id = data.get("member_id")
             self.token_obtained_at = time.time()
+            self.last_error = None
             return token
 
     async def _ensure_token(self, client: httpx.AsyncClient) -> Optional[str]:
@@ -147,8 +161,9 @@ async def login_test(client: httpx.AsyncClient) -> Dict:
         "configured": True,
         "logged_in": token is not None,
         "base": _client.base,
+        "email": _client.email,
         "member_id": _client.member_id,
-        "error": None if token else "login failed (check creds and KALSHI_API_BASE)",
+        "error": None if token else (_client.last_error or "unknown error"),
     }
 
 
