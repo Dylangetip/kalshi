@@ -192,8 +192,21 @@ async def fetch_climate_report(client: httpx.AsyncClient, office: str) -> Option
         return None
 
 
-async def fetch_nws_forecast_max(client: httpx.AsyncClient, lat: float, lon: float) -> Optional[float]:
-    """Official NWS forecast max temp for tomorrow, in Fahrenheit. Two-step lookup via /points."""
+async def fetch_nws_forecast_max(
+    client: httpx.AsyncClient,
+    lat: float,
+    lon: float,
+    target_date_iso: Optional[str] = None,
+) -> Optional[float]:
+    """Official NWS forecast max temp, in Fahrenheit. Two-step lookup via
+    /points → /forecast.
+
+    NWS returns periods like ["This Afternoon", "Tonight", "Monday",
+    "Monday Night", ...]. The previous "first daytime period wins" was
+    picking up "This Afternoon" — today's already-cooked high — when the
+    server runs during the day. With target_date_iso passed, we filter
+    to the daytime period whose startTime falls on that date so we get
+    tomorrow's forecast deliberately."""
     headers = {"User-Agent": USER_AGENT}
     try:
         r = await client.get(f"{NWS_API}/points/{lat:.4f},{lon:.4f}", headers=headers, timeout=15)
@@ -202,14 +215,37 @@ async def fetch_nws_forecast_max(client: httpx.AsyncClient, lat: float, lon: flo
         r2 = await client.get(forecast_url, headers=headers, timeout=15)
         r2.raise_for_status()
         periods = r2.json()["properties"]["periods"]
-        # Find the next daytime "isDaytime: true" period — that's tomorrow's high.
         for p in periods:
-            if p.get("isDaytime"):
-                # Skip today's remainder if there's a later daytime period within ~36h.
-                temp = p.get("temperature")
-                if temp is not None and p.get("temperatureUnit") == "F":
-                    return float(temp)
+            if not p.get("isDaytime"):
+                continue
+            if target_date_iso:
+                start = p.get("startTime", "")
+                # startTime is local-iso e.g. "2026-05-04T06:00:00-04:00".
+                if start[:10] != target_date_iso:
+                    continue
+            temp = p.get("temperature")
+            if temp is not None and p.get("temperatureUnit") == "F":
+                return float(temp)
         return None
+    except Exception:
+        return None
+
+
+async def fetch_nws_forecast_periods(
+    client: httpx.AsyncClient,
+    lat: float,
+    lon: float,
+) -> Optional[list]:
+    """Raw NWS forecast periods. Used by /api/debug/nws/{city} to inspect
+    why fetch_nws_forecast_max picked the period it did."""
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = await client.get(f"{NWS_API}/points/{lat:.4f},{lon:.4f}", headers=headers, timeout=15)
+        r.raise_for_status()
+        forecast_url = r.json()["properties"]["forecast"]
+        r2 = await client.get(forecast_url, headers=headers, timeout=15)
+        r2.raise_for_status()
+        return r2.json()["properties"]["periods"]
     except Exception:
         return None
 

@@ -108,6 +108,7 @@ from .sources import (
     fetch_iem_mos,
     fetch_metar,
     fetch_nws_forecast_max,
+    fetch_nws_forecast_periods,
     fetch_open_meteo,
     fetch_sounding,
 )
@@ -130,13 +131,14 @@ def _afternoon_index(times: List[str]) -> int:
 
 
 async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[Dict]:
+    target_iso = _city_target_date(city)
     om, ecmwf_c, gfs_mos_f, nam_mos_f, afd_text, nws_max_f, sounding, metar = await asyncio.gather(
         fetch_open_meteo(client, city["lat"], city["lon"]),
         fetch_ecmwf_max(client, city["lat"], city["lon"]),
         fetch_iem_mos(client, city["station"], "GFS"),
         fetch_iem_mos(client, city["station"], "NAM"),
         fetch_afd(client, city["office"]),
-        fetch_nws_forecast_max(client, city["lat"], city["lon"]),
+        fetch_nws_forecast_max(client, city["lat"], city["lon"], target_date_iso=target_iso),
         fetch_sounding(client, city["sounding"]),
         fetch_metar(client, city["station"]),
     )
@@ -574,6 +576,31 @@ async def kalshi_events(series_ticker: Optional[str] = None, status: str = "open
     if events is None:
         raise HTTPException(502, "Kalshi fetch failed")
     return {"count": len(events), "events": events}
+
+
+@app.get("/api/debug/nws/{code}")
+async def nws_debug(code: str):
+    """Inspect raw NWS forecast periods for a city — find out which one
+    fetch_nws_forecast_max is picking and why."""
+    city = next((c for c in CITIES if c["code"] == code.upper()), None)
+    if not city:
+        raise HTTPException(404, f"unknown city {code}")
+    target = _city_target_date(city)
+    async with httpx.AsyncClient() as client:
+        periods = await fetch_nws_forecast_periods(client, city["lat"], city["lon"])
+    if periods is None:
+        raise HTTPException(502, "NWS fetch failed")
+    summary = [
+        {
+            "name": p.get("name"),
+            "start": p.get("startTime", "")[:16],
+            "isDaytime": p.get("isDaytime"),
+            "temperature": p.get("temperature"),
+            "match": p.get("startTime", "")[:10] == target and p.get("isDaytime"),
+        }
+        for p in periods[:8]
+    ]
+    return {"city": code.upper(), "target_date": target, "periods": summary}
 
 
 @app.get("/api/kalshi/debug/{code}")
