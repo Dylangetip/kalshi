@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Bets — Kalshi Weather Trading Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" src="data.jsx"></script>
+<script type="text/babel" src="components.jsx"></script>
+<script type="text/babel" src="views.jsx"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "theme": "dark",
+  "density": "comfortable",
+  "accent": "amber"
+}/*EDITMODE-END*/;
+
+const ACCENTS = {
+  amber:   'oklch(0.78 0.14 75)',
+  green:   'oklch(0.74 0.16 145)',
+  cyan:    'oklch(0.74 0.12 220)',
+  magenta: 'oklch(0.7 0.18 330)',
+};
+
+function App() {
+  const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const [tab, setTab] = useState('opportunities');
+  const [states, setStates] = useState(() => MOCK.initialState());
+  const [selectedCity, setSelectedCity] = useState('NYC');
+  const [betLog, setBetLog] = useState([]);
+  const [history] = useState(() => MOCK.buildHistory());
+  const [positions, setPositions] = useState(() => MOCK.buildOpenPositions());
+  const [signals, setSignals] = useState(() => MOCK.buildSignals(MOCK.CITIES.find(c => c.code === 'NYC'), 1));
+  const [now, setNow] = useState(new Date());
+  const [tickFlash, setTickFlash] = useState({});
+
+  // Theme + accent
+  useEffect(() => {
+    document.documentElement.dataset.theme = tweaks.theme;
+    document.documentElement.style.setProperty('--accent', ACCENTS[tweaks.accent] || ACCENTS.amber);
+  }, [tweaks.theme, tweaks.accent]);
+
+  // Clock tick
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Live data tick — every 4s, jitter the kalshi prices a touch + recompute edges
+  useEffect(() => {
+    const t = setInterval(() => {
+      setStates(prev => prev.map(s => {
+        const newBrackets = s.brackets.map(b => {
+          const drift = (Math.random() - 0.5) * 0.018;
+          const newK = Math.max(0.001, Math.min(0.999, b.kalshiPct + drift));
+          return { ...b, kalshiPct: newK, edge: b.modelPct - newK, yesPrice: Math.round(newK * 100) };
+        });
+        const sumK = newBrackets.reduce((a, b) => a + b.kalshiPct, 0);
+        const norm = newBrackets.map(b => ({ ...b, kalshiPct: b.kalshiPct / sumK, edge: b.modelPct - b.kalshiPct / sumK, yesPrice: Math.round(b.kalshiPct / sumK * 100) }));
+        const best = norm.reduce((a, b) => b.edge > a.edge ? b : a, norm[0]);
+        return {
+          ...s,
+          brackets: norm,
+          settlementBracket: best,
+          bestEdgeCents: Math.round(best.edge * 100),
+          asof: Date.now(),
+        };
+      }));
+      // mark to market open positions
+      setPositions(prev => prev.map(p => {
+        const newCur = Math.max(0.01, Math.min(0.99, p.current + (Math.random() - 0.5) * 0.012));
+        const pl = (newCur - p.entry) * p.size * (p.side === 'YES' ? 1 : -1) * 100;
+        return { ...p, current: +newCur.toFixed(3), pl: +pl.toFixed(2) };
+      }));
+      setTickFlash({ t: Date.now() });
+    }, 4000);
+    return () => clearInterval(t);
+  }, []);
+
+  const focus = states.find(s => s.city.code === selectedCity) || states[0];
+
+  const placeBet = (cityCode, bracket, side, size) => {
+    const time = new Date().toTimeString().slice(0, 8);
+    const entry = side === 'YES' ? bracket.yesPrice : 100 - bracket.yesPrice;
+    setBetLog(log => [{ time, city: cityCode, bracket, side, size, entry }, ...log]);
+    // Add to positions
+    setPositions(prev => [{
+      id: 'P' + (prev.length + 100),
+      city: cityCode,
+      bracket: bracket.label,
+      side,
+      size,
+      entry: entry / 100,
+      current: entry / 100,
+      pl: 0,
+    }, ...prev]);
+  };
+
+  const tabs = [
+    { id: 'opportunities', label: 'Opportunities', badge: states.filter(s => s.bestEdgeCents > 3).length },
+    { id: 'dashboard', label: 'City Dashboard' },
+    { id: 'terminal', label: 'Trading Terminal' },
+    { id: 'signals', label: 'Signals', badge: signals.filter(s => s.status === 'stale').length || null },
+    { id: 'pnl', label: 'P&L' },
+  ];
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark"></span>
+          <span>BETS · v3.0</span>
+        </div>
+        <div className="tabs">
+          {tabs.map(t => (
+            <button key={t.id} className={`tab ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)}>
+              {t.label}
+              {t.badge != null && t.badge !== 0 && <span className="tab-badge">{t.badge}</span>}
+            </button>
+          ))}
+        </div>
+        <div className="topbar-right">
+          <span className="live-dot"></span>
+          <span>LIVE</span>
+          <span style={{ color: 'var(--fg-3)' }}>·</span>
+          <span className="clock">{now.toTimeString().slice(0, 8)}</span>
+          <span style={{ color: 'var(--fg-3)' }}>·</span>
+          <span>tick {Math.floor((tickFlash.t || Date.now()) / 4000) % 10000}</span>
+        </div>
+      </header>
+
+      <div className="main">
+        {/* City ticker — present on all tabs */}
+        <div className="ticker">
+          {states.map(s => (
+            <div key={s.city.code}
+              className={`ticker-item ${selectedCity === s.city.code ? 'active' : ''}`}
+              onClick={() => setSelectedCity(s.city.code)}>
+              <div className="ticker-row">
+                <span className="ticker-city">{s.city.code} · {s.city.label}</span>
+                <span className={`ticker-edge ${s.bestEdgeCents > 0 ? 'pos' : 'neg'}`}>
+                  {fmtSign(s.bestEdgeCents)}¢
+                </span>
+              </div>
+              <div className="ticker-row">
+                <span className="ticker-station">{s.city.station} · {fmt(s.modelMax)}°F</span>
+                <span className="ticker-meta">{s.settlementBracket.label}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="view">
+          {tab === 'opportunities' && (
+            <OpportunitiesView states={states} selectedCity={selectedCity} setSelectedCity={setSelectedCity} onPlaceBet={placeBet} history={history} />
+          )}
+          {tab === 'dashboard' && <DashboardView state={focus} history={history} />}
+          {tab === 'terminal' && <TerminalView state={focus} onPlaceBet={placeBet} betLog={betLog} />}
+          {tab === 'signals' && <SignalsView signals={signals} state={focus} />}
+          {tab === 'pnl' && <PnLView history={history} positions={positions} />}
+        </div>
+      </div>
+
+      <footer className="statusbar">
+        <span>BETS v3.0</span>
+        <span className="sep">|</span>
+        <span>34 signals · 17 categories</span>
+        <span className="sep">|</span>
+        <span><span className="dot pos"></span> data: nominal</span>
+        <span className="sep">|</span>
+        <span>paper trading</span>
+        <span className="sep">|</span>
+        <span>{focus.city.code} · {focus.city.station}</span>
+        <span style={{ marginLeft: 'auto' }}>Quarter-Kelly sizing · ¼K cap 5%</span>
+      </footer>
+
+      <TweaksPanel title="Tweaks">
+        <TweakSection title="Appearance">
+          <TweakRadio label="Theme" value={tweaks.theme} options={[['dark','Dark'],['light','Light']]} onChange={v => setTweak('theme', v)} />
+          <TweakRadio label="Accent" value={tweaks.accent} options={[['amber','Amber'],['green','Green'],['cyan','Cyan'],['magenta','Magenta']]} onChange={v => setTweak('accent', v)} />
+          <TweakRadio label="Density" value={tweaks.density} options={[['compact','Compact'],['comfortable','Comfortable']]} onChange={v => setTweak('density', v)} />
+        </TweakSection>
+        <TweakSection title="Live">
+          <div style={{ fontSize: 11, color: 'var(--fg-2)', lineHeight: 1.5 }}>
+            Prices tick every 4s. Place bets on any tab — they appear in P&L · Open positions, marking to market in real time.
+          </div>
+        </TweakSection>
+      </TweaksPanel>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
