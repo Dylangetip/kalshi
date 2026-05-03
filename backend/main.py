@@ -39,8 +39,8 @@ from pydantic import BaseModel, Field
 def _load_dotenv(path: Path) -> None:
     """Tiny stdlib KEY=value loader — no python-dotenv dep needed.
     Ignores blank lines and lines starting with `#`. Strips surrounding
-    quotes if present. Existing process env wins (so explicit exports
-    override the file)."""
+    quotes if present. Always overwrites — every uvicorn reload picks
+    up the current .env without needing a full process restart."""
     if not path.exists():
         return
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -50,7 +50,7 @@ def _load_dotenv(path: Path) -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
+        if key:
             os.environ[key] = value
 
 
