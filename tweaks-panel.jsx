@@ -293,11 +293,7 @@ function TweakToggle({ label, value, onChange }) {
 function TweakRadio({ label, value, options, onChange }) {
   const trackRef = React.useRef(null);
   const [dragging, setDragging] = React.useState(false);
-  const opts = options.map((o) =>
-    Array.isArray(o) ? { value: o[0], label: o[1] }
-      : (o !== null && typeof o === 'object') ? o
-      : { value: o, label: o }
-  );
+  const opts = options.map((o) => (typeof o === 'object' ? o : { value: o, label: o }));
   const idx = Math.max(0, opts.findIndex((o) => o.value === value));
   const n = opts.length;
 
@@ -353,8 +349,8 @@ function TweakSelect({ label, value, options, onChange }) {
     <TweakRow label={label}>
       <select className="twk-field" value={value} onChange={(e) => onChange(e.target.value)}>
         {options.map((o) => {
-          const v = Array.isArray(o) ? o[0] : (typeof o === 'object' && o !== null ? o.value : o);
-          const l = Array.isArray(o) ? o[1] : (typeof o === 'object' && o !== null ? o.label : o);
+          const v = typeof o === 'object' ? o.value : o;
+          const l = typeof o === 'object' ? o.label : o;
           return <option key={v} value={v}>{l}</option>;
         })}
       </select>
