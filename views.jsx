@@ -306,15 +306,32 @@ function TerminalView({ state, onPlaceBet, betLog }) {
             </div>
             <div style={{ maxHeight: 180, overflow: 'auto' }}>
               {betLog.length === 0 && <div style={{ padding: 14, fontSize: 11, color: 'var(--fg-3)' }}>No bets yet — place one →</div>}
-              {betLog.map((b, i) => (
-                <div key={i} style={{ display: 'grid', gridTemplateColumns: '60px 60px 1fr 60px 60px', padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, fontFamily: 'var(--mono)' }}>
-                  <span style={{ color: 'var(--fg-3)' }}>{b.time}</span>
-                  <span>{b.city}</span>
-                  <span>{b.bracket.label} <span className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</span></span>
-                  <span style={{ textAlign: 'right' }}>${b.size}</span>
-                  <span style={{ textAlign: 'right' }} className="pos">{b.entry}¢</span>
-                </div>
-              ))}
+              {betLog.map((b, i) => {
+                const settled = b.status === 'settled' && b.settledPl != null;
+                const won = settled && b.settledPl > 0;
+                return (
+                  <div key={i} style={{ display: 'grid', gridTemplateColumns: '60px 50px 1fr 60px 80px', padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11, fontFamily: 'var(--mono)', opacity: settled ? 0.85 : 1 }}>
+                    <span style={{ color: 'var(--fg-3)' }}>{b.time}</span>
+                    <span>{b.city}</span>
+                    <span>
+                      {b.bracket.label} <span className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</span>
+                      {settled && (
+                        <span className={won ? 'pos' : 'neg'} style={{ marginLeft: 6, fontSize: 9, fontWeight: 600 }}>
+                          · {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
+                        </span>
+                      )}
+                    </span>
+                    <span style={{ textAlign: 'right' }}>${b.size}</span>
+                    {settled ? (
+                      <span style={{ textAlign: 'right' }} className={won ? 'pos' : 'neg'}>
+                        {fmtSign(b.settledPl, 0)}
+                      </span>
+                    ) : (
+                      <span style={{ textAlign: 'right' }} className="pos">{b.entry}¢</span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -515,7 +532,7 @@ function SignalsView({ signals, state }) {
 }
 
 // ====== P&L ======
-function PnLView({ history, positions, liveHistory = false }) {
+function PnLView({ history, positions, liveHistory = false, stats = null }) {
   const total = history[history.length - 1].equity;
   const start = history[0].equity;
   const ret = (total - start) / start;
@@ -539,9 +556,24 @@ function PnLView({ history, positions, liveHistory = false }) {
           <div className={`mono ${ret > 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{fmtSign(ret * 100, 2)}% · {liveHistory ? 'session' : '60d'}</div>
         </div>
         <div className="signal-card">
-          <div className="label">Win rate</div>
-          <div className="big-num">{(winRate * 100).toFixed(0)}%</div>
-          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{wins}W / {history.length - wins}L</div>
+          <div className="label">Win rate {stats && stats.settled > 0 && <Pill kind="pos">REAL</Pill>}</div>
+          {stats && stats.settled > 0 ? (
+            <>
+              <div className="big-num">{(stats.winRate * 100).toFixed(0)}%</div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                {stats.won}W / {stats.settled - stats.won}L · {stats.open} open
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="big-num" style={{ color: stats ? 'var(--fg-2)' : undefined }}>
+                {stats ? '—' : (winRate * 100).toFixed(0) + '%'}
+              </div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                {stats ? `${stats.open} open · awaiting settlement` : `${wins}W / ${history.length - wins}L`}
+              </div>
+            </>
+          )}
         </div>
         <div className="signal-card">
           <div className="label">Sharpe (ann.)</div>

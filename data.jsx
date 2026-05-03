@@ -281,6 +281,16 @@ async function fetchPositions() {
   }
 }
 
+async function fetchStats() {
+  try {
+    const r = await fetch(`${API_BASE}/api/stats`, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 async function fetchEquity(hours = 72) {
   try {
     const r = await fetch(`${API_BASE}/api/equity?hours=${hours}`, { cache: 'no-store' });
@@ -330,5 +340,5 @@ window.MOCK = {
   CITIES, SIGNAL_CATALOG,
   initialState, buildSignals, buildHistory, buildOpenPositions,
   seedRand, gauss, makeBrackets, buildCityState,
-  fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, persistBet, API_BASE,
+  fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, fetchStats, persistBet, API_BASE,
 };

@@ -68,6 +68,7 @@ function App() {
   const [dataSource, setDataSource] = useState('synthetic'); // 'live' | 'synthetic'
   const [edgeHistory, setEdgeHistory] = useState({}); // {NYC: [{ts, bestEdgeCents}, ...], ...}
   const [liveHistory, setLiveHistory] = useState(null); // session equity curve from /api/equity
+  const [liveStats, setLiveStats] = useState(null);     // {settled, won, open, winRate, realizedPl}
 
   // Theme + accent
   useEffect(() => {
@@ -164,12 +165,16 @@ function App() {
   // we pull the last 4h for each and render a tiny trendline next to the
   // ticker edge value. Empty / single-point histories render nothing.
   useEffect(() => {
-    if (dataSource !== 'live') { setEdgeHistory({}); setLiveHistory(null); return; }
+    if (dataSource !== 'live') {
+      setEdgeHistory({}); setLiveHistory(null); setLiveStats(null);
+      return;
+    }
     let cancelled = false;
     const refresh = async () => {
-      const [edges, equity] = await Promise.all([
+      const [edges, equity, stats] = await Promise.all([
         Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4))),
         MOCK.fetchEquity(72),
+        MOCK.fetchStats(),
       ]);
       if (cancelled) return;
       const map = {};
@@ -178,6 +183,7 @@ function App() {
       // Fall back to synthetic until at least 2 equity points have accrued —
       // a single-point chart is uglier than the synthetic backtest.
       setLiveHistory(equity && equity.length >= 2 ? equity : null);
+      setLiveStats(stats);
     };
     refresh();
     const t = setInterval(refresh, 60_000);
@@ -276,7 +282,7 @@ function App() {
           {tab === 'dashboard' && <DashboardView state={focus} history={effectiveHistory} />}
           {tab === 'terminal' && <TerminalView state={focus} onPlaceBet={placeBet} betLog={betLog} />}
           {tab === 'signals' && <SignalsView signals={signals} state={focus} />}
-          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} liveHistory={liveHistory != null} />}
+          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} liveHistory={liveHistory != null} stats={liveStats} />}
         </div>
       </div>
 
