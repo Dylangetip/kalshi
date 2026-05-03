@@ -46,15 +46,30 @@ _BELOW_RE = _re.compile(r"(?:below|under|≤|<=|<)\s*(-?\d+)", _re.IGNORECASE)
 
 def parse_bracket_range(market: Dict) -> Optional[tuple]:
     """Extract (lo, hi) integer Fahrenheit bounds from a Kalshi market.
-    Open-ended brackets ('above 90°') are mapped to a wide bound at the
-    relevant edge so they can still slot into the ladder."""
+
+    Three shapes Kalshi actually uses for daily-high temp brackets:
+      - "B<x>.5" two-sided bracket: floor_strike + cap_strike both present
+      - "T<x>" lower-tail (≤x°): only cap_strike present
+      - "T<x>" upper-tail (≥x°): only floor_strike present
+    Open-ended brackets get widened by 20° so they slot into the ladder."""
     floor = market.get("floor_strike")
     cap = market.get("cap_strike")
-    if floor is not None and cap is not None:
-        try:
-            return int(round(float(floor))), int(round(float(cap)))
-        except (TypeError, ValueError):
-            pass
+    try:
+        floor_i = int(round(float(floor))) if floor is not None else None
+        cap_i = int(round(float(cap))) if cap is not None else None
+    except (TypeError, ValueError):
+        floor_i = cap_i = None
+
+    if floor_i is not None and cap_i is not None:
+        return (floor_i, cap_i)
+    if cap_i is not None and floor_i is None:
+        # Lower-tail "T<n>" → "≤ n°"
+        return (cap_i - 20, cap_i)
+    if floor_i is not None and cap_i is None:
+        # Upper-tail → "≥ n°"
+        return (floor_i, floor_i + 20)
+
+    # Subtitle fallback for any market that doesn't expose strikes.
     for field in ("yes_sub_title", "sub_title", "subtitle", "rules_primary"):
         text = market.get(field)
         if not text:
@@ -69,6 +84,26 @@ def parse_bracket_range(market: Dict) -> Optional[tuple]:
         m = _BELOW_RE.search(text)
         if m:
             return (int(m.group(1)) - 20, int(m.group(1)))
+    return None
+
+
+def _market_yes_cents(m: Dict) -> Optional[int]:
+    """Best-available YES price in cents, in priority order:
+    last fill → midpoint of bid/ask → ask → bid. Kalshi exposes prices
+    as decimal dollars in `*_dollars` fields (e.g. 0.04 = 4¢)."""
+    last = m.get("last_price_dollars")
+    if last and float(last) > 0:
+        return int(round(float(last) * 100))
+    bid = m.get("yes_bid_dollars")
+    ask = m.get("yes_ask_dollars")
+    bid_f = float(bid) if bid not in (None, "") else None
+    ask_f = float(ask) if ask not in (None, "") else None
+    if bid_f and ask_f:
+        return int(round((bid_f + ask_f) / 2 * 100))
+    if ask_f:
+        return int(round(ask_f * 100))
+    if bid_f:
+        return int(round(bid_f * 100))
     return None
 
 
@@ -275,23 +310,20 @@ class KalshiClient:
             if rng is None:
                 continue
             lo, hi = rng
-            # Prefer last_price (real fill price); fall back to ask, then bid.
-            yes_cents = (
-                m.get("last_price")
-                or m.get("yes_ask")
-                or m.get("yes_bid")
-            )
+            yes_cents = _market_yes_cents(m)
             if yes_cents is None:
                 continue
             out.append({
                 "ticker": m.get("ticker"),
                 "lo": lo,
                 "hi": hi,
-                "yes_cents": int(yes_cents),
-                "yes_bid": m.get("yes_bid"),
-                "yes_ask": m.get("yes_ask"),
-                "volume": m.get("volume", 0) or 0,
-                "open_interest": m.get("open_interest", 0) or 0,
+                "yes_cents": yes_cents,
+                "yes_bid_cents": int(round(float(m["yes_bid_dollars"]) * 100))
+                    if m.get("yes_bid_dollars") else None,
+                "yes_ask_cents": int(round(float(m["yes_ask_dollars"]) * 100))
+                    if m.get("yes_ask_dollars") else None,
+                "volume": int(round(float(m.get("volume_fp") or 0))),
+                "open_interest": int(round(float(m.get("open_interest_fp") or 0))),
             })
         out.sort(key=lambda b: b["lo"])
         return out or None
