@@ -43,21 +43,27 @@ async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) ->
 
 
 async def fetch_ecmwf_max(client: httpx.AsyncClient, lat: float, lon: float) -> Optional[float]:
-    """ECMWF IFS daily max temp for tomorrow, in Celsius."""
-    params = {
-        "latitude": lat, "longitude": lon,
-        "daily": "temperature_2m_max",
-        "models": "ecmwf_ifs04",
-        "forecast_days": 2,
-        "timezone": "auto",
-    }
-    try:
-        r = await client.get(OPEN_METEO_URL, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return data["daily"]["temperature_2m_max"][1]
-    except Exception:
-        return None
+    """ECMWF IFS daily max temp for tomorrow, in Celsius. Open-Meteo
+    renamed `ecmwf_ifs04` (0.4°) to `ecmwf_ifs025` (0.25°) — try the
+    current name first, fall back to the legacy name."""
+    for model_id in ("ecmwf_ifs025", "ecmwf_ifs04"):
+        params = {
+            "latitude": lat, "longitude": lon,
+            "daily": "temperature_2m_max",
+            "models": model_id,
+            "forecast_days": 2,
+            "timezone": "auto",
+        }
+        try:
+            r = await client.get(OPEN_METEO_URL, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            highs = data.get("daily", {}).get("temperature_2m_max")
+            if highs and len(highs) >= 2 and highs[1] is not None:
+                return highs[1]
+        except Exception:
+            continue
+    return None
 
 
 def _parse_mos_csv(text: str, target_date: datetime) -> Optional[float]:

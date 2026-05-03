@@ -7,6 +7,34 @@ def gauss(x: float, mean: float, sigma: float) -> float:
     return math.exp(-0.5 * z * z) / (sigma * math.sqrt(2 * math.pi))
 
 
+def gauss_cdf(x: float, mean: float, sigma: float) -> float:
+    """Cumulative distribution function: P(X ≤ x) for X ~ N(mean, sigma²)."""
+    return 0.5 * (1 + math.erf((x - mean) / (sigma * math.sqrt(2))))
+
+
+def bracket_prob(
+    lo: float,
+    hi: float,
+    mean: float,
+    sigma: float,
+    lower_tail: bool = False,
+    upper_tail: bool = False,
+) -> float:
+    """Probability the daily max falls in this Kalshi bracket.
+
+    Kalshi events are mutually_exclusive=true. The B-brackets are
+    integer intervals like {70, 71} → continuous [69.5, 71.5). The
+    T-brackets are open tails — but defined to NOT overlap with the
+    adjacent B-bracket, so T70 means "strictly below 70" (cap_strike
+    is the threshold, not a member). For T70 with hi=70: integers
+    [..., 69] = (-∞, 69.5) → CDF(hi - 0.5). Symmetric for upper tails."""
+    if lower_tail:
+        return gauss_cdf(hi - 0.5, mean, sigma)
+    if upper_tail:
+        return 1.0 - gauss_cdf(lo + 0.5, mean, sigma)
+    return gauss_cdf(hi + 0.5, mean, sigma) - gauss_cdf(lo - 0.5, mean, sigma)
+
+
 def make_brackets(model_max: float, count: int = 9, step: int = 2) -> List[Dict]:
     center = round(model_max / step) * step
     half = count // 2

@@ -96,9 +96,9 @@ _snapshot_task: Optional[asyncio.Task] = None
 _settlement_task: Optional[asyncio.Task] = None
 from .model import (
     best_bracket,
+    bracket_prob,
     compute_ladder,
     ensemble_model_max,
-    gauss,
     kelly_fraction,
     parse_afd,
 )
@@ -195,13 +195,16 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     if kalshi_brackets:
         ladder = []
         for b in kalshi_brackets:
-            mid = (b["lo"] + b["hi"]) / 2
-            width = max(1, b["hi"] - b["lo"] + 1)
-            model_pct = gauss(mid, model_max, sigma) * width
+            model_pct = bracket_prob(
+                b["lo"], b["hi"], model_max, sigma,
+                lower_tail=b.get("lower_tail", False),
+                upper_tail=b.get("upper_tail", False),
+            )
             kalshi_pct = b["yes_cents"] / 100
             ladder.append({
                 "lo": b["lo"], "hi": b["hi"],
-                "label": f"{b['lo']}–{b['hi']}°F",
+                "label": f"{b['lo']}–{b['hi']}°F" if not (b.get("lower_tail") or b.get("upper_tail"))
+                         else (f"≤{b['hi']}°F" if b.get("lower_tail") else f"≥{b['lo']}°F"),
                 "modelPct": round(model_pct, 4),
                 "kalshiPct": round(kalshi_pct, 4),
                 "edge": round(model_pct - kalshi_pct, 4),

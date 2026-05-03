@@ -293,7 +293,11 @@ function App() {
         <span className="sep">|</span>
         <span>
           <span className={`dot ${dataSource === 'live' ? 'pos' : 'warn'}`}></span>
-          {' '}data: {dataSource === 'live' ? 'live · OM/MOS/AFD' : 'synthetic'}
+          {' '}data: {dataSource === 'live'
+            ? `live · ${[focus.sources?.metar && 'METAR', focus.sources?.gfsMos && 'MOS',
+                         focus.sources?.afd && 'AFD', focus.sources?.kalshi && 'KALSHI']
+                       .filter(Boolean).join('/') || 'OM'}`
+            : 'synthetic'}
         </span>
         <span className="sep">|</span>
         <span>paper trading</span>

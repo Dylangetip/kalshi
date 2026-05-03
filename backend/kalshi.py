@@ -313,10 +313,16 @@ class KalshiClient:
             yes_cents = _market_yes_cents(m)
             if yes_cents is None:
                 continue
+            # Tag the synthetic-edge brackets so the ladder builder integrates
+            # them as proper tails (-inf or +inf) instead of fixed 20°-wide.
+            has_floor = m.get("floor_strike") is not None
+            has_cap = m.get("cap_strike") is not None
             out.append({
                 "ticker": m.get("ticker"),
                 "lo": lo,
                 "hi": hi,
+                "lower_tail": (has_cap and not has_floor),
+                "upper_tail": (has_floor and not has_cap),
                 "yes_cents": yes_cents,
                 "yes_bid_cents": int(round(float(m["yes_bid_dollars"]) * 100))
                     if m.get("yes_bid_dollars") else None,
