@@ -199,6 +199,89 @@ class KalshiClient:
             "Accept": "application/json",
         }
 
+    async def _signed_post(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        body: Dict,
+    ) -> Optional[httpx.Response]:
+        """POST <base><path> with a signed Authorization. Same RSA-PSS
+        signature scheme as GET — signs `{ts_ms}{METHOD}{path}` where
+        path includes the /trade-api/v2 prefix."""
+        if not self.configured():
+            self.last_error = "API key not configured"
+            return None
+        full_path = self.base_path + path
+        headers = self._signed_headers("POST", full_path)
+        if headers is None:
+            return None
+        headers["Content-Type"] = "application/json"
+        try:
+            return await client.post(
+                f"{self.base}{path}", headers=headers, json=body, timeout=15
+            )
+        except Exception as exc:
+            self.last_error = f"network: {type(exc).__name__}: {exc}"
+            return None
+
+    async def place_order(
+        self,
+        client: httpx.AsyncClient,
+        ticker: str,
+        side: str,            # "yes" or "no"
+        count: int,           # number of contracts
+        yes_price: Optional[int] = None,  # 1-99 cents (limit YES)
+        no_price: Optional[int] = None,   # 1-99 cents (limit NO)
+        action: str = "buy",  # "buy" or "sell"
+        order_type: str = "limit",
+    ) -> Optional[Dict]:
+        """Submit a real order to Kalshi. Returns the API's order object on
+        success, None on failure (with details in self.last_error).
+        Caller is responsible for safety caps — this method just signs
+        and ships the request."""
+        import uuid
+        body: Dict = {
+            "ticker": ticker,
+            "side": side,
+            "count": count,
+            "action": action,
+            "type": order_type,
+            "client_order_id": str(uuid.uuid4()),
+        }
+        if order_type == "limit":
+            if side == "yes" and yes_price is not None:
+                body["yes_price"] = yes_price
+            elif side == "no" and no_price is not None:
+                body["no_price"] = no_price
+            else:
+                self.last_error = "limit order requires yes_price (yes) or no_price (no)"
+                return None
+
+        r = await self._signed_post(client, "/portfolio/orders", body)
+        if r is None:
+            return None
+        if r.status_code not in (200, 201):
+            self.last_error = f"HTTP {r.status_code}: {r.text[:400]}"
+            return None
+        try:
+            return r.json()
+        except Exception as exc:
+            self.last_error = f"non-JSON: {exc}"
+            return None
+
+    async def fetch_balance(self, client: httpx.AsyncClient) -> Optional[Dict]:
+        """Account balance — used as a sanity check before placing orders."""
+        r = await self._signed_get(client, "/portfolio/balance")
+        if r is None or r.status_code != 200:
+            if r is not None:
+                self.last_error = f"HTTP {r.status_code}: {r.text[:200]}"
+            return None
+        try:
+            return r.json()
+        except Exception as exc:
+            self.last_error = f"non-JSON: {exc}"
+            return None
+
     async def _signed_get(
         self,
         client: httpx.AsyncClient,
@@ -433,3 +516,24 @@ async def fetch_brackets_for_city(
     """Module-level wrapper around the singleton client. Returns today's
     bracket markets with parsed (lo, hi) and yes_cents."""
     return await _client.fetch_brackets_for_city(client, series_ticker)
+
+
+async def place_order(
+    client: httpx.AsyncClient,
+    ticker: str,
+    side: str,
+    count: int,
+    yes_price: Optional[int] = None,
+    no_price: Optional[int] = None,
+    action: str = "buy",
+    order_type: str = "limit",
+) -> Optional[Dict]:
+    return await _client.place_order(
+        client, ticker, side, count,
+        yes_price=yes_price, no_price=no_price,
+        action=action, order_type=order_type,
+    )
+
+
+async def fetch_balance(client: httpx.AsyncClient) -> Optional[Dict]:
+    return await _client.fetch_balance(client)

@@ -326,6 +326,37 @@ async def fetch_metar(client: httpx.AsyncClient, station: str, hours: int = 6) -
         return None
 
 
+async def fetch_sounding_raw(client: httpx.AsyncClient, station_id: str) -> dict:
+    """Same upstream call as fetch_sounding, but returns the URL,
+    HTTP status, response length, and a short body excerpt for
+    debugging — never None."""
+    now = datetime.now(timezone.utc)
+    target = now if now.hour >= 13 else now - timedelta(days=1)
+    params = {
+        "TYPE": "TEXT:LIST",
+        "YEAR": target.strftime("%Y"),
+        "MONTH": target.strftime("%m"),
+        "FROM": target.strftime("%d") + "12",
+        "TO": target.strftime("%d") + "12",
+        "STNM": station_id,
+    }
+    try:
+        r = await client.get(UWYO_SOUNDING_URL, params=params, timeout=20)
+        body = r.text
+        parsed = _parse_uwyo_sounding(body)
+        return {
+            "url": str(r.request.url),
+            "status": r.status_code,
+            "body_len": len(body),
+            "body_excerpt": body[:600],
+            "has_pre_block": "<PRE>" in body or "<pre>" in body,
+            "parsed_levels": list(parsed.keys()) if parsed else None,
+            "parsed": parsed,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional[dict]:
     """Pull the most recent 12Z radiosonde sounding from U. Wyoming.
 

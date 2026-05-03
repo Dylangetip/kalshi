@@ -111,6 +111,7 @@ from .sources import (
     fetch_nws_forecast_periods,
     fetch_open_meteo,
     fetch_sounding,
+    fetch_sounding_raw,
 )
 
 CACHE_TTL_SECONDS = 600  # 10 min — Open-Meteo refreshes hourly, MOS/AFD every 6h
@@ -179,9 +180,12 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         return None
 
     afd = parse_afd(afd_text)
-    # Tighter sigma when AFD says high confidence; wider when models disagree.
-    sigma = 2.4 - (afd["score"] - 3) * 0.25
-    sigma = max(1.2, sigma)
+    # Next-day temp forecasts have ~1.5-2°F std dev empirically, so default
+    # σ = 1.8 with AFD adjustment. Tighter when AFD says high confidence,
+    # wider when models disagree. Old σ=2.4 was calibrated for the
+    # synthetic 2°F-wide ladder; the live Kalshi 1°F brackets need tighter.
+    sigma = 1.8 - (afd["score"] - 3) * 0.20
+    sigma = max(1.0, sigma)
 
     # Try real Kalshi prices first. When the API key is configured and the
     # bracket fetch succeeds, use the live market structure (Kalshi's own
@@ -535,6 +539,65 @@ def get_stats():
     return db.stats_summary()
 
 
+class PlaceOrderIn(BaseModel):
+    ticker: str = Field(min_length=1)
+    side: str = Field(pattern="^(yes|no)$")
+    count: int = Field(gt=0)
+    yes_price: Optional[int] = Field(None, ge=1, le=99)
+    no_price: Optional[int] = Field(None, ge=1, le=99)
+    action: str = Field("buy", pattern="^(buy|sell)$")
+    type: str = Field("limit", pattern="^(limit|market)$")
+    confirm: bool = False
+
+
+@app.get("/api/kalshi/balance")
+async def kalshi_balance():
+    """Account balance — sanity check before placing real orders."""
+    if not kalshi.configured():
+        raise HTTPException(503, "Kalshi not configured")
+    async with httpx.AsyncClient() as client:
+        bal = await kalshi.fetch_balance(client)
+    if bal is None:
+        raise HTTPException(502, kalshi._client.last_error or "balance fetch failed")
+    return bal
+
+
+@app.post("/api/kalshi/order")
+async def kalshi_order(o: PlaceOrderIn):
+    """Submit a REAL Kalshi order. Real money. Safety guards:
+      - confirm:true must be set explicitly
+      - server-side cost cap via env BETS_MAX_ORDER_USD (default $25)
+      - side must match the price field (yes_price for yes, etc.)
+    Cost cap is the worst-case dollar exposure of the order."""
+    if not kalshi.configured():
+        raise HTTPException(503, "Kalshi not configured (see backend/.env.example)")
+    if not o.confirm:
+        raise HTTPException(400, "must pass confirm:true to place a real order")
+    price = o.yes_price if o.side == "yes" else o.no_price
+    if o.type == "limit" and price is None:
+        raise HTTPException(400, f"limit order on side={o.side} requires {o.side}_price")
+    if price is not None:
+        cost_usd = (price * o.count) / 100.0
+    else:
+        cost_usd = o.count  # market order worst case = $1/contract
+    cap_usd = float(os.getenv("BETS_MAX_ORDER_USD", "25"))
+    if cost_usd > cap_usd:
+        raise HTTPException(
+            400,
+            f"order cost ${cost_usd:.2f} exceeds BETS_MAX_ORDER_USD=${cap_usd:.2f}",
+        )
+    async with httpx.AsyncClient() as client:
+        result = await kalshi.place_order(
+            client,
+            ticker=o.ticker, side=o.side, count=o.count,
+            yes_price=o.yes_price, no_price=o.no_price,
+            action=o.action, order_type=o.type,
+        )
+    if result is None:
+        raise HTTPException(502, kalshi._client.last_error or "order placement failed")
+    return result
+
+
 @app.get("/api/kalshi/info")
 def kalshi_info():
     """Non-secret view of current Kalshi auth state. Useful as a sanity
@@ -576,6 +639,17 @@ async def kalshi_events(series_ticker: Optional[str] = None, status: str = "open
     if events is None:
         raise HTTPException(502, "Kalshi fetch failed")
     return {"count": len(events), "events": events}
+
+
+@app.get("/api/debug/sounding/{code}")
+async def sounding_debug(code: str):
+    """Inspect why fetch_sounding returns None — surfaces URL, HTTP
+    status, body length, and parsed levels."""
+    city = next((c for c in CITIES if c["code"] == code.upper()), None)
+    if not city:
+        raise HTTPException(404, f"unknown city {code}")
+    async with httpx.AsyncClient() as client:
+        return await fetch_sounding_raw(client, city["sounding"])
 
 
 @app.get("/api/debug/nws/{code}")
