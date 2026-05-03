@@ -9,7 +9,14 @@ USER_AGENT = "kalshi-weather-bets/0.1 (research; contact: dylan@example.com)"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 IEM_MOS_URL = "https://mesonet.agron.iastate.edu/mos/csv.php"
 NWS_API = "https://api.weather.gov"
-UWYO_SOUNDING_URL = "https://weather.uwyo.edu/cgi-bin/sounding.py"
+# U. Wyoming retired their cgi-bin/sounding.py around 2024-25. The
+# modern path is wsgi/sounding (no .py extension). We try the new URL
+# first and fall back to the legacy one in case it ever comes back.
+UWYO_SOUNDING_URLS = [
+    "https://weather.uwyo.edu/wsgi/sounding",
+    "https://weather.uwyo.edu/cgi-bin/sounding.py",
+]
+UWYO_SOUNDING_URL = UWYO_SOUNDING_URLS[0]  # backwards-compat for tests
 AVWX_METAR_URL = "https://aviationweather.gov/api/data/metar"
 
 
@@ -328,8 +335,9 @@ async def fetch_metar(client: httpx.AsyncClient, station: str, hours: int = 6) -
 
 async def fetch_sounding_raw(client: httpx.AsyncClient, station_id: str) -> dict:
     """Same upstream call as fetch_sounding, but returns the URL,
-    HTTP status, response length, and a short body excerpt for
-    debugging — never None."""
+    HTTP status, response length, and a short body excerpt for each
+    candidate URL — never None. Tries each URL in UWYO_SOUNDING_URLS
+    and reports per-URL outcomes."""
     now = datetime.now(timezone.utc)
     target = now if now.hour >= 13 else now - timedelta(days=1)
     params = {
@@ -340,21 +348,26 @@ async def fetch_sounding_raw(client: httpx.AsyncClient, station_id: str) -> dict
         "TO": target.strftime("%d") + "12",
         "STNM": station_id,
     }
-    try:
-        r = await client.get(UWYO_SOUNDING_URL, params=params, timeout=20)
-        body = r.text
-        parsed = _parse_uwyo_sounding(body)
-        return {
-            "url": str(r.request.url),
-            "status": r.status_code,
-            "body_len": len(body),
-            "body_excerpt": body[:600],
-            "has_pre_block": "<PRE>" in body or "<pre>" in body,
-            "parsed_levels": list(parsed.keys()) if parsed else None,
-            "parsed": parsed,
-        }
-    except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
+    attempts = []
+    parsed_final = None
+    for url in UWYO_SOUNDING_URLS:
+        try:
+            r = await client.get(url, params=params, timeout=20)
+            body = r.text
+            parsed = _parse_uwyo_sounding(body)
+            attempts.append({
+                "url": str(r.request.url),
+                "status": r.status_code,
+                "body_len": len(body),
+                "body_excerpt": body[:300],
+                "has_pre_block": "<PRE>" in body or "<pre>" in body,
+                "parsed_levels": list(parsed.keys()) if parsed else None,
+            })
+            if parsed and parsed_final is None:
+                parsed_final = parsed
+        except Exception as exc:
+            attempts.append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+    return {"parsed": parsed_final, "attempts": attempts}
 
 
 async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional[dict]:
@@ -363,9 +376,10 @@ async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional
     12Z launches at 7 AM ET / 4 AM PT and are typically posted by 13Z.
     Per the v3.0 doc §2.4, the 12Z sounding is the highest-value reading —
     it captures the morning atmospheric state before afternoon heating.
-    """
+
+    Tries each candidate URL in UWYO_SOUNDING_URLS in order, returns the
+    first one that parses successfully."""
     now = datetime.now(timezone.utc)
-    # If we're past 13Z, today's 12Z is fresh; otherwise reach back to yesterday.
     target = now if now.hour >= 13 else now - timedelta(days=1)
     params = {
         "TYPE": "TEXT:LIST",
@@ -375,9 +389,14 @@ async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional
         "TO": target.strftime("%d") + "12",
         "STNM": station_id,
     }
-    try:
-        r = await client.get(UWYO_SOUNDING_URL, params=params, timeout=20)
-        r.raise_for_status()
-        return _parse_uwyo_sounding(r.text)
-    except Exception:
-        return None
+    for url in UWYO_SOUNDING_URLS:
+        try:
+            r = await client.get(url, params=params, timeout=20)
+            if r.status_code != 200:
+                continue
+            parsed = _parse_uwyo_sounding(r.text)
+            if parsed:
+                return parsed
+        except Exception:
+            continue
+    return None
