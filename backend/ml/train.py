@@ -71,13 +71,18 @@ _GBM_GRID = [
 ]
 
 
-def _build_dataframe():
+def _build_dataframe(min_target_date: Optional[str] = None):
+    """Pull training data, optionally filtered to target_date >= a cutoff.
+    Recent-only filtering helps when older years have sparser features
+    (e.g., MOS only densely populated since ~2024)."""
     import pandas as pd  # type: ignore
     rows = db.list_training_data()
     if not rows:
         return None
     df = pd.DataFrame(rows)
     df = df.dropna(subset=[TARGET_COLUMN])
+    if min_target_date:
+        df = df[df["target_date"] >= min_target_date]
     if df.empty:
         return None
     return df
@@ -182,8 +187,16 @@ def _fit_one(algorithm: str, X_train, y_train, X_test, y_test) -> Dict:
         from sklearn.ensemble import RandomForestRegressor  # type: ignore
         m = RandomForestRegressor(n_estimators=300, max_depth=12, min_samples_leaf=4, random_state=42, n_jobs=-1)
     elif algorithm == "linear":
+        # Ridge needs scaled inputs — h500_m around 5800 vs t500_c around -20
+        # would otherwise dominate the regularization penalty asymmetrically.
+        # StandardScaler normalizes each column to mean 0, std 1 before fit.
         from sklearn.linear_model import Ridge  # type: ignore
-        m = Ridge(alpha=1.0)
+        from sklearn.preprocessing import StandardScaler  # type: ignore
+        from sklearn.pipeline import Pipeline  # type: ignore
+        m = Pipeline([
+            ("scaler", StandardScaler()),
+            ("ridge", Ridge(alpha=1.0)),
+        ])
     elif algorithm == "gbm":
         from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
         m = GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42)
@@ -236,6 +249,8 @@ def _train_per_city(df) -> Optional[Dict]:
     global model for them."""
     from sklearn.linear_model import Ridge  # type: ignore
     from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+    from sklearn.preprocessing import StandardScaler  # type: ignore
+    from sklearn.pipeline import Pipeline  # type: ignore
     fits_by_city: Dict[str, Dict] = {}
     feature_cols_per_city: Dict[str, List[str]] = {}
     total_train = 0
@@ -257,7 +272,7 @@ def _train_per_city(df) -> Optional[Dict]:
         # Try Ridge + a single fast GBM per city; pick the better one.
         best = None
         for name, m in (
-            ("linear", Ridge(alpha=1.0)),
+            ("linear", Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=1.0))])),
             ("gbm", GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42)),
         ):
             m.fit(X_tr, y_tr)
@@ -288,21 +303,26 @@ def _train_stack(X_train, y_train, X_test, y_test) -> Dict:
     1-3% off the best individual model."""
     from sklearn.linear_model import Ridge  # type: ignore
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor  # type: ignore
+    from sklearn.preprocessing import StandardScaler  # type: ignore
+    from sklearn.pipeline import Pipeline  # type: ignore
+    from sklearn.base import clone  # type: ignore
     import numpy as np  # type: ignore
     base_models = {
-        "linear": Ridge(alpha=1.0),
+        "linear": Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=1.0))]),
         "rf": RandomForestRegressor(n_estimators=200, max_depth=12, min_samples_leaf=4, random_state=42, n_jobs=-1),
         "gbm": GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42),
     }
     # 5-fold cross-validated predictions on the training set so the meta
-    # model trains on out-of-sample predictions (no leakage).
+    # model trains on out-of-sample predictions (no leakage). Use
+    # sklearn.base.clone so Pipelines clone properly (raw type(m)(**params)
+    # doesn't handle flattened pipeline params).
     from sklearn.model_selection import KFold  # type: ignore
     kf = KFold(n_splits=5, shuffle=False)
     n = len(X_train)
     base_train_preds = {name: np.zeros(n) for name in base_models}
     for tr_idx, va_idx in kf.split(X_train):
         for name, m in base_models.items():
-            mc = type(m)(**m.get_params())
+            mc = clone(m)
             mc.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
             base_train_preds[name][va_idx] = mc.predict(X_train.iloc[va_idx])
     # Refit each base model on the full training set for inference.
@@ -327,16 +347,24 @@ def _train_stack(X_train, y_train, X_test, y_test) -> Dict:
     }
 
 
-def train(algorithm: str = "linear") -> Dict:
+def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> Dict:
     """Fit one model run. Wraps the pipeline in try/except so the API gets
     a clean error body instead of a 500.
 
     Pass algorithm='auto' to sweep linear + rf + gbm-best in one call —
     the lowest test_mae candidate becomes the active model, and every
     candidate's metrics land in ml_runs so the history table shows the
-    full sweep."""
+    full sweep.
+
+    `min_target_date` (ISO YYYY-MM-DD): only train on rows on/after this
+    date. Defaults to BETS_ML_MIN_TRAIN_DATE env (e.g. '2023-01-01' to
+    skip pre-MOS-coverage years). Recommended when older years have
+    sparse features that confuse the model."""
+    import os as _os
+    if min_target_date is None:
+        min_target_date = _os.getenv("BETS_ML_MIN_TRAIN_DATE") or None
     try:
-        df = _build_dataframe()
+        df = _build_dataframe(min_target_date=min_target_date)
         if df is None or len(df) < 20:
             return {"error": f"not enough training data ({0 if df is None else len(df)} rows; need ≥20)"}
 

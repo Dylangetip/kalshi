@@ -513,7 +513,9 @@ def upsert_historical_actual(city: str, target_date: str, actual_max_f: float, s
 
 
 def historical_counts() -> Dict:
-    """Quick stats for the UI: how much data we have to train on."""
+    """Quick stats for the UI: how much data we have to train on, plus
+    feature coverage so we can diagnose why a model might be struggling
+    (e.g., MOS sparse in older rows confuses mean-imputation)."""
     c = _conn_or_init()
     pred_n = c.execute("SELECT COUNT(*) AS n FROM historical_predictions").fetchone()["n"]
     act_n = c.execute("SELECT COUNT(*) AS n FROM historical_actuals").fetchone()["n"]
@@ -529,12 +531,38 @@ def historical_counts() -> Dict:
         """SELECT MAX(target_date) AS d FROM historical_predictions p
            JOIN historical_actuals a USING (city, target_date)"""
     ).fetchone()["d"]
+    # Coverage % per major feature column — identifies which features are
+    # sparse and may need a recency filter to avoid imputation-driven drift.
+    coverage_row = c.execute(
+        """SELECT
+              COUNT(*)                                 AS total,
+              SUM(CASE WHEN gfs_max IS NOT NULL THEN 1 ELSE 0 END)     AS gfs,
+              SUM(CASE WHEN ecmwf_max IS NOT NULL THEN 1 ELSE 0 END)   AS ecmwf,
+              SUM(CASE WHEN icon_max IS NOT NULL THEN 1 ELSE 0 END)    AS icon,
+              SUM(CASE WHEN gfs_mos_max IS NOT NULL THEN 1 ELSE 0 END) AS gfs_mos,
+              SUM(CASE WHEN nam_mos_max IS NOT NULL THEN 1 ELSE 0 END) AS nam_mos
+           FROM historical_predictions"""
+    ).fetchone()
+    total = max(1, int(coverage_row["total"] or 0))
+    coverage = {
+        "gfs":     round(int(coverage_row["gfs"] or 0)     / total * 100, 1),
+        "ecmwf":   round(int(coverage_row["ecmwf"] or 0)   / total * 100, 1),
+        "icon":    round(int(coverage_row["icon"] or 0)    / total * 100, 1),
+        "gfs_mos": round(int(coverage_row["gfs_mos"] or 0) / total * 100, 1),
+        "nam_mos": round(int(coverage_row["nam_mos"] or 0) / total * 100, 1),
+    }
+    # Earliest date a feature has data — helps see "MOS only since YYYY-MM"
+    earliest_mos = c.execute(
+        "SELECT MIN(target_date) AS d FROM historical_predictions WHERE gfs_mos_max IS NOT NULL"
+    ).fetchone()["d"]
     return {
         "predictions": pred_n,
         "actuals": act_n,
         "paired": paired,
         "earliest_target_date": earliest,
         "latest_target_date": latest,
+        "feature_coverage_pct": coverage,
+        "earliest_mos_date": earliest_mos,
     }
 
 
