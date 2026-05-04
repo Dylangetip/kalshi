@@ -1175,11 +1175,30 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
   const [lastRunResult, setLastRunResult] = useState_v(null);
   const [draft, setDraft] = useState_v({});
 
-  // Auto-bets are the ones placed via this view's trigger / loop. We
-  // can't distinguish them from manual bets in the schema yet, so
-  // "recent" just means the live session bet log — same data the
-  // Terminal shows.
-  const recent = (bets || []).slice(0, 20);
+  const [betSort, setBetSort] = useState_v('recent');
+  const [betPage, setBetPage] = useState_v(0);
+  const [betPageSize, setBetPageSize] = useState_v(20);
+
+  const allBets = bets || [];
+  const sortedBets = React.useMemo(() => {
+    const arr = [...allBets];
+    if (betSort === 'recent')    arr.sort((a, b) => (b.id || 0) - (a.id || 0));
+    if (betSort === 'soonest')   arr.sort((a, b) => {
+      const ta = a.closeAt ? new Date(a.closeAt).getTime() : Infinity;
+      const tb = b.closeAt ? new Date(b.closeAt).getTime() : Infinity;
+      return ta - tb;
+    });
+    if (betSort === 'biggest')   arr.sort((a, b) => {
+      const win = p => p.size * (1 - (p.entry || 10) / 100) / ((p.entry || 10) / 100);
+      return win(b) - win(a);
+    });
+    if (betSort === 'likely')    arr.sort((a, b) => (b.entry || 0) - (a.entry || 0));
+    if (betSort === 'open')      arr.sort((a, b) => (a.status === 'open' ? -1 : 1) - (b.status === 'open' ? -1 : 1));
+    return arr;
+  }, [allBets, betSort]);
+
+  const betTotalPages = Math.ceil(sortedBets.length / betPageSize);
+  const recent = sortedBets.slice(betPage * betPageSize, (betPage + 1) * betPageSize);
 
   const cfg = info || {};
   const enabled = draft.enabled ?? cfg.enabled ?? false;
@@ -1290,58 +1309,90 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
 
       <div className="panel">
         <div className="panel-header">
-          <span>Recent bets</span>
-          <span className="panel-title-actions">
-            session log · {recent.length} shown
+          <span>Bets</span>
+          <span className="panel-title-actions" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span>{allBets.length} total</span>
+            <select
+              value={betSort}
+              onChange={e => { setBetSort(e.target.value); setBetPage(0); }}
+              style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 4px', fontSize: 11 }}
+            >
+              <option value="recent">Most recent</option>
+              <option value="soonest">First to hit</option>
+              <option value="biggest">Biggest win</option>
+              <option value="likely">Most likely</option>
+              <option value="open">Open first</option>
+            </select>
+            <select
+              value={betPageSize}
+              onChange={e => { setBetPageSize(+e.target.value); setBetPage(0); }}
+              style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 4px', fontSize: 11 }}
+            >
+              {[20, 40, 60, 80, 100].map(n => <option key={n} value={n}>{n} / page</option>)}
+            </select>
           </span>
         </div>
-        {recent.length === 0 ? (
+        {allBets.length === 0 ? (
           <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
             no bets yet — turn auto-trade on, or hit "Trigger Now"
           </div>
         ) : (
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>Time</th><th>City</th><th>Bracket</th><th>Side</th>
-                <th className="num-r">Size</th><th className="num-r">Entry</th>
-                <th className="num-r">Closes in</th>
-                <th>Status</th><th className="num-r">Settled P/L</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recent.map(b => {
-                const settled = b.status === 'settled' && b.settledPl != null;
-                const won = settled && b.settledPl > 0;
-                const closesIn = settled ? '—' : until(b.closeAt);
-                const isClosingSoon = !settled && b.closeAt &&
-                  (new Date(b.closeAt).getTime() - Date.now()) < 3 * 3600 * 1000;
-                return (
-                  <tr key={b.id}>
-                    <td>{b.time}</td>
-                    <td className="city-cell">{b.city}</td>
-                    <td>{b.bracket?.label || b.bracket}</td>
-                    <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
-                    <td className="num-r">${b.size}</td>
-                    <td className="num-r">{b.entry}¢</td>
-                    <td className={`num-r ${isClosingSoon ? 'warn' : ''}`}>{closesIn}</td>
-                    <td>
-                      {settled ? (
-                        <Pill kind={won ? 'pos' : 'neg'}>
-                          {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
-                        </Pill>
-                      ) : (
-                        <Pill kind="info">OPEN</Pill>
-                      )}
-                    </td>
-                    <td className={`num-r ${settled ? (won ? 'pos' : 'neg') : ''}`}>
-                      {settled ? fmtSign(b.settledPl, 0) : '—'}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <>
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Time</th><th>City</th><th>Bracket</th><th>Side</th>
+                  <th className="num-r">Size</th><th className="num-r">Entry</th>
+                  <th className="num-r">Closes in</th>
+                  <th>Status</th><th className="num-r">Settled P/L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recent.map(b => {
+                  const settled = b.status === 'settled' && b.settledPl != null;
+                  const won = settled && b.settledPl > 0;
+                  const closesIn = settled ? '—' : until(b.closeAt);
+                  const isClosingSoon = !settled && b.closeAt &&
+                    (new Date(b.closeAt).getTime() - Date.now()) < 3 * 3600 * 1000;
+                  return (
+                    <tr key={b.id}>
+                      <td>{b.time}</td>
+                      <td className="city-cell">{b.city}</td>
+                      <td>{b.bracket?.label || b.bracket}</td>
+                      <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
+                      <td className="num-r">${b.size}</td>
+                      <td className="num-r">{b.entry}¢</td>
+                      <td className={`num-r ${isClosingSoon ? 'warn' : ''}`}>{closesIn}</td>
+                      <td>
+                        {settled ? (
+                          <Pill kind={won ? 'pos' : 'neg'}>
+                            {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
+                          </Pill>
+                        ) : (
+                          <Pill kind="info">OPEN</Pill>
+                        )}
+                      </td>
+                      <td className={`num-r ${settled ? (won ? 'pos' : 'neg') : ''}`}>
+                        {settled ? fmtSign(b.settledPl, 0) : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            {betTotalPages > 1 && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--fg-2)' }}>
+                <span>Showing {betPage * betPageSize + 1}–{Math.min((betPage + 1) * betPageSize, sortedBets.length)} of {sortedBets.length}</span>
+                <span style={{ display: 'flex', gap: 4 }}>
+                  <button className="btn-sm" onClick={() => setBetPage(0)} disabled={betPage === 0}>«</button>
+                  <button className="btn-sm" onClick={() => setBetPage(p => p - 1)} disabled={betPage === 0}>‹</button>
+                  <span style={{ padding: '0 6px', lineHeight: '22px' }}>pg {betPage + 1} / {betTotalPages}</span>
+                  <button className="btn-sm" onClick={() => setBetPage(p => p + 1)} disabled={betPage >= betTotalPages - 1}>›</button>
+                  <button className="btn-sm" onClick={() => setBetPage(betTotalPages - 1)} disabled={betPage >= betTotalPages - 1}>»</button>
+                </span>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
