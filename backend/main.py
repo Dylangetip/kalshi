@@ -121,11 +121,19 @@ _snapshot_task: Optional[asyncio.Task] = None
 _settlement_task: Optional[asyncio.Task] = None
 _auto_trader_task: Optional[asyncio.Task] = None
 _ml_retrain_task: Optional[asyncio.Task] = None
+_ml_incremental_backfill_task: Optional[asyncio.Task] = None
 
-# ML retraining loop. Default: weekly (Sunday-ish via 7-day sleep).
-ML_RETRAIN_INTERVAL_SECONDS = int(os.getenv("BETS_ML_RETRAIN_INTERVAL", str(7 * 86400)))
+# ML retraining loop. Default daily so the model keeps absorbing newly-
+# settled days as the historical_actuals table grows.
+ML_RETRAIN_INTERVAL_SECONDS = int(os.getenv("BETS_ML_RETRAIN_INTERVAL", "86400"))
 ML_RETRAIN_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_RETRAIN_LOOP") == "1"
-ML_RETRAIN_ALGORITHM = os.getenv("BETS_ML_ALGORITHM", "linear")  # 'linear' | 'gbm'
+
+# Incremental-backfill loop: every ML_BACKFILL_INTERVAL_SECONDS, pull
+# the last 7 days into historical_predictions / historical_actuals so
+# the next retrain has fresh examples. Idempotent thanks to
+# INSERT OR REPLACE in the upsert helpers.
+ML_BACKFILL_INTERVAL_SECONDS = int(os.getenv("BETS_ML_BACKFILL_INTERVAL", "86400"))
+ML_BACKFILL_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_BACKFILL_LOOP") == "1"
 
 # Backfill progress shared dict (read by /api/ml/backfill/status).
 _ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
@@ -421,27 +429,63 @@ async def _snapshot_loop() -> None:
 
 
 async def _ml_retrain_loop() -> None:
-    """Retrain the ML model every BETS_ML_RETRAIN_INTERVAL seconds
-    (default weekly). Best-effort — errors are logged and we keep
-    sleeping. Skipped silently if there's not enough training data."""
+    """Retrain BOTH algorithms every BETS_ML_RETRAIN_INTERVAL seconds
+    (default daily). Each cycle:
+      - trains linear, then gbm, on whatever historical pairs exist
+      - logs both runs to ml_runs
+      - the predictor auto-loads the most recent run by trained_at
+    Skipped silently if there's not enough training data.
+
+    Combined with _ml_incremental_backfill_loop (which extends the
+    historical tables each day), the model genuinely improves over
+    time as more settled data accrues."""
     while True:
         try:
-            run = ml_train.train(algorithm=ML_RETRAIN_ALGORITHM)
-            if run.get("error"):
-                print(f"[ml-retrain] skipped: {run['error']}")
-            else:
-                print(f"[ml-retrain] {run.get('algorithm')} model trained: "
-                      f"test_mae={run.get('test_mae')} "
-                      f"vs ensemble={run.get('holdout_mae_ensemble')}")
+            for algo in ("linear", "gbm"):
+                run = ml_train.train(algorithm=algo)
+                if run.get("error"):
+                    print(f"[ml-retrain] {algo} skipped: {run['error']}")
+                else:
+                    delta = (
+                        f"vs ensemble {run.get('holdout_mae_ensemble')}"
+                        if run.get("holdout_mae_ensemble") is not None
+                        else "no ensemble baseline"
+                    )
+                    print(f"[ml-retrain] {algo} trained: test_mae={run.get('test_mae')} ({delta})")
         except Exception as exc:  # noqa: BLE001
             print(f"[ml-retrain] error: {exc}")
         await asyncio.sleep(ML_RETRAIN_INTERVAL_SECONDS)
 
 
+async def _ml_incremental_backfill_loop() -> None:
+    """Pull the last 7 days of historical predictions + actuals each
+    cycle (default daily). Idempotent — INSERT OR REPLACE just refreshes
+    rows for days that were already pulled. The 7-day window catches up
+    automatically if the loop missed a few days (e.g. server downtime)."""
+    while True:
+        # Initial offset: wait a few minutes so the manual full-history
+        # backfill (if running on a fresh start) finishes first.
+        await asyncio.sleep(300)
+        try:
+            today = datetime.now(timezone.utc).date()
+            start = (today - timedelta(days=7)).isoformat()
+            end = (today - timedelta(days=1)).isoformat()
+            print(f"[ml-backfill] daily incremental: {start} → {end}")
+            async with httpx.AsyncClient() as client:
+                await ml_backfill.run_backfill(start, end, _ml_backfill_progress)
+            counts = db.historical_counts()
+            print(f"[ml-backfill] tables now: {counts.get('paired')} paired rows")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ml-backfill] error: {exc}")
+        # Sleep the configured interval BEFORE the next pull (the initial
+        # 5-min wait above only runs once).
+        await asyncio.sleep(max(1, ML_BACKFILL_INTERVAL_SECONDS - 300))
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
-    global _snapshot_task, _settlement_task, _auto_trader_task, _ml_retrain_task
+    global _snapshot_task, _settlement_task, _auto_trader_task, _ml_retrain_task, _ml_incremental_backfill_task
     if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
     if not SETTLEMENT_LOOP_DISABLED and _settlement_task is None:
@@ -452,11 +496,14 @@ async def _startup() -> None:
         _auto_trader_task = asyncio.create_task(_auto_trader_loop())
     if not ML_RETRAIN_LOOP_DISABLED and _ml_retrain_task is None:
         _ml_retrain_task = asyncio.create_task(_ml_retrain_loop())
+    if not ML_BACKFILL_LOOP_DISABLED and _ml_incremental_backfill_task is None:
+        _ml_incremental_backfill_task = asyncio.create_task(_ml_incremental_backfill_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    for name in ("_snapshot_task", "_settlement_task", "_auto_trader_task", "_ml_retrain_task"):
+    for name in ("_snapshot_task", "_settlement_task", "_auto_trader_task",
+                 "_ml_retrain_task", "_ml_incremental_backfill_task"):
         task = globals().get(name)
         if task is not None:
             task.cancel()
@@ -796,10 +843,12 @@ def ml_info():
     return {
         "data": db.historical_counts(),
         "latest_run": ml_train.latest_run_summary(),
-        "recent_runs": db.list_ml_runs(limit=10),
+        "recent_runs": db.list_ml_runs(limit=20),
         "predictor": ml_predict.info(),
         "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
-        "retrain_algorithm": ML_RETRAIN_ALGORITHM,
+        "backfill_interval_seconds": ML_BACKFILL_INTERVAL_SECONDS,
+        "retrain_loop_disabled": ML_RETRAIN_LOOP_DISABLED,
+        "backfill_loop_disabled": ML_BACKFILL_LOOP_DISABLED,
         "backfill_progress": _ml_backfill_progress,
     }
 

@@ -887,6 +887,41 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
         </button>
       </div>
 
+      <div style={{ padding: '0 14px 14px', display: 'flex', gap: 14, fontSize: 11, color: 'var(--fg-2)', fontFamily: 'var(--mono)' }}>
+        <span>
+          retrain loop: {mlInfo?.retrain_loop_disabled ? <span className="neg">disabled</span> :
+            <span className="pos">every {Math.round((mlInfo?.retrain_interval_seconds || 86400) / 3600)}h</span>}
+        </span>
+        <span>·</span>
+        <span>
+          incremental backfill: {mlInfo?.backfill_loop_disabled ? <span className="neg">disabled</span> :
+            <span className="pos">every {Math.round((mlInfo?.backfill_interval_seconds || 86400) / 3600)}h</span>}
+        </span>
+        <span>·</span>
+        <span>both algos trained each cycle, predictor loads newest run</span>
+      </div>
+
+      {recentRuns.length >= 2 && (
+        <div style={{ padding: '0 14px 14px' }}>
+          <div className="label" style={{ marginBottom: 8 }}>Test MAE trend (newest → oldest)</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <Sparkline
+              data={recentRuns.slice().reverse().map(r => r.test_mae).filter(v => v != null)}
+              width={240} height={40} fill={true}
+            />
+            <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+              {(() => {
+                const xs = recentRuns.slice().reverse().map(r => r.test_mae).filter(v => v != null);
+                if (xs.length < 2) return '';
+                const first = xs[0], last = xs[xs.length - 1];
+                const delta = last - first;
+                return `${first.toFixed(2)}° → ${last.toFixed(2)}° · ${delta < 0 ? 'improving by' : 'worse by'} ${Math.abs(delta).toFixed(2)}° over ${xs.length} runs`;
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
       {recentRuns.length > 0 && (
         <div style={{ padding: '0 14px 14px' }}>
           <div className="label" style={{ marginBottom: 8 }}>Training history</div>
