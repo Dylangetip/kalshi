@@ -666,8 +666,15 @@ def insert_ml_run(
 
 
 def latest_ml_run() -> Optional[Dict]:
+    """Most recent ml_runs row whose pickle was actually persisted to
+    disk (i.e. won an auto-sweep or was a single-algo train). Excludes
+    the throw-away candidate rows we keep just for the history table."""
     c = _conn_or_init()
-    row = c.execute("SELECT * FROM ml_runs ORDER BY trained_at DESC LIMIT 1").fetchone()
+    row = c.execute(
+        "SELECT * FROM ml_runs "
+        "WHERE model_path IS NOT NULL AND model_path != '(not-persisted)' "
+        "ORDER BY trained_at DESC, id DESC LIMIT 1"
+    ).fetchone()
     return dict(row) if row else None
 
 
