@@ -776,18 +776,27 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
       );
     } else if (lastResult.kind.startsWith('train') && r.test_mae != null) {
       const beat = r.holdout_mae_ensemble != null && r.test_mae < r.holdout_mae_ensemble;
+      const cands = r.auto_candidates;
       banner = (
-        <div className="status-banner success">
+        <div className="status-banner success" style={{ flexWrap: 'wrap' }}>
           <span className="b-title">✓ Trained {r.algorithm}</span>
           <span style={{ marginLeft: 8 }}>
             test MAE <strong>{r.test_mae}°F</strong>{' '}
-            vs ensemble <strong>{r.holdout_mae_ensemble}°F</strong>{' '}
+            {r.holdout_mae_ensemble != null && (
+              <>vs ensemble <strong>{r.holdout_mae_ensemble}°F</strong>{' · '}</>
+            )}
             on {r.n_test} holdout days
-            {' · '}
-            <span className={beat ? 'pos' : 'neg'}>
-              {beat ? `ML wins by ${(r.holdout_mae_ensemble - r.test_mae).toFixed(2)}°F` : 'ensemble still wins'}
-            </span>
+            {r.holdout_mae_ensemble != null && (
+              <span className={beat ? 'pos' : 'neg'} style={{ marginLeft: 4 }}>
+                {beat ? `ML wins by ${(r.holdout_mae_ensemble - r.test_mae).toFixed(2)}°F` : 'ensemble still wins'}
+              </span>
+            )}
           </span>
+          {cands && cands.length > 0 && (
+            <span style={{ width: '100%', marginTop: 6, fontSize: 11, color: 'var(--fg-2)' }}>
+              swept {cands.length}: {cands.map(c => `${c.algorithm}=${c.test_mae}°`).join(' · ')}
+            </span>
+          )}
         </div>
       );
     } else if (lastResult.kind === 'backfill' && r.started) {
@@ -874,7 +883,14 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
            busy === 'backfill' ? <><span className="spinner" />starting…</> : 'Backfill 3 yrs'}
         </button>
         <button
-          className="btn primary"
+          className="btn success"
+          disabled={!!busy || backfillRunning || (data.paired || 0) < 50}
+          onClick={() => click('train-auto', () => onMlTrain('auto'))}
+          title="Sweeps Ridge + Random Forest + GBM grid; keeps the lowest-MAE">
+          {busy === 'train-auto' ? <><span className="spinner" />sweeping {elapsedSec}s</> : 'Auto-train (sweep all)'}
+        </button>
+        <button
+          className="btn"
           disabled={!!busy || backfillRunning || (data.paired || 0) < 20}
           onClick={() => click('train-linear', () => onMlTrain('linear'))}>
           {busy === 'train-linear' ? <><span className="spinner" />training {elapsedSec}s</> : 'Train (linear)'}
@@ -884,6 +900,12 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
           disabled={!!busy || backfillRunning || (data.paired || 0) < 50}
           onClick={() => click('train-gbm', () => onMlTrain('gbm'))}>
           {busy === 'train-gbm' ? <><span className="spinner" />training {elapsedSec}s</> : 'Train (gbm)'}
+        </button>
+        <button
+          className="btn"
+          disabled={!!busy || backfillRunning || (data.paired || 0) < 50}
+          onClick={() => click('train-rf', () => onMlTrain('rf'))}>
+          {busy === 'train-rf' ? <><span className="spinner" />training {elapsedSec}s</> : 'Train (rf)'}
         </button>
       </div>
 

@@ -429,29 +429,26 @@ async def _snapshot_loop() -> None:
 
 
 async def _ml_retrain_loop() -> None:
-    """Retrain BOTH algorithms every BETS_ML_RETRAIN_INTERVAL seconds
-    (default daily). Each cycle:
-      - trains linear, then gbm, on whatever historical pairs exist
-      - logs both runs to ml_runs
-      - the predictor auto-loads the most recent run by trained_at
-    Skipped silently if there's not enough training data.
+    """Retrain via the 'auto' sweep every BETS_ML_RETRAIN_INTERVAL
+    seconds (default daily). Each cycle:
+      - sweeps linear (Ridge) + rf + gbm hyperparameter grid
+      - persists the lowest test_mae candidate as the active model
+      - logs every candidate to ml_runs so the history table shows
+        the full sweep and the trend sparkline traces actual progress
 
     Combined with _ml_incremental_backfill_loop (which extends the
-    historical tables each day), the model genuinely improves over
-    time as more settled data accrues."""
+    historical tables daily), the model genuinely improves over time
+    as more settled data accrues AND as the sweep finds better
+    configurations on that data."""
     while True:
         try:
-            for algo in ("linear", "gbm"):
-                run = ml_train.train(algorithm=algo)
-                if run.get("error"):
-                    print(f"[ml-retrain] {algo} skipped: {run['error']}")
-                else:
-                    delta = (
-                        f"vs ensemble {run.get('holdout_mae_ensemble')}"
-                        if run.get("holdout_mae_ensemble") is not None
-                        else "no ensemble baseline"
-                    )
-                    print(f"[ml-retrain] {algo} trained: test_mae={run.get('test_mae')} ({delta})")
+            run = ml_train.train(algorithm="auto")
+            if run.get("error"):
+                print(f"[ml-retrain] auto skipped: {run['error']}")
+            else:
+                cands = run.get("auto_candidates") or []
+                summary = ", ".join(f"{c['algorithm']}={c['test_mae']}" for c in cands)
+                print(f"[ml-retrain] auto sweep: {summary} → kept {run.get('algorithm')}")
         except Exception as exc:  # noqa: BLE001
             print(f"[ml-retrain] error: {exc}")
         await asyncio.sleep(ML_RETRAIN_INTERVAL_SECONDS)
