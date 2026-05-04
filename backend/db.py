@@ -750,10 +750,19 @@ def _bucket_stats(errors: List[float]) -> Dict:
         return {
             "n": 0, "mae": None, "median": None,
             "within_1_pct": None, "within_2_pct": None, "within_3_pct": None,
+            "buckets": {"exact": None, "one_off": None, "two_off": None, "three_plus": None},
         }
     mae = sum(errors) / n
     med = sorted(errors)[n // 2]
     pct = lambda t: round(sum(1 for e in errors if e <= t) / n * 100, 1)
+    # Mutually-exclusive buckets — these add up to 100%, unlike the
+    # cumulative within_*_pct values. Maps directly to Kalshi 1°F-wide
+    # brackets: exact = same bracket as actual, one_off = neighbor, etc.
+    n_exact   = sum(1 for e in errors if e <= 1)
+    n_one     = sum(1 for e in errors if 1 < e <= 2)
+    n_two     = sum(1 for e in errors if 2 < e <= 3)
+    n_three   = sum(1 for e in errors if e > 3)
+    bp = lambda count: round(count / n * 100, 1)
     return {
         "n": n,
         "mae": round(mae, 2),
@@ -761,6 +770,12 @@ def _bucket_stats(errors: List[float]) -> Dict:
         "within_1_pct": pct(1),
         "within_2_pct": pct(2),
         "within_3_pct": pct(3),
+        "buckets": {
+            "exact":      bp(n_exact),    # ≤1°F — same Kalshi bracket
+            "one_off":    bp(n_one),      # 1-2°F — one bracket off
+            "two_off":    bp(n_two),      # 2-3°F — two off
+            "three_plus": bp(n_three),    # >3°F — far miss
+        },
     }
 
 

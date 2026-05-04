@@ -393,6 +393,10 @@ input:focus, select:focus { border-color: var(--accent); }
 .bar-fill { height: 100%; transition: width .3s ease; }
 .bar-fill.kalshi { background: var(--info); }
 .bar-fill.model { background: var(--accent); }
+.bar-fill.pos { background: var(--pos); }
+.bar-fill.info { background: var(--info); }
+.bar-fill.warn { background: var(--warn); }
+.bar-fill.neg { background: var(--neg); }
 .bar-pct { font-family: var(--mono); font-size: 10px; color: var(--fg-1); width: 32px; text-align: right; }
 
 /* ===== SIGNAL CARDS ===== */

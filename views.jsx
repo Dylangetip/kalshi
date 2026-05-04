@@ -684,6 +684,15 @@ function AccuracyBlock({ title, stats }) {
       </div>
     );
   }
+  const buckets = stats.buckets || {};
+  // Mutually-exclusive bins — each maps to an outcome on a 1°F-wide
+  // Kalshi bracket. Sum to 100%.
+  const rows = [
+    { key: 'exact',      label: 'Exact bracket',  range: '0–1°F', pct: buckets.exact,      cls: 'pos' },
+    { key: 'one_off',    label: 'One neighbor',   range: '1–2°F', pct: buckets.one_off,    cls: 'info' },
+    { key: 'two_off',    label: 'Two off',        range: '2–3°F', pct: buckets.two_off,    cls: 'warn' },
+    { key: 'three_plus', label: 'Far miss',       range: '>3°F',  pct: buckets.three_plus, cls: 'neg' },
+  ];
   return (
     <div className="signal-card">
       <div className="label">{title}</div>
@@ -691,8 +700,22 @@ function AccuracyBlock({ title, stats }) {
         <span className="big-num">{stats.mae}°F</span>
         <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>MAE · n={stats.n}</span>
       </div>
-      <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)', marginTop: 4 }}>
-        ≤1°: {stats.within_1_pct}% · ≤2°: {stats.within_2_pct}% · ≤3°: {stats.within_3_pct}%
+      <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {rows.map(r => (
+          <div key={r.key} style={{ display: 'grid', gridTemplateColumns: '90px 1fr 50px', alignItems: 'center', gap: 6, fontSize: 10, fontFamily: 'var(--mono)' }}>
+            <span>
+              <span className={r.cls}>{r.label}</span>
+              <span style={{ color: 'var(--fg-3)', marginLeft: 4 }}>{r.range}</span>
+            </span>
+            <div style={{ background: 'var(--bg-3)', borderRadius: 1, height: 6, overflow: 'hidden' }}>
+              <div className={`bar-fill ${r.cls}`}
+                   style={{ height: '100%', width: `${Math.max(0, Math.min(100, r.pct || 0))}%`, transition: 'width .3s' }} />
+            </div>
+            <span className={r.cls} style={{ textAlign: 'right', fontWeight: 600 }}>
+              {r.pct != null ? r.pct + '%' : '—'}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
