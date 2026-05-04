@@ -305,11 +305,13 @@ async function fetchMlInfo() {
   }
 }
 
-async function triggerMlBackfill(startDate, endDate) {
+async function triggerMlBackfill(opts = {}) {
+  // opts: { years, startDate, endDate }
   try {
     const params = new URLSearchParams();
-    if (startDate) params.set('start_date', startDate);
-    if (endDate) params.set('end_date', endDate);
+    if (opts.startDate) params.set('start_date', opts.startDate);
+    if (opts.endDate) params.set('end_date', opts.endDate);
+    if (opts.years != null) params.set('years', String(opts.years));
     const r = await fetch(`${API_BASE}/api/ml/backfill?${params.toString()}`, { method: 'POST' });
     if (!r.ok) return null;
     return await r.json();

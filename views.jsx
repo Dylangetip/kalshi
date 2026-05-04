@@ -703,6 +703,7 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
   const [busyStartedAt, setBusyStartedAt] = useState_v(null);
   const [lastResult, setLastResult] = useState_v(null);
   const [tick, setTick] = useState_v(0);  // forces elapsed-seconds re-render
+  const [years, setYears] = useState_v(3);  // backfill lookback
 
   const data = mlInfo?.data || {};
   const run = mlInfo?.latest_run || {};
@@ -875,12 +876,24 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
       {banner}
 
       <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <input
+            type="number"
+            min={1}
+            max={20}
+            value={years}
+            disabled={!!busy || backfillRunning}
+            onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
+            style={{ width: 60, fontSize: 13, padding: '6px 8px' }}
+            title="Years of historical data to pull. Open-Meteo's forecast archive only goes back to ~2022 — older years may have gaps." />
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
+        </div>
         <button
           className="btn primary"
           disabled={!!busy || backfillRunning}
-          onClick={() => click('backfill', () => onMlBackfill())}>
+          onClick={() => click('backfill', () => onMlBackfill({ years }))}>
           {backfillRunning ? <><span className="spinner" />Backfilling {progress.cities_done || 0}/5</> :
-           busy === 'backfill' ? <><span className="spinner" />starting…</> : 'Backfill 3 yrs'}
+           busy === 'backfill' ? <><span className="spinner" />starting…</> : `Backfill ${years} yr${years === 1 ? '' : 's'}`}
         </button>
         <button
           className="btn success"

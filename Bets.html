@@ -316,8 +316,8 @@ function App() {
             <MlView
               mlInfo={mlInfo}
               accuracy={accuracy}
-              onMlBackfill={async (start, end) => {
-                const r = await MOCK.triggerMlBackfill(start, end);
+              onMlBackfill={async (opts) => {
+                const r = await MOCK.triggerMlBackfill(opts || {});
                 if (r) setMlInfo(await MOCK.fetchMlInfo());
                 return r;
               }}

@@ -851,14 +851,25 @@ def ml_info():
 
 
 @app.post("/api/ml/backfill")
-async def ml_backfill_endpoint(start_date: Optional[str] = None, end_date: Optional[str] = None):
+async def ml_backfill_endpoint(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    years: Optional[int] = None,
+):
     """Kick off a historical backfill in the background. Returns
-    immediately; poll /api/ml/info to watch progress."""
+    immediately; poll /api/ml/info to watch progress.
+
+    Three ways to specify the window (in priority order):
+      - explicit start_date / end_date (ISO YYYY-MM-DD)
+      - years=N         → start = today - N years
+      - neither         → defaults to 3 years
+    """
     if _ml_backfill_progress.get("running"):
         raise HTTPException(409, "backfill already running")
     today = datetime.now(timezone.utc).date()
     if not start_date:
-        start_date = (today - timedelta(days=3 * 365)).isoformat()
+        lookback_years = years if years is not None else 3
+        start_date = (today - timedelta(days=int(lookback_years * 365.25))).isoformat()
     if not end_date:
         end_date = (today - timedelta(days=1)).isoformat()
     _ml_backfill_progress.clear()
