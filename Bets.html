@@ -232,6 +232,7 @@ function App() {
     { id: 'signals', label: 'Signals', badge: signals.filter(s => s.status === 'stale').length || null },
     { id: 'pnl', label: 'P&L' },
     { id: 'auto', label: 'Auto-Trade', badge: autoInfo?.enabled ? '●' : null },
+    { id: 'ml', label: 'ML Model', badge: mlInfo?.latest_run?.trained ? '✓' : null },
   ];
 
   return (
@@ -296,18 +297,6 @@ function App() {
           {tab === 'auto' && (
             <AutoTradeView
               info={autoInfo}
-              accuracy={accuracy}
-              mlInfo={mlInfo}
-              onMlBackfill={async (start, end) => {
-                const r = await MOCK.triggerMlBackfill(start, end);
-                if (r) setMlInfo(await MOCK.fetchMlInfo());
-                return r;
-              }}
-              onMlTrain={async (algo) => {
-                const r = await MOCK.triggerMlTrain(algo);
-                if (r) setMlInfo(await MOCK.fetchMlInfo());
-                return r;
-              }}
               bets={betLog}
               onSetConfig={async (patch) => {
                 const updated = await MOCK.setAutoTradeConfig(patch);
@@ -319,6 +308,22 @@ function App() {
                 if (r) setAutoInfo({ ...r, interval_seconds: r.interval_seconds });
                 // Refresh bet log so newly placed bets show up immediately
                 MOCK.fetchBets().then(b => { if (b) setBetLog(b); });
+                return r;
+              }}
+            />
+          )}
+          {tab === 'ml' && (
+            <MlView
+              mlInfo={mlInfo}
+              accuracy={accuracy}
+              onMlBackfill={async (start, end) => {
+                const r = await MOCK.triggerMlBackfill(start, end);
+                if (r) setMlInfo(await MOCK.fetchMlInfo());
+                return r;
+              }}
+              onMlTrain={async (algo) => {
+                const r = await MOCK.triggerMlTrain(algo);
+                if (r) setMlInfo(await MOCK.fetchMlInfo());
                 return r;
               }}
             />

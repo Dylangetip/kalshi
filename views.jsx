@@ -827,7 +827,93 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
   );
 }
 
-function AutoTradeView({ info, accuracy, bets, mlInfo, onMlBackfill, onMlTrain, onSetConfig, onTriggerNow }) {
+function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
+  return (
+    <div className="pnl-layout">
+      <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
+
+      <div className="panel">
+        <div className="panel-header">
+          <span>Model accuracy</span>
+          <span className="panel-title-actions">
+            ensemble vs ML · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
+          </span>
+        </div>
+        {!accuracy || accuracy.n_predictions === 0 ? (
+          <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+            no settled predictions yet — accuracy populates after the first
+            bet settles tomorrow morning when the NWS Daily Climate Report posts.
+          </div>
+        ) : (
+          <div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, padding: 14 }}>
+              <AccuracyBlock title="Ensemble (naive weighted)" stats={accuracy.ensemble} />
+              <AccuracyBlock title="ML (trained model)" stats={accuracy.ml} />
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 14, padding: '0 14px 14px' }}>
+              <div>
+                <div className="label" style={{ marginBottom: 8 }}>By city — MAE (°F)</div>
+                <table className="tbl">
+                  <thead>
+                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">Ens</th><th className="num-r">ML</th></tr>
+                  </thead>
+                  <tbody>
+                    {accuracy.by_city.map(r => (
+                      <tr key={r.city}>
+                        <td className="city-cell">{r.city}</td>
+                        <td className="num-r">{r.n}</td>
+                        <td className="num-r">{r.ensemble_mae != null ? r.ensemble_mae + '°' : '—'}</td>
+                        <td className={`num-r ${r.ml_mae != null && r.ensemble_mae != null && r.ml_mae < r.ensemble_mae ? 'pos' : ''}`}>
+                          {r.ml_mae != null ? r.ml_mae + '°' : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div>
+                <div className="label" style={{ marginBottom: 8 }}>Recent predictions</div>
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Date</th><th>City</th>
+                      <th className="num-r">Ens</th>
+                      <th className="num-r">ML</th>
+                      <th className="num-r">Actual</th>
+                      <th className="num-r">Ens Δ</th>
+                      <th className="num-r">ML Δ</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {accuracy.recent.slice(0, 10).map((r, i) => {
+                      const ec = (e) => Math.abs(e) <= 1 ? 'pos' : Math.abs(e) <= 2 ? 'info' : 'neg';
+                      return (
+                        <tr key={i}>
+                          <td>{r.date}</td>
+                          <td className="city-cell">{r.city}</td>
+                          <td className="num-r">{r.ensemble}°</td>
+                          <td className="num-r">{r.ml != null ? r.ml + '°' : '—'}</td>
+                          <td className="num-r">{r.actual}°</td>
+                          <td className={`num-r ${ec(r.ensemble_error)}`}>{fmtSign(r.ensemble_error, 1)}°</td>
+                          <td className={`num-r ${r.ml_error != null ? ec(r.ml_error) : ''}`}>
+                            {r.ml_error != null ? fmtSign(r.ml_error, 1) + '°' : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
   const [busy, setBusy] = useState_v(false);
   const [lastRunResult, setLastRunResult] = useState_v(null);
   const [draft, setDraft] = useState_v({});
@@ -945,85 +1031,6 @@ function AutoTradeView({ info, accuracy, bets, mlInfo, onMlBackfill, onMlTrain, 
         )}
       </div>
 
-      <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
-
-      <div className="panel">
-        <div className="panel-header">
-          <span>Model accuracy</span>
-          <span className="panel-title-actions">
-            ensemble vs ML · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
-          </span>
-        </div>
-        {!accuracy || accuracy.n_predictions === 0 ? (
-          <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
-            no settled predictions yet — accuracy populates after the first
-            bet settles tomorrow morning when the NWS Daily Climate Report posts.
-          </div>
-        ) : (
-          <div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, padding: 14 }}>
-              <AccuracyBlock title="Ensemble (naive weighted)" stats={accuracy.ensemble} />
-              <AccuracyBlock title="ML (trained model)" stats={accuracy.ml} />
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 14, padding: '0 14px 14px' }}>
-              <div>
-                <div className="label" style={{ marginBottom: 8 }}>By city — MAE (°F)</div>
-                <table className="tbl">
-                  <thead>
-                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">Ens</th><th className="num-r">ML</th></tr>
-                  </thead>
-                  <tbody>
-                    {accuracy.by_city.map(r => (
-                      <tr key={r.city}>
-                        <td className="city-cell">{r.city}</td>
-                        <td className="num-r">{r.n}</td>
-                        <td className="num-r">{r.ensemble_mae != null ? r.ensemble_mae + '°' : '—'}</td>
-                        <td className={`num-r ${r.ml_mae != null && r.ensemble_mae != null && r.ml_mae < r.ensemble_mae ? 'pos' : ''}`}>
-                          {r.ml_mae != null ? r.ml_mae + '°' : '—'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div>
-                <div className="label" style={{ marginBottom: 8 }}>Recent predictions</div>
-                <table className="tbl">
-                  <thead>
-                    <tr>
-                      <th>Date</th><th>City</th>
-                      <th className="num-r">Ens</th>
-                      <th className="num-r">ML</th>
-                      <th className="num-r">Actual</th>
-                      <th className="num-r">Ens Δ</th>
-                      <th className="num-r">ML Δ</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {accuracy.recent.slice(0, 10).map((r, i) => {
-                      const ec = (e) => Math.abs(e) <= 1 ? 'pos' : Math.abs(e) <= 2 ? 'info' : 'neg';
-                      return (
-                        <tr key={i}>
-                          <td>{r.date}</td>
-                          <td className="city-cell">{r.city}</td>
-                          <td className="num-r">{r.ensemble}°</td>
-                          <td className="num-r">{r.ml != null ? r.ml + '°' : '—'}</td>
-                          <td className="num-r">{r.actual}°</td>
-                          <td className={`num-r ${ec(r.ensemble_error)}`}>{fmtSign(r.ensemble_error, 1)}°</td>
-                          <td className={`num-r ${r.ml_error != null ? ec(r.ml_error) : ''}`}>
-                            {r.ml_error != null ? fmtSign(r.ml_error, 1) + '°' : '—'}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-
       <div className="panel">
         <div className="panel-header">
           <span>Recent bets</span>
@@ -1084,4 +1091,4 @@ function AutoTradeView({ info, accuracy, bets, mlInfo, onMlBackfill, onMlTrain, 
   );
 }
 
-Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView });
+Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView, MlView });
