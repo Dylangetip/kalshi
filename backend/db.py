@@ -488,6 +488,13 @@ def upsert_historical_prediction(row: Dict) -> None:
             for col in coalesce_cols:
                 if merged[col] is None and existing[col] is not None:
                     merged[col] = existing[col]
+        # Don't create orphan rows: if there's no existing row AND we
+        # don't have ensemble_max in the new data, skip the insert
+        # entirely. (MOS-only inserts on dates that never had OM data
+        # are useless for training and were the source of the orphan
+        # bug.)
+        if not existing and merged.get("ensemble_max") is None:
+            return
         c.execute(
             """INSERT OR REPLACE INTO historical_predictions (
                 city, target_date, forecast_horizon_hours,
