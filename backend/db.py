@@ -461,26 +461,33 @@ def list_bets_for_target(city: str, target_date: str) -> List[Dict]:
 # ── Historical / ML ──────────────────────────────────────────────────────
 
 def upsert_historical_prediction(row: Dict) -> None:
-    """INSERT OR REPLACE one historical prediction row. `row` keys must
-    match the historical_predictions columns. Uses COALESCE on MOS
-    columns so a re-run that doesn't fetch MOS doesn't blank out an
-    earlier MOS-included row."""
+    """INSERT OR REPLACE one historical prediction row, but coalesce
+    EVERY column against the existing row so a partial update doesn't
+    wipe out fields the caller didn't include.
+
+    This was a real bug source: a MOS-only fetch (gfs_mos_max +
+    nam_mos_max set, everything else None) would land on top of an
+    earlier Open-Meteo upsert (gfs_max / ecmwf_max / ensemble_max set)
+    and the INSERT OR REPLACE blanked out the OM columns. After the
+    full backfill, only ~22% of rows had a non-null ensemble_max."""
     c = _conn_or_init()
+    coalesce_cols = (
+        "gfs_max", "ecmwf_max", "icon_max", "om_max",
+        "gfs_mos_max", "nam_mos_max",
+        "t850_c", "t700_c", "t500_c", "h500_m", "rh850_pct",
+        "ensemble_max",
+    )
     with _lock:
-        # Read existing MOS values so we don't NULL them on re-runs that
-        # skip MOS (e.g. fast OM-only repulls).
         existing = c.execute(
-            "SELECT gfs_mos_max, nam_mos_max FROM historical_predictions "
+            "SELECT * FROM historical_predictions "
             "WHERE city=? AND target_date=? AND forecast_horizon_hours=?",
             (row["city"], row["target_date"], int(row["forecast_horizon_hours"])),
         ).fetchone()
-        gfs_mos = row.get("gfs_mos_max")
-        nam_mos = row.get("nam_mos_max")
+        merged = {col: row.get(col) for col in coalesce_cols}
         if existing:
-            if gfs_mos is None:
-                gfs_mos = existing["gfs_mos_max"]
-            if nam_mos is None:
-                nam_mos = existing["nam_mos_max"]
+            for col in coalesce_cols:
+                if merged[col] is None and existing[col] is not None:
+                    merged[col] = existing[col]
         c.execute(
             """INSERT OR REPLACE INTO historical_predictions (
                 city, target_date, forecast_horizon_hours,
@@ -491,15 +498,29 @@ def upsert_historical_prediction(row: Dict) -> None:
             ) VALUES (?,?,?, ?,?,?,?, ?,?, ?,?,?,?,?, ?)""",
             (
                 row["city"], row["target_date"], int(row["forecast_horizon_hours"]),
-                row.get("gfs_max"), row.get("ecmwf_max"),
-                row.get("icon_max"), row.get("om_max"),
-                gfs_mos, nam_mos,
-                row.get("t850_c"), row.get("t700_c"), row.get("t500_c"),
-                row.get("h500_m"), row.get("rh850_pct"),
-                row.get("ensemble_max"),
+                merged["gfs_max"], merged["ecmwf_max"],
+                merged["icon_max"], merged["om_max"],
+                merged["gfs_mos_max"], merged["nam_mos_max"],
+                merged["t850_c"], merged["t700_c"], merged["t500_c"],
+                merged["h500_m"], merged["rh850_pct"],
+                merged["ensemble_max"],
             ),
         )
         c.commit()
+
+
+def cleanup_orphan_predictions() -> int:
+    """One-shot cleanup: delete historical_predictions rows that have
+    NULL ensemble_max (MOS-only orphans from the upsert bug). Returns
+    rows deleted. After running this, re-running backfill will refill
+    the OM data correctly because the upsert now coalesces properly."""
+    c = _conn_or_init()
+    with _lock:
+        before = c.execute("SELECT COUNT(*) AS n FROM historical_predictions").fetchone()["n"]
+        c.execute("DELETE FROM historical_predictions WHERE ensemble_max IS NULL")
+        c.commit()
+        after = c.execute("SELECT COUNT(*) AS n FROM historical_predictions").fetchone()["n"]
+    return int(before - after)
 
 
 def upsert_historical_actual(city: str, target_date: str, actual_max_f: float, source: str) -> None:
@@ -588,6 +609,7 @@ def list_training_data() -> List[Dict]:
                    a.actual_max_f
             FROM historical_predictions p
             JOIN historical_actuals a USING (city, target_date)
+            WHERE p.ensemble_max IS NOT NULL  -- skip MOS-only / corrupted rows
         ),
         with_lag AS (
             SELECT j.*,

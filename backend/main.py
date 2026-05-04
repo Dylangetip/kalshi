@@ -912,6 +912,16 @@ def ml_train_endpoint(algorithm: str = "linear"):
     return ml_train.train(algorithm=algorithm)
 
 
+@app.post("/api/ml/cleanup")
+def ml_cleanup_endpoint():
+    """One-shot fix: delete historical_predictions rows where
+    ensemble_max is NULL. These are orphans left by an earlier upsert
+    bug where MOS-only inserts overwrote OM data. After running this,
+    re-fire Backfill to repopulate the OM columns cleanly."""
+    deleted = db.cleanup_orphan_predictions()
+    return {"deleted_rows": deleted, "remaining": db.historical_counts()}
+
+
 class PlaceOrderIn(BaseModel):
     ticker: str = Field(min_length=1)
     side: str = Field(pattern="^(yes|no)$")
