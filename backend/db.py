@@ -178,10 +178,13 @@ def init() -> None:
             ):
                 if col not in cols:
                     _conn.execute(ddl)
-            # feature_snapshots gained ml_max in the historical-backfill plan.
+            # feature_snapshots gained ml_max in the historical-backfill plan,
+            # then blended_max once we started averaging the two predictors.
             feat_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(feature_snapshots)").fetchall()}
             if "ml_max" not in feat_cols:
                 _conn.execute("ALTER TABLE feature_snapshots ADD COLUMN ml_max REAL")
+            if "blended_max" not in feat_cols:
+                _conn.execute("ALTER TABLE feature_snapshots ADD COLUMN blended_max REAL")
             _conn.commit()
 
 
@@ -408,8 +411,8 @@ def insert_feature_snapshot(state: Dict, ts: Optional[int] = None) -> None:
                 afd_sea_breeze, afd_marine_layer, afd_smoke, afd_overcast, afd_offshore,
                 rec_bracket_label, rec_bracket_lo, rec_bracket_hi,
                 rec_edge_cents, rec_kalshi_pct, rec_model_pct,
-                ml_max
-            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?,?,?, ?,?,?, ?)""",
+                ml_max, blended_max
+            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?,?,?, ?,?,?, ?,?)""",
             (
                 ts, state["city"]["code"], state.get("targetDate"),
                 state.get("mosMax"), state.get("namMos"),
@@ -431,6 +434,7 @@ def insert_feature_snapshot(state: Dict, ts: Optional[int] = None) -> None:
                 int(round((rec.get("edge") or 0) * 100)),
                 rec.get("kalshiPct"), rec.get("modelPct"),
                 state.get("mlMax"),
+                state.get("blendedMax"),
             ),
         )
         c.commit()
@@ -670,18 +674,15 @@ def _bucket_stats(errors: List[float]) -> Dict:
 
 
 def accuracy_summary() -> Dict:
-    """Pair the latest model_max AND ml_max per (city, target_date) with
-    the actual high observed for that day (from any settled bet's
-    settled_max_f) and roll up overall + per-city accuracy stats.
-
-    Returns parallel ensemble + ml blocks so the UI can render head-to-
-    head. ML block is empty until the first ml_max has been logged AND
-    a settled actual exists for the same (city, date)."""
+    """Pair the latest model_max, ml_max, AND blended_max per (city,
+    target_date) with the actual high observed for that day and roll up
+    overall + per-city accuracy stats. Returns three parallel blocks
+    (ensemble / ml / blended) so the UI can render head-to-head-to-head."""
     c = _conn_or_init()
     rows = c.execute(
         """
         WITH latest_pred AS (
-            SELECT city, target_date, model_max, ml_max,
+            SELECT city, target_date, model_max, ml_max, blended_max,
                    ROW_NUMBER() OVER (
                        PARTITION BY city, target_date
                        ORDER BY ts DESC
@@ -698,7 +699,7 @@ def accuracy_summary() -> Dict:
               AND target_date IS NOT NULL
             GROUP BY city, target_date
         )
-        SELECT p.city, p.target_date, p.model_max, p.ml_max, a.actual_max
+        SELECT p.city, p.target_date, p.model_max, p.ml_max, p.blended_max, a.actual_max
         FROM latest_pred p
         JOIN actuals a ON a.city = p.city AND a.target_date = p.target_date
         WHERE p.rn = 1
@@ -708,32 +709,36 @@ def accuracy_summary() -> Dict:
     pairs = [dict(r) for r in rows]
 
     ens_errors = [abs(p["model_max"] - p["actual_max"]) for p in pairs]
-    ml_errors = [
-        abs(p["ml_max"] - p["actual_max"])
-        for p in pairs if p["ml_max"] is not None
-    ]
+    ml_errors = [abs(p["ml_max"] - p["actual_max"])
+                 for p in pairs if p["ml_max"] is not None]
+    blend_errors = [abs(p["blended_max"] - p["actual_max"])
+                    for p in pairs if p["blended_max"] is not None]
 
-    by_city_ens: Dict[str, List[float]] = {}
-    by_city_ml: Dict[str, List[float]] = {}
+    by_city: Dict[str, Dict[str, List[float]]] = {}
     for p in pairs:
-        by_city_ens.setdefault(p["city"], []).append(abs(p["model_max"] - p["actual_max"]))
+        d = by_city.setdefault(p["city"], {"ens": [], "ml": [], "blend": []})
+        d["ens"].append(abs(p["model_max"] - p["actual_max"]))
         if p["ml_max"] is not None:
-            by_city_ml.setdefault(p["city"], []).append(abs(p["ml_max"] - p["actual_max"]))
+            d["ml"].append(abs(p["ml_max"] - p["actual_max"]))
+        if p["blended_max"] is not None:
+            d["blend"].append(abs(p["blended_max"] - p["actual_max"]))
 
     return {
         "n_predictions": len(pairs),
         "ensemble": _bucket_stats(ens_errors),
         "ml": _bucket_stats(ml_errors),
+        "blended": _bucket_stats(blend_errors),
         "by_city": [
             {
                 "city": city,
-                "n": len(es),
-                "ensemble_mae": round(sum(es) / len(es), 2) if es else None,
-                "ml_mae": (round(sum(by_city_ml[city]) / len(by_city_ml[city]), 2)
-                           if city in by_city_ml else None),
-                "ml_n": len(by_city_ml.get(city, [])),
+                "n": len(d["ens"]),
+                "ensemble_mae": round(sum(d["ens"]) / len(d["ens"]), 2) if d["ens"] else None,
+                "ml_mae": round(sum(d["ml"]) / len(d["ml"]), 2) if d["ml"] else None,
+                "blend_mae": round(sum(d["blend"]) / len(d["blend"]), 2) if d["blend"] else None,
+                "ml_n": len(d["ml"]),
+                "blend_n": len(d["blend"]),
             }
-            for city, es in sorted(by_city_ens.items())
+            for city, d in sorted(by_city.items())
         ],
         "recent": [
             {
@@ -741,10 +746,11 @@ def accuracy_summary() -> Dict:
                 "date": p["target_date"],
                 "ensemble": round(p["model_max"], 1),
                 "ml": round(p["ml_max"], 1) if p["ml_max"] is not None else None,
+                "blended": round(p["blended_max"], 1) if p["blended_max"] is not None else None,
                 "actual": round(p["actual_max"], 1),
                 "ensemble_error": round(p["model_max"] - p["actual_max"], 2),
-                "ml_error": (round(p["ml_max"] - p["actual_max"], 2)
-                             if p["ml_max"] is not None else None),
+                "ml_error": round(p["ml_max"] - p["actual_max"], 2) if p["ml_max"] is not None else None,
+                "blend_error": round(p["blended_max"] - p["actual_max"], 2) if p["blended_max"] is not None else None,
             }
             for p in pairs[:30]
         ],

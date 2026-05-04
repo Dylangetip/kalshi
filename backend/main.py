@@ -135,6 +135,12 @@ ML_RETRAIN_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_RETRAIN_LOOP") == "1"
 ML_BACKFILL_INTERVAL_SECONDS = int(os.getenv("BETS_ML_BACKFILL_INTERVAL", "86400"))
 ML_BACKFILL_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_BACKFILL_LOOP") == "1"
 
+# Blend weight for blended_max = α · ml_max + (1−α) · model_max.
+# 0.7 = 70% ML / 30% ensemble. The ML model never trained on MOS, so
+# leaving 30% on the ensemble keeps the MOS signal alive in the
+# blended prediction. Override with BETS_BLEND_ALPHA in the env.
+ML_BLEND_ALPHA = float(os.getenv("BETS_BLEND_ALPHA", "0.7"))
+
 # Backfill progress shared dict (read by /api/ml/backfill/status).
 _ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
 from .model import (
@@ -320,6 +326,10 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "settlementBracket": best,
         "modelMax": round(model_max, 1),
         "mlMax": ml_max,
+        "blendedMax": (
+            round(ML_BLEND_ALPHA * ml_max + (1 - ML_BLEND_ALPHA) * model_max, 1)
+            if ml_max is not None else None
+        ),
         "nwsForecast": round(nws_max_f, 1) if nws_max_f is not None else round(om_max_f, 1),
         "mosMax": round(gfs_mos_f, 1) if gfs_mos_f is not None else round(model_max, 1),
         "namMos": round(nam_mos_f, 1) if nam_mos_f is not None else round(model_max, 1),

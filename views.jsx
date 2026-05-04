@@ -1018,28 +1018,35 @@ function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
           </div>
         ) : (
           <div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, padding: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, padding: 14 }}>
               <AccuracyBlock title="Ensemble (naive weighted)" stats={accuracy.ensemble} />
               <AccuracyBlock title="ML (trained model)" stats={accuracy.ml} />
+              <AccuracyBlock title="Blended (α·ML + (1−α)·Ens)" stats={accuracy.blended} />
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 14, padding: '0 14px 14px' }}>
               <div>
                 <div className="label" style={{ marginBottom: 8 }}>By city — MAE (°F)</div>
                 <table className="tbl">
                   <thead>
-                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">Ens</th><th className="num-r">ML</th></tr>
+                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">Ens</th><th className="num-r">ML</th><th className="num-r">Blend</th></tr>
                   </thead>
                   <tbody>
-                    {accuracy.by_city.map(r => (
-                      <tr key={r.city}>
-                        <td className="city-cell">{r.city}</td>
-                        <td className="num-r">{r.n}</td>
-                        <td className="num-r">{r.ensemble_mae != null ? r.ensemble_mae + '°' : '—'}</td>
-                        <td className={`num-r ${r.ml_mae != null && r.ensemble_mae != null && r.ml_mae < r.ensemble_mae ? 'pos' : ''}`}>
-                          {r.ml_mae != null ? r.ml_mae + '°' : '—'}
-                        </td>
-                      </tr>
-                    ))}
+                    {accuracy.by_city.map(r => {
+                      const best = (() => {
+                        const xs = [r.ensemble_mae, r.ml_mae, r.blend_mae].filter(v => v != null);
+                        return xs.length ? Math.min(...xs) : null;
+                      })();
+                      const cls = (v) => (v != null && v === best ? 'pos' : '');
+                      return (
+                        <tr key={r.city}>
+                          <td className="city-cell">{r.city}</td>
+                          <td className="num-r">{r.n}</td>
+                          <td className={`num-r ${cls(r.ensemble_mae)}`}>{r.ensemble_mae != null ? r.ensemble_mae + '°' : '—'}</td>
+                          <td className={`num-r ${cls(r.ml_mae)}`}>{r.ml_mae != null ? r.ml_mae + '°' : '—'}</td>
+                          <td className={`num-r ${cls(r.blend_mae)}`}>{r.blend_mae != null ? r.blend_mae + '°' : '—'}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1051,9 +1058,11 @@ function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
                       <th>Date</th><th>City</th>
                       <th className="num-r">Ens</th>
                       <th className="num-r">ML</th>
+                      <th className="num-r">Blend</th>
                       <th className="num-r">Actual</th>
                       <th className="num-r">Ens Δ</th>
                       <th className="num-r">ML Δ</th>
+                      <th className="num-r">Bl Δ</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1065,10 +1074,14 @@ function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
                           <td className="city-cell">{r.city}</td>
                           <td className="num-r">{r.ensemble}°</td>
                           <td className="num-r">{r.ml != null ? r.ml + '°' : '—'}</td>
+                          <td className="num-r">{r.blended != null ? r.blended + '°' : '—'}</td>
                           <td className="num-r">{r.actual}°</td>
                           <td className={`num-r ${ec(r.ensemble_error)}`}>{fmtSign(r.ensemble_error, 1)}°</td>
                           <td className={`num-r ${r.ml_error != null ? ec(r.ml_error) : ''}`}>
                             {r.ml_error != null ? fmtSign(r.ml_error, 1) + '°' : '—'}
+                          </td>
+                          <td className={`num-r ${r.blend_error != null ? ec(r.blend_error) : ''}`}>
+                            {r.blend_error != null ? fmtSign(r.blend_error, 1) + '°' : '—'}
                           </td>
                         </tr>
                       );
