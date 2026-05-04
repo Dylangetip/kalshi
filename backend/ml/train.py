@@ -37,18 +37,32 @@ FEATURE_COLUMNS_NUMERIC: List[str] = [
     "gfs_max", "ecmwf_max", "icon_max", "om_max",
     "t850_c", "t700_c", "t500_c", "h500_m", "rh850_pct",
     "ensemble_max",
+    # High-autocorrelation + climatology anchors. Joined in via
+    # db.list_training_data's window functions; passed at inference
+    # via predict_max(features=...).
+    "prev_actual_max_f",
+    "seasonal_avg_max_f",
 ]
 FEATURE_COLUMNS_CATEGORICAL: List[str] = ["city"]
 TARGET_COLUMN = "actual_max_f"
 
 MODELS_DIR = Path(__file__).parent / "models"
 
+# Wider GBM grid — 12 configs spanning learning rate, depth, and
+# n_estimators. Each fits in a few seconds on ~10k rows.
 _GBM_GRID = [
-    {"n_estimators": 100, "max_depth": 3, "learning_rate": 0.1},
+    {"n_estimators": 100, "max_depth": 3, "learning_rate": 0.10},
     {"n_estimators": 200, "max_depth": 3, "learning_rate": 0.05},
+    {"n_estimators": 300, "max_depth": 3, "learning_rate": 0.03},
+    {"n_estimators": 500, "max_depth": 3, "learning_rate": 0.02},
+    {"n_estimators": 200, "max_depth": 4, "learning_rate": 0.05},
     {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.03},
-    {"n_estimators": 500, "max_depth": 5, "learning_rate": 0.02},
-    {"n_estimators": 200, "max_depth": 2, "learning_rate": 0.1},
+    {"n_estimators": 500, "max_depth": 4, "learning_rate": 0.02},
+    {"n_estimators": 300, "max_depth": 5, "learning_rate": 0.02},
+    {"n_estimators": 500, "max_depth": 5, "learning_rate": 0.01},
+    {"n_estimators": 200, "max_depth": 2, "learning_rate": 0.10},
+    {"n_estimators": 400, "max_depth": 2, "learning_rate": 0.05},
+    {"n_estimators": 800, "max_depth": 3, "learning_rate": 0.01},
 ]
 
 
@@ -94,6 +108,14 @@ def _engineer_features(df):
             out["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
         except Exception:
             pass
+    # How much does today's forecast deviate from yesterday's actual / from
+    # climatology? These deltas are often more predictive than the raw
+    # values (a forecast 5° above climo is informative independent of
+    # whether climo is 60° or 80°).
+    if "ensemble_max" in out.columns and "prev_actual_max_f" in out.columns:
+        out["ens_minus_prev"] = out["ensemble_max"] - out["prev_actual_max_f"]
+    if "ensemble_max" in out.columns and "seasonal_avg_max_f" in out.columns:
+        out["ens_minus_climo"] = out["ensemble_max"] - out["seasonal_avg_max_f"]
     return out
 
 
@@ -105,7 +127,8 @@ def _featurize(df, fitted_columns: Optional[List[str]] = None):
     df = _engineer_features(df)
     numeric_cols = list(FEATURE_COLUMNS_NUMERIC)
     for extra in ("spread_gfs_ecmwf", "spread_gfs_icon", "spread_ecmwf_icon",
-                  "lapse_850_500", "doy_sin", "doy_cos"):
+                  "lapse_850_500", "doy_sin", "doy_cos",
+                  "ens_minus_prev", "ens_minus_climo"):
         if extra in df.columns:
             numeric_cols.append(extra)
     base = df[[c for c in numeric_cols if c in df.columns]].copy()

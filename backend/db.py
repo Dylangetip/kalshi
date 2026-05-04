@@ -511,19 +511,99 @@ def historical_counts() -> Dict:
 
 def list_training_data() -> List[Dict]:
     """Inner-join historical_predictions × historical_actuals for training.
-    Returns one row per (city, target_date, forecast_horizon)."""
+    Returns one row per (city, target_date, forecast_horizon).
+
+    Adds two derived columns that the trained model uses as features:
+      - prev_actual_max_f: actual high from the previous day in this city
+        (high day-to-day autocorrelation — biggest single signal we
+        weren't using before)
+      - seasonal_avg_max_f: long-run average actual max for this city ×
+        month (climatology anchor)"""
     c = _conn_or_init()
     rows = c.execute(
-        """SELECT p.city, p.target_date, p.forecast_horizon_hours,
-                  p.gfs_max, p.ecmwf_max, p.icon_max, p.om_max,
-                  p.t850_c, p.t700_c, p.t500_c, p.h500_m, p.rh850_pct,
-                  p.ensemble_max,
-                  a.actual_max_f
-           FROM historical_predictions p
-           JOIN historical_actuals a USING (city, target_date)
-           ORDER BY p.target_date ASC, p.city ASC"""
+        """
+        WITH joined AS (
+            SELECT p.city, p.target_date, p.forecast_horizon_hours,
+                   p.gfs_max, p.ecmwf_max, p.icon_max, p.om_max,
+                   p.t850_c, p.t700_c, p.t500_c, p.h500_m, p.rh850_pct,
+                   p.ensemble_max,
+                   a.actual_max_f
+            FROM historical_predictions p
+            JOIN historical_actuals a USING (city, target_date)
+        ),
+        with_lag AS (
+            SELECT j.*,
+                   LAG(j.actual_max_f) OVER (
+                       PARTITION BY j.city, j.forecast_horizon_hours
+                       ORDER BY j.target_date
+                   ) AS prev_actual_max_f,
+                   substr(j.target_date, 6, 2) AS month_str
+            FROM joined j
+        ),
+        climatology AS (
+            SELECT city,
+                   substr(target_date, 6, 2) AS month_str,
+                   AVG(actual_max_f) AS seasonal_avg_max_f
+            FROM historical_actuals
+            GROUP BY city, substr(target_date, 6, 2)
+        )
+        SELECT w.city, w.target_date, w.forecast_horizon_hours,
+               w.gfs_max, w.ecmwf_max, w.icon_max, w.om_max,
+               w.t850_c, w.t700_c, w.t500_c, w.h500_m, w.rh850_pct,
+               w.ensemble_max,
+               w.actual_max_f,
+               w.prev_actual_max_f,
+               c.seasonal_avg_max_f
+        FROM with_lag w
+        LEFT JOIN climatology c
+          ON c.city = w.city AND c.month_str = w.month_str
+        ORDER BY w.target_date ASC, w.city ASC
+        """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_prev_actual(city: str, target_date: str) -> Optional[float]:
+    """Yesterday's actual high for `city` (the day before target_date).
+    Used at inference time. Checks historical_actuals first, falls back
+    to bets.settled_max_f if a settled bet is available."""
+    from datetime import date, timedelta
+    try:
+        d = date.fromisoformat(target_date) - timedelta(days=1)
+    except ValueError:
+        return None
+    prev = d.isoformat()
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT actual_max_f FROM historical_actuals WHERE city = ? AND target_date = ?",
+        (city, prev),
+    ).fetchone()
+    if row and row["actual_max_f"] is not None:
+        return float(row["actual_max_f"])
+    row = c.execute(
+        "SELECT AVG(CAST(settled_max_f AS REAL)) AS m FROM bets "
+        "WHERE city = ? AND target_date = ? AND settled_max_f IS NOT NULL",
+        (city, prev),
+    ).fetchone()
+    if row and row["m"] is not None:
+        return float(row["m"])
+    return None
+
+
+def get_seasonal_avg(city: str, target_date: str) -> Optional[float]:
+    """Long-run climatology: average actual max for this city × month."""
+    if not target_date or len(target_date) < 7:
+        return None
+    month = target_date[5:7]
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT AVG(actual_max_f) AS m FROM historical_actuals "
+        "WHERE city = ? AND substr(target_date, 6, 2) = ?",
+        (city, month),
+    ).fetchone()
+    if row and row["m"] is not None:
+        return float(row["m"])
+    return None
 
 
 def insert_ml_run(

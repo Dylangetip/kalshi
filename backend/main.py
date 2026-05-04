@@ -223,9 +223,10 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         return None
 
     # Run the trained ML model in parallel for the comparison panel.
-    # Inference uses only the features available historically (no MOS) so
-    # the live + training feature schemas match. Returns None when no
-    # model has been trained yet — callers handle gracefully.
+    # Pass the same feature set the training schema uses, including
+    # yesterday's actual + monthly climatology if available.
+    prev_actual = db.get_prev_actual(city["code"], target_iso) if target_iso else None
+    seasonal_avg = db.get_seasonal_avg(city["code"], target_iso) if target_iso else None
     ml_max = ml_predict.predict_max(
         {
             "gfs_max": om_max_f,        # surface OM seamless ≈ GFS daily max
@@ -238,6 +239,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             "h500_m": h500,
             "rh850_pct": rh850,
             "ensemble_max": model_max,
+            "prev_actual_max_f": prev_actual,
+            "seasonal_avg_max_f": seasonal_avg,
         },
         city=city["code"],
     )
