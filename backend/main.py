@@ -792,10 +792,11 @@ def get_accuracy():
 
 @app.get("/api/ml/info")
 def ml_info():
-    """Latest training run + dataset counts + currently-loaded model."""
+    """Latest training run + dataset counts + currently-loaded model + recent run history."""
     return {
         "data": db.historical_counts(),
         "latest_run": ml_train.latest_run_summary(),
+        "recent_runs": db.list_ml_runs(limit=10),
         "predictor": ml_predict.info(),
         "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
         "retrain_algorithm": ML_RETRAIN_ALGORITHM,

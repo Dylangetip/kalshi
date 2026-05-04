@@ -699,24 +699,108 @@ function AccuracyBlock({ title, stats }) {
 }
 
 function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
-  const [busy, setBusy] = useState_v(null);  // 'backfill' | 'train' | null
+  const [busy, setBusy] = useState_v(null);  // 'backfill' | 'train-linear' | 'train-gbm' | null
+  const [busyStartedAt, setBusyStartedAt] = useState_v(null);
   const [lastResult, setLastResult] = useState_v(null);
+  const [tick, setTick] = useState_v(0);  // forces elapsed-seconds re-render
+
   const data = mlInfo?.data || {};
   const run = mlInfo?.latest_run || {};
+  const recentRuns = mlInfo?.recent_runs || [];
   const progress = mlInfo?.backfill_progress || {};
   const trained = run.trained;
+  const trainedAt = run.trained_at ? new Date(run.trained_at * 1000).toLocaleString() : 'never';
+  const backfillRunning = !!progress.running;
 
-  const trainedAt = run.trained_at
-    ? new Date(run.trained_at * 1000).toLocaleString()
-    : 'never';
+  // Elapsed-seconds counter while a sync action is running
+  useEffect_v(() => {
+    if (!busy) return;
+    const t = setInterval(() => setTick(x => x + 1), 250);
+    return () => clearInterval(t);
+  }, [busy]);
+  const elapsedSec = busyStartedAt ? Math.floor((Date.now() - busyStartedAt) / 1000) : 0;
 
   const click = async (kind, fn) => {
     setBusy(kind);
+    setBusyStartedAt(Date.now());
     setLastResult(null);
-    const r = await fn();
-    setLastResult(r);
-    setBusy(null);
+    try {
+      const r = await fn();
+      setLastResult({ kind, result: r, ok: !(r && r.error), at: Date.now() });
+    } catch (exc) {
+      setLastResult({ kind, result: { error: String(exc) }, ok: false, at: Date.now() });
+    } finally {
+      setBusy(null);
+      setBusyStartedAt(null);
+    }
   };
+
+  // ── Status banner content ──
+  let banner = null;
+  if (backfillRunning) {
+    banner = (
+      <div className="status-banner busy">
+        <span className="spinner" />
+        <span className="b-title">Backfilling historical data…</span>
+        <span style={{ marginLeft: 8 }}>{progress.stage}</span>
+        <span className="b-detail">
+          {progress.cities_done || 0}/5 cities · {progress.predictions_inserted || 0} preds · {progress.actuals_inserted || 0} actuals
+        </span>
+      </div>
+    );
+  } else if (busy === 'train-linear' || busy === 'train-gbm') {
+    const algo = busy === 'train-gbm' ? 'gradient boosting' : 'linear regression';
+    banner = (
+      <div className="status-banner busy">
+        <span className="spinner" />
+        <span className="b-title">Training {algo} on {data.paired || 0} pairs…</span>
+        <span className="b-detail">elapsed {elapsedSec}s</span>
+      </div>
+    );
+  } else if (busy === 'backfill') {
+    banner = (
+      <div className="status-banner busy">
+        <span className="spinner" />
+        <span className="b-title">Starting backfill…</span>
+        <span className="b-detail">contacting Open-Meteo + IEM</span>
+      </div>
+    );
+  } else if (lastResult) {
+    const r = lastResult.result || {};
+    if (!lastResult.ok) {
+      banner = (
+        <div className="status-banner error">
+          <span className="b-title">✕ {lastResult.kind} failed:</span>
+          <span style={{ marginLeft: 8 }}>{r.error || 'unknown error'}</span>
+        </div>
+      );
+    } else if (lastResult.kind.startsWith('train') && r.test_mae != null) {
+      const beat = r.holdout_mae_ensemble != null && r.test_mae < r.holdout_mae_ensemble;
+      banner = (
+        <div className="status-banner success">
+          <span className="b-title">✓ Trained {r.algorithm}</span>
+          <span style={{ marginLeft: 8 }}>
+            test MAE <strong>{r.test_mae}°F</strong>{' '}
+            vs ensemble <strong>{r.holdout_mae_ensemble}°F</strong>{' '}
+            on {r.n_test} holdout days
+            {' · '}
+            <span className={beat ? 'pos' : 'neg'}>
+              {beat ? `ML wins by ${(r.holdout_mae_ensemble - r.test_mae).toFixed(2)}°F` : 'ensemble still wins'}
+            </span>
+          </span>
+        </div>
+      );
+    } else if (lastResult.kind === 'backfill' && r.started) {
+      banner = (
+        <div className="status-banner success">
+          <span className="b-title">✓ Backfill started</span>
+          <span style={{ marginLeft: 8 }}>
+            {r.start_date} → {r.end_date} · watch progress above
+          </span>
+        </div>
+      );
+    }
+  }
 
   return (
     <div className="panel">
@@ -779,48 +863,66 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
         </div>
       </div>
 
+      {banner}
+
       <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <button
           className="btn primary"
-          disabled={!!busy || progress.running}
+          disabled={!!busy || backfillRunning}
           onClick={() => click('backfill', () => onMlBackfill())}>
-          {progress.running ? `Backfilling… ${progress.cities_done || 0}/5 cities` :
-           busy === 'backfill' ? 'starting…' : 'Backfill 3 yrs'}
+          {backfillRunning ? <><span className="spinner" />Backfilling {progress.cities_done || 0}/5</> :
+           busy === 'backfill' ? <><span className="spinner" />starting…</> : 'Backfill 3 yrs'}
         </button>
         <button
           className="btn primary"
-          disabled={!!busy || (data.paired || 0) < 20}
-          onClick={() => click('train', () => onMlTrain('linear'))}>
-          {busy === 'train' ? 'training…' : 'Train (linear)'}
+          disabled={!!busy || backfillRunning || (data.paired || 0) < 20}
+          onClick={() => click('train-linear', () => onMlTrain('linear'))}>
+          {busy === 'train-linear' ? <><span className="spinner" />training {elapsedSec}s</> : 'Train (linear)'}
         </button>
         <button
           className="btn"
-          disabled={!!busy || (data.paired || 0) < 50}
-          onClick={() => click('train', () => onMlTrain('gbm'))}>
-          {busy === 'train' ? 'training…' : 'Train (gbm)'}
+          disabled={!!busy || backfillRunning || (data.paired || 0) < 50}
+          onClick={() => click('train-gbm', () => onMlTrain('gbm'))}>
+          {busy === 'train-gbm' ? <><span className="spinner" />training {elapsedSec}s</> : 'Train (gbm)'}
         </button>
-        {progress.running && (
-          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
-            {progress.stage} · {progress.predictions_inserted || 0} preds, {progress.actuals_inserted || 0} actuals
-          </span>
-        )}
-        {progress.errors && progress.errors.length > 0 && (
-          <span className="mono neg" style={{ fontSize: 11 }}>
-            {progress.errors.length} error(s) — see console
-          </span>
-        )}
       </div>
 
-      {lastResult && lastResult.error && (
-        <div style={{ padding: '0 14px 14px', fontSize: 11 }} className="neg">
-          training error: {lastResult.error}
-        </div>
-      )}
-      {lastResult && !lastResult.error && lastResult.test_mae != null && (
-        <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-2)' }}>
-          <span className="mono pos">trained ✓</span> {' '}
-          test MAE <span className="mono">{lastResult.test_mae}°F</span> vs ensemble {' '}
-          <span className="mono">{lastResult.holdout_mae_ensemble}°F</span> on {lastResult.n_test} holdout days
+      {recentRuns.length > 0 && (
+        <div style={{ padding: '0 14px 14px' }}>
+          <div className="label" style={{ marginBottom: 8 }}>Training history</div>
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>When</th><th>Algorithm</th>
+                <th className="num-r">N train</th><th className="num-r">N test</th>
+                <th className="num-r">Train MAE</th>
+                <th className="num-r">Test MAE</th>
+                <th className="num-r">Ens MAE</th>
+                <th className="num-r">Δ</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentRuns.map(r => {
+                const beat = r.test_mae != null && r.holdout_mae_ensemble != null && r.test_mae < r.holdout_mae_ensemble;
+                const delta = r.holdout_mae_ensemble != null && r.test_mae != null
+                  ? r.holdout_mae_ensemble - r.test_mae : null;
+                return (
+                  <tr key={r.id}>
+                    <td>{ago(r.trained_at * 1000)} ago</td>
+                    <td>{r.algorithm}</td>
+                    <td className="num-r">{r.n_train}</td>
+                    <td className="num-r">{r.n_test}</td>
+                    <td className="num-r">{r.train_mae != null ? r.train_mae + '°' : '—'}</td>
+                    <td className="num-r">{r.test_mae != null ? r.test_mae + '°' : '—'}</td>
+                    <td className="num-r">{r.holdout_mae_ensemble != null ? r.holdout_mae_ensemble + '°' : '—'}</td>
+                    <td className={`num-r ${delta != null ? (beat ? 'pos' : 'neg') : ''}`}>
+                      {delta != null ? fmtSign(delta, 2) + '°' : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

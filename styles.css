@@ -532,3 +532,35 @@ input:focus, select:focus { border-color: var(--accent); }
 .fresh-tick.on { background: var(--pos); }
 .fresh-tick.warn { background: var(--warn); }
 .fresh-tick.off { background: var(--neg); }
+
+/* ===== ML LOADING / STATUS BANNERS ===== */
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid var(--bg-3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+@keyframes pulse-bg {
+  0%, 100% { background: var(--bg-2); }
+  50%      { background: var(--bg-3); }
+}
+.status-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px;
+  border-radius: var(--rad);
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 0 14px 14px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-2);
+}
+.status-banner.busy    { animation: pulse-bg 1.4s ease-in-out infinite; border-color: var(--accent); color: var(--fg-0); }
+.status-banner.success { background: var(--pos-bg); border-color: var(--pos); color: var(--pos); }
+.status-banner.error   { background: var(--neg-bg); border-color: var(--neg); color: var(--neg); }
+.status-banner .b-title  { font-weight: 600; }
+.status-banner .b-detail { color: var(--fg-2); margin-left: auto; font-size: 11px; }
