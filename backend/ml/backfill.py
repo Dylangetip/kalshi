@@ -22,8 +22,14 @@ from .. import db
 from ..cities import CITIES
 from ..sources import (
     fetch_iem_asos_daily_max,
+    fetch_iem_mos_for_date,
     fetch_open_meteo_historical,
 )
+
+
+# IEM is generous but not unlimited. Keep at most this many MOS pulls
+# in flight at once to be polite during bulk backfill.
+_MOS_CONCURRENCY = int(__import__("os").getenv("BETS_MOS_CONCURRENCY", "5"))
 
 
 # Weights that the live ensemble uses on the subset of features we have
@@ -143,6 +149,7 @@ async def run_backfill(
         "cities_done": 0,
         "predictions_inserted": 0,
         "actuals_inserted": 0,
+        "mos_inserted": 0,
         "errors": [],
     })
 
@@ -183,6 +190,54 @@ async def run_backfill(
                         db.upsert_historical_actual(city["code"], d, mx, "iem_asos")
                         act_count += 1
                         progress["actuals_inserted"] = act_count
+
+                # 3. Historical MOS bulletins (GFS-MOS + NAM-MOS).
+                # IEM archives back to 2004; per-call cost is ~100ms, so
+                # a 5-yr backfill across one city is ~365×5×2 = ~3650
+                # calls. Throttle via semaphore.
+                progress["stage"] = f"backfilling {city['code']} MOS"
+                sem = asyncio.Semaphore(_MOS_CONCURRENCY)
+                async def _one_mos(target_iso: str, model_name: str):
+                    async with sem:
+                        return await fetch_iem_mos_for_date(
+                            client, city["station"], target_iso, model_name,
+                        )
+
+                # Build the list of dates that already have a prediction row
+                # but lack MOS values (cheaper than re-fetching everything).
+                cur = s
+                target_dates: List[str] = []
+                while cur <= e:
+                    target_dates.append(cur.isoformat())
+                    cur += timedelta(days=1)
+
+                tasks = []
+                for td in target_dates:
+                    tasks.append(asyncio.create_task(_one_mos(td, "GFS")))
+                    tasks.append(asyncio.create_task(_one_mos(td, "NAM")))
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Pair results back with (date, model). Each task list:
+                # [GFS_d1, NAM_d1, GFS_d2, NAM_d2, ...]
+                mos_added = 0
+                for i, td in enumerate(target_dates):
+                    gfs_v = results[2 * i]
+                    nam_v = results[2 * i + 1]
+                    if isinstance(gfs_v, Exception):
+                        gfs_v = None
+                    if isinstance(nam_v, Exception):
+                        nam_v = None
+                    if gfs_v is None and nam_v is None:
+                        continue
+                    db.upsert_historical_prediction({
+                        "city": city["code"],
+                        "target_date": td,
+                        "forecast_horizon_hours": 24,
+                        "gfs_mos_max": gfs_v,
+                        "nam_mos_max": nam_v,
+                    })
+                    mos_added += 1
+                progress["mos_inserted"] = progress.get("mos_inserted", 0) + mos_added
             except Exception as exc:  # noqa: BLE001 — record and continue
                 progress["errors"].append(f"{city['code']}: {type(exc).__name__}: {exc}")
             progress["cities_done"] += 1

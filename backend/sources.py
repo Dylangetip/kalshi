@@ -150,10 +150,36 @@ def _parse_mos_csv(text: str, target_date: datetime) -> Optional[float]:
 
 async def fetch_iem_mos(client: httpx.AsyncClient, station: str, model: str = "GFS") -> Optional[float]:
     """GFS-MOS or NAM-MOS predicted max temp for tomorrow at this station, in Fahrenheit."""
-    from datetime import timedelta
     today = datetime.now(timezone.utc)
     runtime = today.strftime("%Y-%m-%d 00:00")
     target_date = today + timedelta(days=1)
+    params = {"station": station, "runtime": runtime, "model": model}
+    try:
+        r = await client.get(IEM_MOS_URL, params=params, timeout=15)
+        r.raise_for_status()
+        return _parse_mos_csv(r.text, target_date)
+    except Exception:
+        return None
+
+
+async def fetch_iem_mos_for_date(
+    client: httpx.AsyncClient,
+    station: str,
+    target_date_str: str,
+    model: str = "GFS",
+) -> Optional[float]:
+    """Historical MOS prediction for a specific past date. Uses the
+    target_date - 1 day 00Z model run (24h-ahead forecast horizon). IEM
+    archives GFS-MOS / NAM-MOS bulletins back to ~2004.
+
+    Per-call cost is one IEM HTTP fetch — the caller should rate-limit
+    via a semaphore for bulk backfills."""
+    try:
+        target_date = datetime.fromisoformat(target_date_str)
+    except ValueError:
+        return None
+    runtime_dt = target_date - timedelta(days=1)
+    runtime = runtime_dt.strftime("%Y-%m-%d 00:00")
     params = {"station": station, "runtime": runtime, "model": model}
     try:
         r = await client.get(IEM_MOS_URL, params=params, timeout=15)

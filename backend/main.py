@@ -239,6 +239,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             "ecmwf_max": ecmwf_max_f,
             "icon_max": None,           # not currently in live state
             "om_max": om_max_f,
+            "gfs_mos_max": gfs_mos_f,
+            "nam_mos_max": nam_mos_f,
             "t850_c": t850_c,
             "t700_c": t700_c,
             "t500_c": t500_c,

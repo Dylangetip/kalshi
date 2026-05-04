@@ -44,29 +44,64 @@ def _load_if_changed() -> Optional[Dict[str, Any]]:
 
 def predict_max(features: Dict[str, Any], city: str) -> Optional[float]:
     """Run the latest trained model on `features`. Returns ml_max in °F
-    or None if no model is trained yet / inference fails."""
+    or None if no model is trained yet / inference fails. Handles three
+    payload shapes:
+      - flat (one model + one feature_columns list): single algo or
+        gbm-best winner
+      - per-city: dict of city → fit + feature_columns_per_city
+      - stack: dict with base + meta + base_order"""
     payload = _load_if_changed()
     if not payload:
         return None
+
+    algo = payload.get("algorithm") or ""
+
+    # Per-city payload
+    if algo == "per-city" or "fits_by_city" in payload:
+        fits = payload.get("fits_by_city") or {}
+        cols_per_city = payload.get("feature_columns_per_city") or {}
+        fit = fits.get(city)
+        if not fit:
+            return None
+        return _predict_with(fit["model"], cols_per_city.get(city, []), features, city)
+
     model = payload.get("model")
     fitted_cols: List[str] = payload.get("feature_columns") or []
     if model is None or not fitted_cols:
         return None
+
+    # Stacking payload — model is a dict {base, meta, base_order}
+    if isinstance(model, dict) and "base" in model and "meta" in model:
+        try:
+            import pandas as pd  # type: ignore
+            base_models = model["base"]
+            meta = model["meta"]
+            base_order = model.get("base_order") or list(base_models.keys())
+            base_preds = {}
+            for name in base_order:
+                v = _predict_with(base_models[name], fitted_cols, features, city)
+                if v is None:
+                    return None
+                base_preds[name] = [v]
+            meta_X = pd.DataFrame(base_preds, columns=base_order)
+            return float(round(meta.predict(meta_X)[0], 1))
+        except Exception:
+            return None
+
+    return _predict_with(model, fitted_cols, features, city)
+
+
+def _predict_with(model, fitted_cols: List[str], features: Dict[str, Any], city: str) -> Optional[float]:
     try:
         import pandas as pd  # type: ignore
-        # Build a one-row DataFrame matching the training feature schema
         row = {col: 0 for col in fitted_cols}
         for col, val in features.items():
             if col in row and val is not None:
                 row[col] = float(val)
-        # City one-hot
         city_col = f"city_{city}"
         if city_col in row:
             row[city_col] = 1
         df = pd.DataFrame([row], columns=fitted_cols)
-        # Mean-impute remaining zeros for numeric features that should have
-        # a sensible default (relies on training-time fill behavior; here
-        # we just leave 0 since the linear model handles it gracefully).
         pred = model.predict(df)
         return float(round(pred[0], 1))
     except Exception:

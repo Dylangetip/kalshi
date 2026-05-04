@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS historical_predictions (
     ecmwf_max               REAL,
     icon_max                REAL,
     om_max                  REAL,
+    gfs_mos_max             REAL,
+    nam_mos_max             REAL,
     t850_c                  REAL,
     t700_c                  REAL,
     t500_c                  REAL,
@@ -185,6 +187,11 @@ def init() -> None:
                 _conn.execute("ALTER TABLE feature_snapshots ADD COLUMN ml_max REAL")
             if "blended_max" not in feat_cols:
                 _conn.execute("ALTER TABLE feature_snapshots ADD COLUMN blended_max REAL")
+            # historical_predictions gained gfs_mos_max + nam_mos_max
+            hp_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(historical_predictions)").fetchall()}
+            for col in ("gfs_mos_max", "nam_mos_max"):
+                if col not in hp_cols:
+                    _conn.execute(f"ALTER TABLE historical_predictions ADD COLUMN {col} REAL")
             _conn.commit()
 
 
@@ -455,20 +462,38 @@ def list_bets_for_target(city: str, target_date: str) -> List[Dict]:
 
 def upsert_historical_prediction(row: Dict) -> None:
     """INSERT OR REPLACE one historical prediction row. `row` keys must
-    match the historical_predictions columns."""
+    match the historical_predictions columns. Uses COALESCE on MOS
+    columns so a re-run that doesn't fetch MOS doesn't blank out an
+    earlier MOS-included row."""
     c = _conn_or_init()
     with _lock:
+        # Read existing MOS values so we don't NULL them on re-runs that
+        # skip MOS (e.g. fast OM-only repulls).
+        existing = c.execute(
+            "SELECT gfs_mos_max, nam_mos_max FROM historical_predictions "
+            "WHERE city=? AND target_date=? AND forecast_horizon_hours=?",
+            (row["city"], row["target_date"], int(row["forecast_horizon_hours"])),
+        ).fetchone()
+        gfs_mos = row.get("gfs_mos_max")
+        nam_mos = row.get("nam_mos_max")
+        if existing:
+            if gfs_mos is None:
+                gfs_mos = existing["gfs_mos_max"]
+            if nam_mos is None:
+                nam_mos = existing["nam_mos_max"]
         c.execute(
             """INSERT OR REPLACE INTO historical_predictions (
                 city, target_date, forecast_horizon_hours,
                 gfs_max, ecmwf_max, icon_max, om_max,
+                gfs_mos_max, nam_mos_max,
                 t850_c, t700_c, t500_c, h500_m, rh850_pct,
                 ensemble_max
-            ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?, ?)""",
+            ) VALUES (?,?,?, ?,?,?,?, ?,?, ?,?,?,?,?, ?)""",
             (
                 row["city"], row["target_date"], int(row["forecast_horizon_hours"]),
                 row.get("gfs_max"), row.get("ecmwf_max"),
                 row.get("icon_max"), row.get("om_max"),
+                gfs_mos, nam_mos,
                 row.get("t850_c"), row.get("t700_c"), row.get("t500_c"),
                 row.get("h500_m"), row.get("rh850_pct"),
                 row.get("ensemble_max"),
@@ -529,6 +554,7 @@ def list_training_data() -> List[Dict]:
         WITH joined AS (
             SELECT p.city, p.target_date, p.forecast_horizon_hours,
                    p.gfs_max, p.ecmwf_max, p.icon_max, p.om_max,
+                   p.gfs_mos_max, p.nam_mos_max,
                    p.t850_c, p.t700_c, p.t500_c, p.h500_m, p.rh850_pct,
                    p.ensemble_max,
                    a.actual_max_f
@@ -553,6 +579,7 @@ def list_training_data() -> List[Dict]:
         )
         SELECT w.city, w.target_date, w.forecast_horizon_hours,
                w.gfs_max, w.ecmwf_max, w.icon_max, w.om_max,
+               w.gfs_mos_max, w.nam_mos_max,
                w.t850_c, w.t700_c, w.t500_c, w.h500_m, w.rh850_pct,
                w.ensemble_max,
                w.actual_max_f,

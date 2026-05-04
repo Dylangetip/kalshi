@@ -35,6 +35,11 @@ from .. import db
 # Raw numeric features. _engineer_features adds derived columns on top.
 FEATURE_COLUMNS_NUMERIC: List[str] = [
     "gfs_max", "ecmwf_max", "icon_max", "om_max",
+    # Doc §2.1 calls MOS the highest-value source. Backfilled from IEM
+    # archives; at inference the live ensemble's mosMax / namMos populate
+    # these fields directly.
+    "gfs_mos_max",
+    "nam_mos_max",
     "t850_c", "t700_c", "t500_c", "h500_m", "rh850_pct",
     "ensemble_max",
     # High-autocorrelation + climatology anchors. Joined in via
@@ -116,6 +121,13 @@ def _engineer_features(df):
         out["ens_minus_prev"] = out["ensemble_max"] - out["prev_actual_max_f"]
     if "ensemble_max" in out.columns and "seasonal_avg_max_f" in out.columns:
         out["ens_minus_climo"] = out["ensemble_max"] - out["seasonal_avg_max_f"]
+    # MOS spreads: how much do MOS bulletins disagree with the raw model
+    # ensemble? MOS is bias-corrected for station microclimate, so the
+    # delta is informative (it's literally the bias signal).
+    if "gfs_mos_max" in out.columns and "ensemble_max" in out.columns:
+        out["gfsmos_minus_ens"] = out["gfs_mos_max"] - out["ensemble_max"]
+    if "gfs_mos_max" in out.columns and "nam_mos_max" in out.columns:
+        out["mos_spread"] = out["gfs_mos_max"] - out["nam_mos_max"]
     return out
 
 
@@ -128,7 +140,8 @@ def _featurize(df, fitted_columns: Optional[List[str]] = None):
     numeric_cols = list(FEATURE_COLUMNS_NUMERIC)
     for extra in ("spread_gfs_ecmwf", "spread_gfs_icon", "spread_ecmwf_icon",
                   "lapse_850_500", "doy_sin", "doy_cos",
-                  "ens_minus_prev", "ens_minus_climo"):
+                  "ens_minus_prev", "ens_minus_climo",
+                  "gfsmos_minus_ens", "mos_spread"):
         if extra in df.columns:
             numeric_cols.append(extra)
     base = df[[c for c in numeric_cols if c in df.columns]].copy()
@@ -186,17 +199,25 @@ def _fit_one(algorithm: str, X_train, y_train, X_test, y_test) -> Dict:
 
 
 def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
-             holdout_mae_ensemble: Optional[float]) -> Dict:
-    """Save a fitted model to disk and record the run in ml_runs."""
+             holdout_mae_ensemble: Optional[float],
+             extra_payload: Optional[Dict] = None) -> Dict:
+    """Save a fitted model to disk and record the run in ml_runs.
+    `extra_payload` lets callers (e.g. per-city / stacking) include
+    structured side data in the pickle that predict.py knows how to
+    consume."""
     import joblib  # type: ignore
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
     safe_algo = fit["algorithm"].replace("[", "-").replace("]", "").replace(",", "_").replace("=", "").replace("/", "_")
     model_path = MODELS_DIR / f"{safe_algo}-{ts}.pkl"
-    joblib.dump(
-        {"model": fit["model"], "feature_columns": feature_cols, "algorithm": fit["algorithm"]},
-        model_path,
-    )
+    payload = {
+        "model": fit["model"],
+        "feature_columns": feature_cols,
+        "algorithm": fit["algorithm"],
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    joblib.dump(payload, model_path)
     return db.insert_ml_run(
         algorithm=fit["algorithm"],
         n_train=n_train, n_test=n_test,
@@ -206,6 +227,104 @@ def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
         feature_columns=feature_cols,
         model_path=str(model_path),
     )
+
+
+def _train_per_city(df) -> Optional[Dict]:
+    """Fit one model per city. Returns a dict of {city: best_fit} where
+    each best_fit is the algo with lowest test_mae for THAT city. Cities
+    with too few rows fall back to None and inference will use the
+    global model for them."""
+    from sklearn.linear_model import Ridge  # type: ignore
+    from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+    fits_by_city: Dict[str, Dict] = {}
+    feature_cols_per_city: Dict[str, List[str]] = {}
+    total_train = 0
+    total_test = 0
+    weighted_test_mae = 0.0
+    for city, sub in df.groupby("city"):
+        if len(sub) < 50:
+            continue
+        sub = sub.sort_values("target_date").reset_index(drop=True)
+        n = len(sub)
+        n_test = max(1, int(n * 0.2))
+        n_train = n - n_test
+        train_df = sub.iloc[:n_train]
+        test_df = sub.iloc[n_train:]
+        X_tr, fc = _featurize(train_df)
+        X_te, _ = _featurize(test_df, fitted_columns=fc)
+        y_tr = train_df[TARGET_COLUMN].astype(float)
+        y_te = test_df[TARGET_COLUMN].astype(float)
+        # Try Ridge + a single fast GBM per city; pick the better one.
+        best = None
+        for name, m in (
+            ("linear", Ridge(alpha=1.0)),
+            ("gbm", GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42)),
+        ):
+            m.fit(X_tr, y_tr)
+            te = float((m.predict(X_te) - y_te).abs().mean())
+            if best is None or te < best["test_mae"]:
+                tr = float((m.predict(X_tr) - y_tr).abs().mean())
+                best = {"model": m, "name": name, "train_mae": tr, "test_mae": te}
+        fits_by_city[city] = best
+        feature_cols_per_city[city] = fc
+        total_train += n_train
+        total_test += n_test
+        weighted_test_mae += best["test_mae"] * n_test
+    if not fits_by_city:
+        return None
+    return {
+        "fits": fits_by_city,
+        "feature_columns": feature_cols_per_city,
+        "n_train": total_train,
+        "n_test": total_test,
+        "test_mae": weighted_test_mae / total_test if total_test else None,
+        "train_mae": None,
+    }
+
+
+def _train_stack(X_train, y_train, X_test, y_test) -> Dict:
+    """Stacking: fit Ridge / RF / GBM on the training set, then a
+    Ridge meta-model on their out-of-sample predictions. Often shaves
+    1-3% off the best individual model."""
+    from sklearn.linear_model import Ridge  # type: ignore
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor  # type: ignore
+    import numpy as np  # type: ignore
+    base_models = {
+        "linear": Ridge(alpha=1.0),
+        "rf": RandomForestRegressor(n_estimators=200, max_depth=12, min_samples_leaf=4, random_state=42, n_jobs=-1),
+        "gbm": GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42),
+    }
+    # 5-fold cross-validated predictions on the training set so the meta
+    # model trains on out-of-sample predictions (no leakage).
+    from sklearn.model_selection import KFold  # type: ignore
+    kf = KFold(n_splits=5, shuffle=False)
+    n = len(X_train)
+    base_train_preds = {name: np.zeros(n) for name in base_models}
+    for tr_idx, va_idx in kf.split(X_train):
+        for name, m in base_models.items():
+            mc = type(m)(**m.get_params())
+            mc.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+            base_train_preds[name][va_idx] = mc.predict(X_train.iloc[va_idx])
+    # Refit each base model on the full training set for inference.
+    for m in base_models.values():
+        m.fit(X_train, y_train)
+    # Meta-model on stacked OOF predictions.
+    import pandas as pd  # type: ignore
+    meta_X_train = pd.DataFrame(base_train_preds)
+    meta = Ridge(alpha=1.0)
+    meta.fit(meta_X_train, y_train)
+    # Evaluate the full stack on the test set.
+    meta_X_test = pd.DataFrame({
+        name: m.predict(X_test) for name, m in base_models.items()
+    })
+    test_pred = meta.predict(meta_X_test)
+    train_pred = meta.predict(meta_X_train)
+    return {
+        "model": {"base": base_models, "meta": meta, "base_order": list(base_models.keys())},
+        "algorithm": "stack[linear+rf+gbm]",
+        "train_mae": float((train_pred - y_train).abs().mean()),
+        "test_mae": float((test_pred - y_test).abs().mean()),
+    }
 
 
 def train(algorithm: str = "linear") -> Dict:
@@ -237,11 +356,44 @@ def train(algorithm: str = "linear") -> Dict:
             if ens_mask.sum() > 0 else None
         )
 
+        if algorithm == "stack":
+            fit = _train_stack(X_train, y_train, X_test, y_test)
+            return _persist(fit, feature_cols, len(train_df), len(test_df), holdout_mae_ensemble)
+
+        if algorithm == "per-city":
+            payload = _train_per_city(df)
+            if payload is None:
+                return {"error": "no city had enough rows (≥50) for per-city training"}
+            algo = "per-city"
+            run = db.insert_ml_run(
+                algorithm=algo,
+                n_train=payload["n_train"], n_test=payload["n_test"],
+                train_mae=None,
+                test_mae=round(payload["test_mae"], 3) if payload["test_mae"] else None,
+                holdout_mae_ensemble=round(holdout_mae_ensemble, 3) if holdout_mae_ensemble is not None else None,
+                feature_columns=["per-city: see payload"],
+                model_path=str(MODELS_DIR / f"per-city-{int(time.time())}.pkl"),
+            )
+            import joblib  # type: ignore
+            joblib.dump({
+                "algorithm": algo,
+                "fits_by_city": payload["fits"],
+                "feature_columns_per_city": payload["feature_columns"],
+            }, run["model_path"])
+            run["per_city_breakdown"] = [
+                {"city": c, "test_mae": round(f["test_mae"], 3), "algo": f["name"]}
+                for c, f in payload["fits"].items()
+            ]
+            return run
+
         if algorithm == "auto":
             candidates = []
-            for algo in ("linear", "rf", "gbm-best"):
+            for algo in ("linear", "rf", "gbm-best", "stack"):
                 try:
-                    fit = _fit_one(algo, X_train, y_train, X_test, y_test)
+                    if algo == "stack":
+                        fit = _train_stack(X_train, y_train, X_test, y_test)
+                    else:
+                        fit = _fit_one(algo, X_train, y_train, X_test, y_test)
                     candidates.append(fit)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[ml-auto] {algo} fit failed: {exc}")

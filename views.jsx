@@ -920,6 +920,20 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
           onClick={() => click('train-rf', () => onMlTrain('rf'))}>
           {busy === 'train-rf' ? <><span className="spinner" />training {elapsedSec}s</> : 'Train (rf)'}
         </button>
+        <button
+          className="btn"
+          disabled={!!busy || backfillRunning || (data.paired || 0) < 100}
+          onClick={() => click('train-stack', () => onMlTrain('stack'))}
+          title="Stacking: combines linear + rf + gbm via a meta-model. Often beats any individual algo by 1-3%.">
+          {busy === 'train-stack' ? <><span className="spinner" />stacking {elapsedSec}s</> : 'Train (stack)'}
+        </button>
+        <button
+          className="btn"
+          disabled={!!busy || backfillRunning || (data.paired || 0) < 250}
+          onClick={() => click('train-per-city', () => onMlTrain('per-city'))}
+          title="One model per city. Captures microclimate patterns the global model can't.">
+          {busy === 'train-per-city' ? <><span className="spinner" />per-city {elapsedSec}s</> : 'Train (per-city)'}
+        </button>
       </div>
 
       <div style={{ padding: '0 14px 14px', display: 'flex', gap: 14, fontSize: 11, color: 'var(--fg-2)', fontFamily: 'var(--mono)' }}>
