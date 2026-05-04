@@ -1,8 +1,14 @@
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import httpx
+
+# Sounding data only changes at 00Z / 12Z launches (~2×/day).
+# Cache per station for 6 hours so we never block a full boot on slow UWyo.
+_SOUNDING_CACHE: Dict[str, Dict] = {}  # station → {ts, data}
+_SOUNDING_TTL = 6 * 3600
 
 USER_AGENT = "kalshi-weather-bets/0.1 (research; contact: dylan@example.com)"
 
@@ -411,23 +417,24 @@ async def fetch_sounding_raw(client: httpx.AsyncClient, station_id: str) -> dict
 async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional[dict]:
     """Pull the most recent 12Z radiosonde sounding from U. Wyoming.
 
-    12Z launches at 7 AM ET / 4 AM PT and are typically posted by 13Z.
-    Per the v3.0 doc §2.4, the 12Z sounding is the highest-value reading —
-    it captures the morning atmospheric state before afternoon heating.
+    Results are cached 6 hours per station — soundings only update at 00Z/12Z
+    so re-fetching on every boot/snapshot tick wastes 20-120 s per city.
+    """
+    cached = _SOUNDING_CACHE.get(station_id)
+    if cached and time.time() - cached["ts"] < _SOUNDING_TTL:
+        return cached["data"]
 
-    Tries the (URL, param-schema) cartesian product and returns the first
-    combination that parses successfully — UWyo migrated from cgi-bin
-    to wsgi mid-2024 and the param keys changed at the same time."""
     now = datetime.now(timezone.utc)
     target = now if now.hour >= 13 else now - timedelta(days=1)
     for url in UWYO_SOUNDING_URLS:
         for params in _sounding_param_variants(station_id, target):
             try:
-                r = await client.get(url, params=params, timeout=20)
+                r = await client.get(url, params=params, timeout=8)
                 if r.status_code != 200:
                     continue
                 parsed = _parse_uwyo_sounding(r.text)
                 if parsed:
+                    _SOUNDING_CACHE[station_id] = {"ts": time.time(), "data": parsed}
                     return parsed
             except Exception:
                 continue
