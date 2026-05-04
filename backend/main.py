@@ -654,23 +654,32 @@ def _bet_row_to_log(b: Dict) -> Dict:
 
 
 def _mark_bet_to_market(b: Dict, current_yes_pct: float) -> Dict:
-    """Mark a stored bet against the latest Kalshi YES probability for its
-    bracket. Matches the prototype's sign convention: entry/current are
-    stored as YES probabilities, and P/L = (current - entry) * size * 100
-    * (+1 for YES, -1 for NO) so a NO bet profits when YES drops."""
-    entry = b["entry_cents"] / 100
-    current = current_yes_pct
-    sign = 1 if b["side"] == "YES" else -1
-    pl = (current - entry) * b["size"] * sign * 100
+    """Return settlement binary outcomes for an open bet.
+    ifWin  = net profit if the bet resolves in your favour (payout - stake).
+    ifLose = net loss if it resolves against you (always -size, the full stake).
+    """
+    entry = b["entry_cents"] / 100      # fraction, e.g. 0.26
+    size = b["size"]                    # USD risked
+    contracts = size / entry            # number of $1-payout contracts bought
+    if b["side"] == "YES":
+        if_win = round((1 - entry) * contracts, 2)   # profit per contract × count
+        if_lose = -size
+    else:
+        # NO bet: you bought (100-entry)¢ contracts that pay $1 if NO wins
+        no_entry = 1 - entry
+        no_contracts = size / no_entry
+        if_win = round((1 - no_entry) * no_contracts, 2)
+        if_lose = -size
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
         "bracket": b["bracket_label"],
         "side": b["side"],
-        "size": b["size"],
+        "size": size,
         "entry": round(entry, 3),
-        "current": round(current, 3),
-        "pl": round(pl, 2),
+        "current": round(current_yes_pct, 3),
+        "ifWin": if_win,
+        "ifLose": if_lose,
     }
 
 

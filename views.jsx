@@ -625,8 +625,8 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
             <thead>
               <tr>
                 <th>City</th><th>Bracket</th><th>Side</th>
-                <th className="num-r">Size</th><th className="num-r">Entry</th>
-                <th className="num-r">Mark</th><th className="num-r">P/L</th>
+                <th className="num-r">Stake</th><th className="num-r">Entry</th>
+                <th className="num-r pos">If WIN</th><th className="num-r neg">If LOSE</th>
               </tr>
             </thead>
             <tbody>
@@ -637,8 +637,8 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
                   <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
                   <td className="num-r">${p.size}</td>
                   <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
-                  <td className="num-r">{(p.current * 100).toFixed(0)}¢</td>
-                  <td className={`num-r ${p.pl > 0 ? 'pos' : 'neg'}`}>{fmtSign(p.pl, 2)}</td>
+                  <td className="num-r pos">+{fmtSign(p.ifWin ?? (p.size * (1 - p.entry) / p.entry), 0)}</td>
+                  <td className="num-r neg">-${p.size}</td>
                 </tr>
               ))}
             </tbody>
