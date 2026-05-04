@@ -637,7 +637,7 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
                   <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
                   <td className="num-r">${p.size}</td>
                   <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
-                  <td className="num-r pos">+{fmtSign(p.ifWin ?? (p.size * (1 - p.entry) / p.entry), 0)}</td>
+                  <td className="num-r pos">+${Math.round(p.ifWin ?? (p.size * (1 - p.entry) / p.entry)).toLocaleString()}</td>
                   <td className="num-r neg">-${p.size}</td>
                 </tr>
               ))}
