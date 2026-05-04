@@ -294,6 +294,9 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 .btn.danger { background: var(--neg); border-color: var(--neg); color: #fff; }
 .btn.ghost { background: transparent; }
 .btn.sm { padding: 3px 8px; font-size: 11px; }
+.btn-sm { padding: 1px 6px; font-size: 11px; background: var(--bg-2); color: var(--fg-1); border: 1px solid var(--border); border-radius: 3px; cursor: pointer; line-height: 20px; }
+.btn-sm:hover:not(:disabled) { background: var(--bg-hover); }
+.btn-sm:disabled { opacity: 0.35; cursor: default; }
 .btn.icon { padding: 4px 6px; }
 
 /* ===== FORM ===== */

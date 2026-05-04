@@ -620,29 +620,64 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
 
       <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 14 }}>
         <div className="panel">
-          <div className="panel-header"><span>Open positions</span><span className="panel-title-actions">{positions.length} · ${positions.reduce((s, p) => s + p.size, 0)} exposed</span></div>
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>City</th><th>Bracket</th><th>Side</th>
-                <th className="num-r">Stake</th><th className="num-r">Entry</th>
-                <th className="num-r pos">If WIN</th><th className="num-r neg">If LOSE</th>
-              </tr>
-            </thead>
-            <tbody>
-              {positions.map(p => (
-                <tr key={p.id}>
-                  <td className="city-cell">{p.city}</td>
-                  <td>{p.bracket}</td>
-                  <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
-                  <td className="num-r">${p.size}</td>
-                  <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
-                  <td className="num-r pos">+${Math.round(p.ifWin ?? (p.size * (1 - p.entry) / p.entry)).toLocaleString()}</td>
-                  <td className="num-r neg">-${p.size}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {(() => {
+            const [pageSize, setPageSize] = React.useState(20);
+            const [page, setPage] = React.useState(0);
+            const totalPages = Math.ceil(positions.length / pageSize);
+            const slice = positions.slice(page * pageSize, (page + 1) * pageSize);
+            const sliceExposed = slice.reduce((s, p) => s + p.size, 0);
+            return (
+              <>
+                <div className="panel-header">
+                  <span>Open positions</span>
+                  <span className="panel-title-actions" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span>{positions.length} total · ${positions.reduce((s, p) => s + p.size, 0).toLocaleString()} exposed</span>
+                    <select
+                      value={pageSize}
+                      onChange={e => { setPageSize(+e.target.value); setPage(0); }}
+                      style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 4px', fontSize: 11 }}
+                    >
+                      {[20, 40, 60, 80, 100].map(n => <option key={n} value={n}>{n} / page</option>)}
+                    </select>
+                  </span>
+                </div>
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>City</th><th>Bracket</th><th>Side</th>
+                      <th className="num-r">Stake</th><th className="num-r">Entry</th>
+                      <th className="num-r pos">If WIN</th><th className="num-r neg">If LOSE</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {slice.map(p => (
+                      <tr key={p.id}>
+                        <td className="city-cell">{p.city}</td>
+                        <td>{p.bracket}</td>
+                        <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
+                        <td className="num-r">${p.size}</td>
+                        <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
+                        <td className="num-r pos">+${Math.round(p.ifWin ?? (p.size * (1 - p.entry) / p.entry)).toLocaleString()}</td>
+                        <td className="num-r neg">-${p.size}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {totalPages > 1 && (
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--fg-2)' }}>
+                    <span>Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, positions.length)} of {positions.length} · ${sliceExposed.toLocaleString()} on this page</span>
+                    <span style={{ display: 'flex', gap: 4 }}>
+                      <button className="btn-sm" onClick={() => setPage(0)} disabled={page === 0}>«</button>
+                      <button className="btn-sm" onClick={() => setPage(p => p - 1)} disabled={page === 0}>‹</button>
+                      <span style={{ padding: '0 6px', lineHeight: '22px' }}>pg {page + 1} / {totalPages}</span>
+                      <button className="btn-sm" onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1}>›</button>
+                      <button className="btn-sm" onClick={() => setPage(totalPages - 1)} disabled={page >= totalPages - 1}>»</button>
+                    </span>
+                  </div>
+                )}
+              </>
+            );
+          })()}
         </div>
 
         <div className="panel">
