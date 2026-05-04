@@ -155,6 +155,11 @@ CREATE INDEX IF NOT EXISTS idx_mlruns_trained ON ml_runs(trained_at DESC);
 
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
+# Reads run on a per-thread connection to avoid cursor-state corruption
+# when FastAPI's threadpool issues concurrent queries against the same
+# sqlite3.Connection (which is not safe to share across threads even with
+# check_same_thread=False).
+_tls = threading.local()
 
 
 def _connect() -> sqlite3.Connection:
@@ -196,10 +201,15 @@ def init() -> None:
 
 
 def _conn_or_init() -> sqlite3.Connection:
+    """Per-thread sqlite3 connection. The first call also runs init() once
+    so the schema/migrations are applied before any other thread queries."""
     if _conn is None:
         init()
-    assert _conn is not None
-    return _conn
+    tls_conn = getattr(_tls, "conn", None)
+    if tls_conn is None:
+        tls_conn = _connect()
+        _tls.conn = tls_conn
+    return tls_conn
 
 
 def insert_bet(
