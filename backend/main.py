@@ -99,7 +99,7 @@ SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 # Auto paper-trader. Initial config from env, runtime-mutable via
 # POST /api/auto-trade/config. The loop reads from this dict on every
 # iteration so toggles take effect on the next tick (no restart needed).
-AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "3600"))
+AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "600"))  # 10 min — fires within 10m of a new edge appearing
 _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
     "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "3")),
@@ -140,6 +140,12 @@ ML_BACKFILL_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_BACKFILL_LOOP") == "1"
 # leaving 30% on the ensemble keeps the MOS signal alive in the
 # blended prediction. Override with BETS_BLEND_ALPHA in the env.
 ML_BLEND_ALPHA = float(os.getenv("BETS_BLEND_ALPHA", "0.7"))
+
+# Which prediction drives the bracket-prob calc + auto-trader edges.
+# Default 'auto' = use blended ML+ensemble when ML is trained, fall
+# back to ensemble. Set BETS_MODELMAX_SOURCE=ml to force pure ML, =blend
+# to force blend even when ML alone is better, =ensemble to disable ML.
+MODELMAX_SOURCE = os.getenv("BETS_MODELMAX_SOURCE", "auto").lower()
 
 # Backfill progress shared dict (read by /api/ml/backfill/status).
 _ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
@@ -261,13 +267,31 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     sigma = 1.8 - (afd["score"] - 3) * 0.20
     sigma = max(1.0, sigma)
 
-    # Try real Kalshi prices first. When the API key is configured and the
-    # bracket fetch succeeds, use the live market structure (Kalshi's own
-    # bracket bounds + their YES prices) and compute model probabilities
-    # over the same brackets via the same gauss centered on model_max.
-    # Doc §3.1: Kalshi center brackets are systematically overpriced — the
-    # synthetic ladder modeled this with a widening factor; with real
-    # prices we just use them directly.
+    # Choose which prediction drives the bracket-prob math (and therefore
+    # the recommended bet + edge calc + auto-trader). Modes:
+    #   ensemble - naive weighted average (legacy behavior)
+    #   ml       - trained ML model only
+    #   blend    - α·ml + (1-α)·ensemble (default; safest mix)
+    #   auto     - blend if ml available, else ensemble
+    # ML wins on holdout but the live ensemble has access to MOS that the
+    # trained model didn't see in backfill, so blend captures both.
+    blended_for_ladder = (
+        ML_BLEND_ALPHA * ml_max + (1 - ML_BLEND_ALPHA) * model_max
+        if ml_max is not None else None
+    )
+    src = MODELMAX_SOURCE
+    if src == "ml" and ml_max is not None:
+        active_max, active_source = ml_max, "ml"
+    elif src == "blend" and blended_for_ladder is not None:
+        active_max, active_source = blended_for_ladder, "blend"
+    elif src == "ensemble":
+        active_max, active_source = model_max, "ensemble"
+    else:  # auto
+        if blended_for_ladder is not None:
+            active_max, active_source = blended_for_ladder, "blend"
+        else:
+            active_max, active_source = model_max, "ensemble"
+
     kalshi_brackets = None
     if kalshi.configured() and city.get("kalshi_series"):
         kalshi_brackets = await kalshi.fetch_brackets_for_city(client, city["kalshi_series"])
@@ -276,7 +300,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         ladder = []
         for b in kalshi_brackets:
             model_pct = bracket_prob(
-                b["lo"], b["hi"], model_max, sigma,
+                b["lo"], b["hi"], active_max, sigma,
                 lower_tail=b.get("lower_tail", False),
                 upper_tail=b.get("upper_tail", False),
             )
@@ -293,7 +317,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
                 "kalshiTicker": b["ticker"],
             })
     else:
-        ladder = compute_ladder(model_max, model_sigma=sigma, kalshi_widening=1.30)
+        ladder = compute_ladder(active_max, model_sigma=sigma, kalshi_widening=1.30)
 
     best = best_bracket(ladder)
     kelly = kelly_fraction(best["edge"], best["kalshiPct"])
@@ -332,6 +356,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
             round(ML_BLEND_ALPHA * ml_max + (1 - ML_BLEND_ALPHA) * model_max, 1)
             if ml_max is not None else None
         ),
+        "activeMax": round(active_max, 1),
+        "activeSource": active_source,
         "nwsForecast": round(nws_max_f, 1) if nws_max_f is not None else round(om_max_f, 1),
         "mosMax": round(gfs_mos_f, 1) if gfs_mos_f is not None else round(model_max, 1),
         "namMos": round(nam_mos_f, 1) if nam_mos_f is not None else round(model_max, 1),

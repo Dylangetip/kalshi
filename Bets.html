@@ -345,6 +345,11 @@ function App() {
             : 'synthetic'}
         </span>
         <span className="sep">|</span>
+        <span>
+          <span className={`dot ${focus.activeSource === 'ml' ? 'pos' : focus.activeSource === 'blend' ? 'info' : 'muted'}`}></span>
+          {' '}model: {(focus.activeSource || 'ensemble').toUpperCase()}
+        </span>
+        <span className="sep">|</span>
         <span>paper trading</span>
         <span className="sep">|</span>
         <span>{focus.city.code} · {focus.city.station}</span>
