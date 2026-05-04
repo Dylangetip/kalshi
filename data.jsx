@@ -295,6 +295,39 @@ async function fetchStats() {
   }
 }
 
+async function fetchMlInfo() {
+  try {
+    const r = await fetch(`${API_BASE}/api/ml/info`, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function triggerMlBackfill(startDate, endDate) {
+  try {
+    const params = new URLSearchParams();
+    if (startDate) params.set('start_date', startDate);
+    if (endDate) params.set('end_date', endDate);
+    const r = await fetch(`${API_BASE}/api/ml/backfill?${params.toString()}`, { method: 'POST' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function triggerMlTrain(algorithm = 'linear') {
+  try {
+    const r = await fetch(`${API_BASE}/api/ml/train?algorithm=${algorithm}`, { method: 'POST' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 async function fetchAccuracy() {
   try {
     const r = await fetch(`${API_BASE}/api/accuracy`, { cache: 'no-store' });
@@ -390,5 +423,6 @@ window.MOCK = {
   seedRand, gauss, makeBrackets, buildCityState,
   fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, fetchStats, fetchAccuracy,
   fetchAutoTradeInfo, setAutoTradeConfig, triggerAutoTradeNow,
+  fetchMlInfo, triggerMlBackfill, triggerMlTrain,
   persistBet, API_BASE,
 };

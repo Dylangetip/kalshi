@@ -58,6 +58,9 @@ _load_dotenv(Path(__file__).parent / ".env")
 
 from . import db, kalshi
 from .cities import CITIES
+from .ml import predict as ml_predict
+from .ml import train as ml_train
+from .ml import backfill as ml_backfill
 from .model import parse_climate_max_yesterday, settle_pl
 from .sources import fetch_climate_report
 
@@ -117,6 +120,15 @@ _auto_trade_state: Dict = {
 _snapshot_task: Optional[asyncio.Task] = None
 _settlement_task: Optional[asyncio.Task] = None
 _auto_trader_task: Optional[asyncio.Task] = None
+_ml_retrain_task: Optional[asyncio.Task] = None
+
+# ML retraining loop. Default: weekly (Sunday-ish via 7-day sleep).
+ML_RETRAIN_INTERVAL_SECONDS = int(os.getenv("BETS_ML_RETRAIN_INTERVAL", str(7 * 86400)))
+ML_RETRAIN_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_RETRAIN_LOOP") == "1"
+ML_RETRAIN_ALGORITHM = os.getenv("BETS_ML_ALGORITHM", "linear")  # 'linear' | 'gbm'
+
+# Backfill progress shared dict (read by /api/ml/backfill/status).
+_ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
 from .model import (
     best_bracket,
     bracket_prob,
@@ -202,6 +214,26 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     if model_max is None:
         return None
 
+    # Run the trained ML model in parallel for the comparison panel.
+    # Inference uses only the features available historically (no MOS) so
+    # the live + training feature schemas match. Returns None when no
+    # model has been trained yet — callers handle gracefully.
+    ml_max = ml_predict.predict_max(
+        {
+            "gfs_max": om_max_f,        # surface OM seamless ≈ GFS daily max
+            "ecmwf_max": ecmwf_max_f,
+            "icon_max": None,           # not currently in live state
+            "om_max": om_max_f,
+            "t850_c": t850_c,
+            "t700_c": t700_c,
+            "t500_c": t500_c,
+            "h500_m": h500,
+            "rh850_pct": rh850,
+            "ensemble_max": model_max,
+        },
+        city=city["code"],
+    )
+
     afd = parse_afd(afd_text)
     # Next-day temp forecasts have ~1.5-2°F std dev empirically, so default
     # σ = 1.8 with AFD adjustment. Tighter when AFD says high confidence,
@@ -276,6 +308,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "afdAboveNormal": afd.get("above_normal", False),
         "settlementBracket": best,
         "modelMax": round(model_max, 1),
+        "mlMax": ml_max,
         "nwsForecast": round(nws_max_f, 1) if nws_max_f is not None else round(om_max_f, 1),
         "mosMax": round(gfs_mos_f, 1) if gfs_mos_f is not None else round(model_max, 1),
         "namMos": round(nam_mos_f, 1) if nam_mos_f is not None else round(model_max, 1),
@@ -387,10 +420,28 @@ async def _snapshot_loop() -> None:
         await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
 
 
+async def _ml_retrain_loop() -> None:
+    """Retrain the ML model every BETS_ML_RETRAIN_INTERVAL seconds
+    (default weekly). Best-effort — errors are logged and we keep
+    sleeping. Skipped silently if there's not enough training data."""
+    while True:
+        try:
+            run = ml_train.train(algorithm=ML_RETRAIN_ALGORITHM)
+            if run.get("error"):
+                print(f"[ml-retrain] skipped: {run['error']}")
+            else:
+                print(f"[ml-retrain] {run.get('algorithm')} model trained: "
+                      f"test_mae={run.get('test_mae')} "
+                      f"vs ensemble={run.get('holdout_mae_ensemble')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ml-retrain] error: {exc}")
+        await asyncio.sleep(ML_RETRAIN_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
-    global _snapshot_task, _settlement_task, _auto_trader_task
+    global _snapshot_task, _settlement_task, _auto_trader_task, _ml_retrain_task
     if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
     if not SETTLEMENT_LOOP_DISABLED and _settlement_task is None:
@@ -399,11 +450,13 @@ async def _startup() -> None:
     # on each iteration so users can toggle from the UI without restart.
     if _auto_trader_task is None:
         _auto_trader_task = asyncio.create_task(_auto_trader_loop())
+    if not ML_RETRAIN_LOOP_DISABLED and _ml_retrain_task is None:
+        _ml_retrain_task = asyncio.create_task(_ml_retrain_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    for name in ("_snapshot_task", "_settlement_task", "_auto_trader_task"):
+    for name in ("_snapshot_task", "_settlement_task", "_auto_trader_task", "_ml_retrain_task"):
         task = globals().get(name)
         if task is not None:
             task.cancel()
@@ -733,6 +786,57 @@ def get_accuracy():
     """How close model_max came to the actual NWS high on each
     settled day. Joins feature_snapshots × bets.settled_max_f."""
     return db.accuracy_summary()
+
+
+# ── ML pipeline endpoints ───────────────────────────────────────────────
+
+@app.get("/api/ml/info")
+def ml_info():
+    """Latest training run + dataset counts + currently-loaded model."""
+    return {
+        "data": db.historical_counts(),
+        "latest_run": ml_train.latest_run_summary(),
+        "predictor": ml_predict.info(),
+        "retrain_interval_seconds": ML_RETRAIN_INTERVAL_SECONDS,
+        "retrain_algorithm": ML_RETRAIN_ALGORITHM,
+        "backfill_progress": _ml_backfill_progress,
+    }
+
+
+@app.post("/api/ml/backfill")
+async def ml_backfill_endpoint(start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """Kick off a historical backfill in the background. Returns
+    immediately; poll /api/ml/info to watch progress."""
+    if _ml_backfill_progress.get("running"):
+        raise HTTPException(409, "backfill already running")
+    today = datetime.now(timezone.utc).date()
+    if not start_date:
+        start_date = (today - timedelta(days=3 * 365)).isoformat()
+    if not end_date:
+        end_date = (today - timedelta(days=1)).isoformat()
+    _ml_backfill_progress.clear()
+    _ml_backfill_progress.update({"running": True, "stage": "queued"})
+
+    async def _runner():
+        try:
+            await ml_backfill.run_backfill(start_date, end_date, _ml_backfill_progress)
+        except Exception as exc:  # noqa: BLE001
+            _ml_backfill_progress["running"] = False
+            _ml_backfill_progress["stage"] = "error"
+            _ml_backfill_progress.setdefault("errors", []).append(
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    asyncio.create_task(_runner())
+    return {"started": True, "start_date": start_date, "end_date": end_date}
+
+
+@app.post("/api/ml/train")
+def ml_train_endpoint(algorithm: str = "linear"):
+    """Train a model right now on the current historical_predictions ×
+    historical_actuals data. Returns the ml_runs row (or an error
+    if there isn't enough data yet)."""
+    return ml_train.train(algorithm=algorithm)
 
 
 class PlaceOrderIn(BaseModel):

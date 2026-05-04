@@ -673,7 +673,161 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
 }
 
 // ====== AUTO-TRADE ======
-function AutoTradeView({ info, accuracy, bets, onSetConfig, onTriggerNow }) {
+
+function AccuracyBlock({ title, stats }) {
+  if (!stats || stats.n === 0) {
+    return (
+      <div className="signal-card">
+        <div className="label">{title}</div>
+        <div className="big-num" style={{ color: 'var(--fg-3)' }}>—</div>
+        <div className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>no data yet</div>
+      </div>
+    );
+  }
+  return (
+    <div className="signal-card">
+      <div className="label">{title}</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <span className="big-num">{stats.mae}°F</span>
+        <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>MAE · n={stats.n}</span>
+      </div>
+      <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)', marginTop: 4 }}>
+        ≤1°: {stats.within_1_pct}% · ≤2°: {stats.within_2_pct}% · ≤3°: {stats.within_3_pct}%
+      </div>
+    </div>
+  );
+}
+
+function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
+  const [busy, setBusy] = useState_v(null);  // 'backfill' | 'train' | null
+  const [lastResult, setLastResult] = useState_v(null);
+  const data = mlInfo?.data || {};
+  const run = mlInfo?.latest_run || {};
+  const progress = mlInfo?.backfill_progress || {};
+  const trained = run.trained;
+
+  const trainedAt = run.trained_at
+    ? new Date(run.trained_at * 1000).toLocaleString()
+    : 'never';
+
+  const click = async (kind, fn) => {
+    setBusy(kind);
+    setLastResult(null);
+    const r = await fn();
+    setLastResult(r);
+    setBusy(null);
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Machine learning</span>
+        <span className="panel-title-actions">
+          {trained ? `${run.algorithm} · trained ${trainedAt}` : 'no model trained yet'}
+        </span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, padding: 14 }}>
+        <div className="signal-card">
+          <div className="label">Training pairs</div>
+          <div className="big-num">{data.paired || 0}</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            {data.predictions || 0} preds · {data.actuals || 0} actuals
+          </div>
+        </div>
+        <div className="signal-card">
+          <div className="label">Date range</div>
+          <div className="mono" style={{ fontSize: 13, marginTop: 6 }}>
+            {data.earliest_target_date || '—'}
+          </div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            → {data.latest_target_date || '—'}
+          </div>
+        </div>
+        <div className="signal-card">
+          <div className="label">Holdout MAE</div>
+          {trained ? (
+            <>
+              <div className="big-num">{run.test_mae}°F</div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                vs ensemble {run.holdout_mae_ensemble}°F
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="big-num" style={{ color: 'var(--fg-3)' }}>—</div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>train first</div>
+            </>
+          )}
+        </div>
+        <div className="signal-card">
+          <div className="label">vs Ensemble</div>
+          {trained && run.holdout_mae_ensemble != null ? (
+            <>
+              <div className={`big-num ${run.test_mae < run.holdout_mae_ensemble ? 'pos' : 'neg'}`}>
+                {fmtSign(run.holdout_mae_ensemble - run.test_mae, 2)}°F
+              </div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                {run.test_mae < run.holdout_mae_ensemble ? 'ML beats ensemble' : 'ensemble still wins'}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="big-num" style={{ color: 'var(--fg-3)' }}>—</div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>—</div>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button
+          className="btn primary"
+          disabled={!!busy || progress.running}
+          onClick={() => click('backfill', () => onMlBackfill())}>
+          {progress.running ? `Backfilling… ${progress.cities_done || 0}/5 cities` :
+           busy === 'backfill' ? 'starting…' : 'Backfill 3 yrs'}
+        </button>
+        <button
+          className="btn primary"
+          disabled={!!busy || (data.paired || 0) < 20}
+          onClick={() => click('train', () => onMlTrain('linear'))}>
+          {busy === 'train' ? 'training…' : 'Train (linear)'}
+        </button>
+        <button
+          className="btn"
+          disabled={!!busy || (data.paired || 0) < 50}
+          onClick={() => click('train', () => onMlTrain('gbm'))}>
+          {busy === 'train' ? 'training…' : 'Train (gbm)'}
+        </button>
+        {progress.running && (
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            {progress.stage} · {progress.predictions_inserted || 0} preds, {progress.actuals_inserted || 0} actuals
+          </span>
+        )}
+        {progress.errors && progress.errors.length > 0 && (
+          <span className="mono neg" style={{ fontSize: 11 }}>
+            {progress.errors.length} error(s) — see console
+          </span>
+        )}
+      </div>
+
+      {lastResult && lastResult.error && (
+        <div style={{ padding: '0 14px 14px', fontSize: 11 }} className="neg">
+          training error: {lastResult.error}
+        </div>
+      )}
+      {lastResult && !lastResult.error && lastResult.test_mae != null && (
+        <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-2)' }}>
+          <span className="mono pos">trained ✓</span> {' '}
+          test MAE <span className="mono">{lastResult.test_mae}°F</span> vs ensemble {' '}
+          <span className="mono">{lastResult.holdout_mae_ensemble}°F</span> on {lastResult.n_test} holdout days
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AutoTradeView({ info, accuracy, bets, mlInfo, onMlBackfill, onMlTrain, onSetConfig, onTriggerNow }) {
   const [busy, setBusy] = useState_v(false);
   const [lastRunResult, setLastRunResult] = useState_v(null);
   const [draft, setDraft] = useState_v({});
@@ -791,11 +945,13 @@ function AutoTradeView({ info, accuracy, bets, onSetConfig, onTriggerNow }) {
         )}
       </div>
 
+      <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
+
       <div className="panel">
         <div className="panel-header">
           <span>Model accuracy</span>
           <span className="panel-title-actions">
-            modelMax vs actual NWS high · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
+            ensemble vs ML · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
           </span>
         </div>
         {!accuracy || accuracy.n_predictions === 0 ? (
@@ -805,47 +961,26 @@ function AutoTradeView({ info, accuracy, bets, onSetConfig, onTriggerNow }) {
           </div>
         ) : (
           <div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10, padding: 14 }}>
-              <div className="signal-card">
-                <div className="label">Mean abs error</div>
-                <div className="big-num">{accuracy.mean_absolute_error}°F</div>
-                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>median {accuracy.median_abs_error}°</div>
-              </div>
-              <div className="signal-card">
-                <div className="label">Within 1°F</div>
-                <div className="big-num pos">{accuracy.within_1_pct}%</div>
-                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>bullseye</div>
-              </div>
-              <div className="signal-card">
-                <div className="label">Within 2°F</div>
-                <div className="big-num pos">{accuracy.within_2_pct}%</div>
-                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>good</div>
-              </div>
-              <div className="signal-card">
-                <div className="label">Within 3°F</div>
-                <div className="big-num">{accuracy.within_3_pct}%</div>
-                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>acceptable</div>
-              </div>
-              <div className="signal-card">
-                <div className="label">N predictions</div>
-                <div className="big-num">{accuracy.n_predictions}</div>
-                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>settled days</div>
-              </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, padding: 14 }}>
+              <AccuracyBlock title="Ensemble (naive weighted)" stats={accuracy.ensemble} />
+              <AccuracyBlock title="ML (trained model)" stats={accuracy.ml} />
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, padding: '0 14px 14px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 14, padding: '0 14px 14px' }}>
               <div>
-                <div className="label" style={{ marginBottom: 8 }}>By city</div>
+                <div className="label" style={{ marginBottom: 8 }}>By city — MAE (°F)</div>
                 <table className="tbl">
                   <thead>
-                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">MAE</th><th className="num-r">≤2°F</th></tr>
+                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">Ens</th><th className="num-r">ML</th></tr>
                   </thead>
                   <tbody>
                     {accuracy.by_city.map(r => (
                       <tr key={r.city}>
                         <td className="city-cell">{r.city}</td>
                         <td className="num-r">{r.n}</td>
-                        <td className="num-r">{r.mae}°</td>
-                        <td className="num-r">{r.within_2_pct}%</td>
+                        <td className="num-r">{r.ensemble_mae != null ? r.ensemble_mae + '°' : '—'}</td>
+                        <td className={`num-r ${r.ml_mae != null && r.ensemble_mae != null && r.ml_mae < r.ensemble_mae ? 'pos' : ''}`}>
+                          {r.ml_mae != null ? r.ml_mae + '°' : '—'}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -855,20 +990,28 @@ function AutoTradeView({ info, accuracy, bets, onSetConfig, onTriggerNow }) {
                 <div className="label" style={{ marginBottom: 8 }}>Recent predictions</div>
                 <table className="tbl">
                   <thead>
-                    <tr><th>Date</th><th>City</th><th className="num-r">Model</th><th className="num-r">Actual</th><th className="num-r">Δ</th></tr>
+                    <tr>
+                      <th>Date</th><th>City</th>
+                      <th className="num-r">Ens</th>
+                      <th className="num-r">ML</th>
+                      <th className="num-r">Actual</th>
+                      <th className="num-r">Ens Δ</th>
+                      <th className="num-r">ML Δ</th>
+                    </tr>
                   </thead>
                   <tbody>
                     {accuracy.recent.slice(0, 10).map((r, i) => {
-                      const close = Math.abs(r.error) <= 1;
-                      const ok = Math.abs(r.error) <= 2;
+                      const ec = (e) => Math.abs(e) <= 1 ? 'pos' : Math.abs(e) <= 2 ? 'info' : 'neg';
                       return (
                         <tr key={i}>
                           <td>{r.date}</td>
                           <td className="city-cell">{r.city}</td>
-                          <td className="num-r">{r.prediction}°</td>
+                          <td className="num-r">{r.ensemble}°</td>
+                          <td className="num-r">{r.ml != null ? r.ml + '°' : '—'}</td>
                           <td className="num-r">{r.actual}°</td>
-                          <td className={`num-r ${close ? 'pos' : ok ? 'info' : 'neg'}`}>
-                            {fmtSign(r.error, 1)}°
+                          <td className={`num-r ${ec(r.ensemble_error)}`}>{fmtSign(r.ensemble_error, 1)}°</td>
+                          <td className={`num-r ${r.ml_error != null ? ec(r.ml_error) : ''}`}>
+                            {r.ml_error != null ? fmtSign(r.ml_error, 1) + '°' : '—'}
                           </td>
                         </tr>
                       );

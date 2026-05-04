@@ -103,6 +103,52 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_feat_city_ts ON feature_snapshots(city, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_feat_target_date ON feature_snapshots(target_date);
+
+-- Historical (city, target_date, forecast_horizon) → past predictions.
+-- Backfilled from Open-Meteo Historical Forecast API. Used as ML training X.
+CREATE TABLE IF NOT EXISTS historical_predictions (
+    city                    TEXT    NOT NULL,
+    target_date             TEXT    NOT NULL,
+    forecast_horizon_hours  INTEGER NOT NULL,
+    gfs_max                 REAL,
+    ecmwf_max               REAL,
+    icon_max                REAL,
+    om_max                  REAL,
+    t850_c                  REAL,
+    t700_c                  REAL,
+    t500_c                  REAL,
+    h500_m                  INTEGER,
+    rh850_pct               INTEGER,
+    ensemble_max            REAL,
+    PRIMARY KEY (city, target_date, forecast_horizon_hours)
+);
+CREATE INDEX IF NOT EXISTS idx_hpred_target ON historical_predictions(target_date);
+
+-- Historical actual highs. From IEM ASOS hourly archive (no auth, no rate
+-- limit). One row per (city, target_date). Used as ML training y.
+CREATE TABLE IF NOT EXISTS historical_actuals (
+    city          TEXT NOT NULL,
+    target_date   TEXT NOT NULL,
+    actual_max_f  REAL NOT NULL,
+    source        TEXT NOT NULL,
+    PRIMARY KEY (city, target_date)
+);
+CREATE INDEX IF NOT EXISTS idx_hact_target ON historical_actuals(target_date);
+
+-- One row per training run. The model_path file contains the joblib pickle.
+CREATE TABLE IF NOT EXISTS ml_runs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    trained_at            INTEGER NOT NULL,
+    algorithm             TEXT    NOT NULL,
+    n_train               INTEGER NOT NULL,
+    n_test                INTEGER NOT NULL,
+    train_mae             REAL,
+    test_mae              REAL,
+    holdout_mae_ensemble  REAL,
+    feature_columns       TEXT    NOT NULL,
+    model_path            TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mlruns_trained ON ml_runs(trained_at DESC);
 """
 
 _lock = threading.Lock()
@@ -132,6 +178,10 @@ def init() -> None:
             ):
                 if col not in cols:
                     _conn.execute(ddl)
+            # feature_snapshots gained ml_max in the historical-backfill plan.
+            feat_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(feature_snapshots)").fetchall()}
+            if "ml_max" not in feat_cols:
+                _conn.execute("ALTER TABLE feature_snapshots ADD COLUMN ml_max REAL")
             _conn.commit()
 
 
@@ -357,8 +407,9 @@ def insert_feature_snapshot(state: Dict, ts: Optional[int] = None) -> None:
                 afd_conf_score, afd_above_normal,
                 afd_sea_breeze, afd_marine_layer, afd_smoke, afd_overcast, afd_offshore,
                 rec_bracket_label, rec_bracket_lo, rec_bracket_hi,
-                rec_edge_cents, rec_kalshi_pct, rec_model_pct
-            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?,?,?, ?,?,?)""",
+                rec_edge_cents, rec_kalshi_pct, rec_model_pct,
+                ml_max
+            ) VALUES (?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?,?,?, ?,?,?, ?)""",
             (
                 ts, state["city"]["code"], state.get("targetDate"),
                 state.get("mosMax"), state.get("namMos"),
@@ -379,6 +430,7 @@ def insert_feature_snapshot(state: Dict, ts: Optional[int] = None) -> None:
                 rec.get("label"), rec.get("lo"), rec.get("hi"),
                 int(round((rec.get("edge") or 0) * 100)),
                 rec.get("kalshiPct"), rec.get("modelPct"),
+                state.get("mlMax"),
             ),
         )
         c.commit()
@@ -395,18 +447,161 @@ def list_bets_for_target(city: str, target_date: str) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+# ── Historical / ML ──────────────────────────────────────────────────────
+
+def upsert_historical_prediction(row: Dict) -> None:
+    """INSERT OR REPLACE one historical prediction row. `row` keys must
+    match the historical_predictions columns."""
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            """INSERT OR REPLACE INTO historical_predictions (
+                city, target_date, forecast_horizon_hours,
+                gfs_max, ecmwf_max, icon_max, om_max,
+                t850_c, t700_c, t500_c, h500_m, rh850_pct,
+                ensemble_max
+            ) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?, ?)""",
+            (
+                row["city"], row["target_date"], int(row["forecast_horizon_hours"]),
+                row.get("gfs_max"), row.get("ecmwf_max"),
+                row.get("icon_max"), row.get("om_max"),
+                row.get("t850_c"), row.get("t700_c"), row.get("t500_c"),
+                row.get("h500_m"), row.get("rh850_pct"),
+                row.get("ensemble_max"),
+            ),
+        )
+        c.commit()
+
+
+def upsert_historical_actual(city: str, target_date: str, actual_max_f: float, source: str) -> None:
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            "INSERT OR REPLACE INTO historical_actuals (city, target_date, actual_max_f, source) VALUES (?,?,?,?)",
+            (city, target_date, float(actual_max_f), source),
+        )
+        c.commit()
+
+
+def historical_counts() -> Dict:
+    """Quick stats for the UI: how much data we have to train on."""
+    c = _conn_or_init()
+    pred_n = c.execute("SELECT COUNT(*) AS n FROM historical_predictions").fetchone()["n"]
+    act_n = c.execute("SELECT COUNT(*) AS n FROM historical_actuals").fetchone()["n"]
+    paired = c.execute(
+        """SELECT COUNT(*) AS n FROM historical_predictions p
+           JOIN historical_actuals a USING (city, target_date)"""
+    ).fetchone()["n"]
+    earliest = c.execute(
+        """SELECT MIN(target_date) AS d FROM historical_predictions p
+           JOIN historical_actuals a USING (city, target_date)"""
+    ).fetchone()["d"]
+    latest = c.execute(
+        """SELECT MAX(target_date) AS d FROM historical_predictions p
+           JOIN historical_actuals a USING (city, target_date)"""
+    ).fetchone()["d"]
+    return {
+        "predictions": pred_n,
+        "actuals": act_n,
+        "paired": paired,
+        "earliest_target_date": earliest,
+        "latest_target_date": latest,
+    }
+
+
+def list_training_data() -> List[Dict]:
+    """Inner-join historical_predictions × historical_actuals for training.
+    Returns one row per (city, target_date, forecast_horizon)."""
+    c = _conn_or_init()
+    rows = c.execute(
+        """SELECT p.city, p.target_date, p.forecast_horizon_hours,
+                  p.gfs_max, p.ecmwf_max, p.icon_max, p.om_max,
+                  p.t850_c, p.t700_c, p.t500_c, p.h500_m, p.rh850_pct,
+                  p.ensemble_max,
+                  a.actual_max_f
+           FROM historical_predictions p
+           JOIN historical_actuals a USING (city, target_date)
+           ORDER BY p.target_date ASC, p.city ASC"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_ml_run(
+    algorithm: str,
+    n_train: int,
+    n_test: int,
+    train_mae: Optional[float],
+    test_mae: Optional[float],
+    holdout_mae_ensemble: Optional[float],
+    feature_columns: List[str],
+    model_path: str,
+) -> Dict:
+    import json, time as _time
+    c = _conn_or_init()
+    with _lock:
+        cur = c.execute(
+            """INSERT INTO ml_runs (
+                trained_at, algorithm, n_train, n_test,
+                train_mae, test_mae, holdout_mae_ensemble,
+                feature_columns, model_path
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (int(_time.time()), algorithm, n_train, n_test,
+             train_mae, test_mae, holdout_mae_ensemble,
+             json.dumps(feature_columns), model_path),
+        )
+        c.commit()
+        row = c.execute("SELECT * FROM ml_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def latest_ml_run() -> Optional[Dict]:
+    c = _conn_or_init()
+    row = c.execute("SELECT * FROM ml_runs ORDER BY trained_at DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def list_ml_runs(limit: int = 20) -> List[Dict]:
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT id, trained_at, algorithm, n_train, n_test, train_mae, test_mae, holdout_mae_ensemble, model_path "
+        "FROM ml_runs ORDER BY trained_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _bucket_stats(errors: List[float]) -> Dict:
+    n = len(errors)
+    if n == 0:
+        return {
+            "n": 0, "mae": None, "median": None,
+            "within_1_pct": None, "within_2_pct": None, "within_3_pct": None,
+        }
+    mae = sum(errors) / n
+    med = sorted(errors)[n // 2]
+    pct = lambda t: round(sum(1 for e in errors if e <= t) / n * 100, 1)
+    return {
+        "n": n,
+        "mae": round(mae, 2),
+        "median": round(med, 2),
+        "within_1_pct": pct(1),
+        "within_2_pct": pct(2),
+        "within_3_pct": pct(3),
+    }
+
+
 def accuracy_summary() -> Dict:
-    """Pair the latest model_max per (city, target_date) with the
-    actual high observed for that day (from any settled bet's
+    """Pair the latest model_max AND ml_max per (city, target_date) with
+    the actual high observed for that day (from any settled bet's
     settled_max_f) and roll up overall + per-city accuracy stats.
 
-    Empty until at least one bet has settled, since that's how we get
-    the actual NWS reading into the DB."""
+    Returns parallel ensemble + ml blocks so the UI can render head-to-
+    head. ML block is empty until the first ml_max has been logged AND
+    a settled actual exists for the same (city, date)."""
     c = _conn_or_init()
     rows = c.execute(
         """
         WITH latest_pred AS (
-            SELECT city, target_date, model_max,
+            SELECT city, target_date, model_max, ml_max,
                    ROW_NUMBER() OVER (
                        PARTITION BY city, target_date
                        ORDER BY ts DESC
@@ -423,7 +618,7 @@ def accuracy_summary() -> Dict:
               AND target_date IS NOT NULL
             GROUP BY city, target_date
         )
-        SELECT p.city, p.target_date, p.model_max, a.actual_max
+        SELECT p.city, p.target_date, p.model_max, p.ml_max, a.actual_max
         FROM latest_pred p
         JOIN actuals a ON a.city = p.city AND a.target_date = p.target_date
         WHERE p.rn = 1
@@ -432,53 +627,46 @@ def accuracy_summary() -> Dict:
     ).fetchall()
     pairs = [dict(r) for r in rows]
 
-    if not pairs:
-        return {
-            "n_predictions": 0,
-            "mean_absolute_error": None,
-            "median_abs_error": None,
-            "within_1_pct": None,
-            "within_2_pct": None,
-            "within_3_pct": None,
-            "by_city": [],
-            "recent": [],
-        }
+    ens_errors = [abs(p["model_max"] - p["actual_max"]) for p in pairs]
+    ml_errors = [
+        abs(p["ml_max"] - p["actual_max"])
+        for p in pairs if p["ml_max"] is not None
+    ]
 
-    errors = [abs(p["model_max"] - p["actual_max"]) for p in pairs]
-    n = len(errors)
-    mae = sum(errors) / n
-    med = sorted(errors)[n // 2]
-    pct = lambda t: round(sum(1 for e in errors if e <= t) / n * 100, 1)
-
-    by_city: Dict[str, List[float]] = {}
+    by_city_ens: Dict[str, List[float]] = {}
+    by_city_ml: Dict[str, List[float]] = {}
     for p in pairs:
-        by_city.setdefault(p["city"], []).append(abs(p["model_max"] - p["actual_max"]))
+        by_city_ens.setdefault(p["city"], []).append(abs(p["model_max"] - p["actual_max"]))
+        if p["ml_max"] is not None:
+            by_city_ml.setdefault(p["city"], []).append(abs(p["ml_max"] - p["actual_max"]))
 
     return {
-        "n_predictions": n,
-        "mean_absolute_error": round(mae, 2),
-        "median_abs_error": round(med, 2),
-        "within_1_pct": pct(1),
-        "within_2_pct": pct(2),
-        "within_3_pct": pct(3),
+        "n_predictions": len(pairs),
+        "ensemble": _bucket_stats(ens_errors),
+        "ml": _bucket_stats(ml_errors),
         "by_city": [
             {
                 "city": city,
                 "n": len(es),
-                "mae": round(sum(es) / len(es), 2),
-                "within_2_pct": round(sum(1 for e in es if e <= 2) / len(es) * 100, 1),
+                "ensemble_mae": round(sum(es) / len(es), 2) if es else None,
+                "ml_mae": (round(sum(by_city_ml[city]) / len(by_city_ml[city]), 2)
+                           if city in by_city_ml else None),
+                "ml_n": len(by_city_ml.get(city, [])),
             }
-            for city, es in sorted(by_city.items())
+            for city, es in sorted(by_city_ens.items())
         ],
         "recent": [
             {
                 "city": p["city"],
                 "date": p["target_date"],
-                "prediction": round(p["model_max"], 1),
+                "ensemble": round(p["model_max"], 1),
+                "ml": round(p["ml_max"], 1) if p["ml_max"] is not None else None,
                 "actual": round(p["actual_max"], 1),
-                "error": round(p["model_max"] - p["actual_max"], 2),
+                "ensemble_error": round(p["model_max"] - p["actual_max"], 2),
+                "ml_error": (round(p["ml_max"] - p["actual_max"], 2)
+                             if p["ml_max"] is not None else None),
             }
-            for p in pairs[:20]
+            for p in pairs[:30]
         ],
     }
 

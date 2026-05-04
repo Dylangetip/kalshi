@@ -7,7 +7,9 @@ import httpx
 USER_AGENT = "kalshi-weather-bets/0.1 (research; contact: dylan@example.com)"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 IEM_MOS_URL = "https://mesonet.agron.iastate.edu/mos/csv.php"
+IEM_ASOS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 NWS_API = "https://api.weather.gov"
 # U. Wyoming retired their cgi-bin/sounding.py around 2024-25. The
 # modern path is wsgi/sounding (no .py extension). We try the new URL
@@ -404,3 +406,123 @@ async def fetch_sounding(client: httpx.AsyncClient, station_id: str) -> Optional
             except Exception:
                 continue
     return None
+
+
+# ── Historical backfill ──────────────────────────────────────────────────
+
+async def fetch_open_meteo_historical(
+    client: httpx.AsyncClient,
+    lat: float,
+    lon: float,
+    start_date: str,   # ISO YYYY-MM-DD
+    end_date: str,
+) -> Optional[Dict]:
+    """Pull historical forecasts via Open-Meteo Historical Forecast API —
+    "what GFS / ECMWF / ICON predicted for date X as of run Y".
+
+    Returns daily max temps (in °F) per model + the 12Z 850/700/500mb
+    pressure level temps (in °C, matching the live ingest). One call
+    per (city, date range). Free, no auth.
+
+    The endpoint stitches multiple models in a single response when
+    requested via &models=. We grab GFS, ECMWF, ICON and surface +
+    pressure-level fields in one round trip."""
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max",
+        "hourly": ",".join([
+            "temperature_2m",
+            "temperature_850hPa",
+            "temperature_700hPa",
+            "temperature_500hPa",
+            "geopotential_height_500hPa",
+            "relative_humidity_850hPa",
+        ]),
+        "models": "gfs_seamless,ecmwf_ifs025,icon_seamless",
+        "temperature_unit": "fahrenheit",
+        "timezone": "auto",
+    }
+    try:
+        r = await client.get(OPEN_METEO_HISTORICAL_FORECAST_URL, params=params, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _date_range(start_date: str, end_date: str) -> List[str]:
+    s = datetime.fromisoformat(start_date).date()
+    e = datetime.fromisoformat(end_date).date()
+    out = []
+    cur = s
+    while cur <= e:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+async def fetch_iem_asos_daily_max(
+    client: httpx.AsyncClient,
+    station: str,    # e.g. "NYC" (without the K prefix)
+    start_date: str,
+    end_date: str,
+) -> Optional[Dict[str, float]]:
+    """Pull hourly ASOS observations from IEM and reduce to daily max
+    Fahrenheit. Returns {target_date: max_f, ...}. Free, no auth, no
+    rate limit. Used to backfill the actual NWS-equivalent daily highs.
+
+    IEM ASOS station codes are the 3-letter ICAO suffix (NYC, ORD, MIA,
+    AUS, LAX) — strip the leading K when calling. CSV contains hourly
+    rows; we groupby date in city local time and take max."""
+    station_short = station.lstrip("K")
+    params = {
+        "station": station_short,
+        "data": "tmpf",
+        "year1": start_date[:4], "month1": start_date[5:7], "day1": start_date[8:10],
+        "year2": end_date[:4],   "month2": end_date[5:7],   "day2": end_date[8:10],
+        "tz": "America/New_York",  # IEM accepts any IANA tz; we group by local date below
+        "format": "onlycomma",
+        "latlon": "no",
+        "missing": "M",
+        "trace": "T",
+        "direct": "no",
+        "report_type": "3",  # MADIS hourly
+    }
+    try:
+        r = await client.get(IEM_ASOS_URL, params=params, timeout=120)
+        r.raise_for_status()
+        text = r.text
+    except Exception:
+        return None
+
+    # Header looks like: station,valid,tmpf
+    lines = [l for l in text.splitlines() if l and not l.startswith("#")]
+    if len(lines) < 2:
+        return None
+    header = [h.strip().lower() for h in lines[0].split(",")]
+    try:
+        valid_col = header.index("valid")
+        tmpf_col = header.index("tmpf")
+    except ValueError:
+        return None
+
+    by_date: Dict[str, float] = {}
+    for line in lines[1:]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) <= max(valid_col, tmpf_col):
+            continue
+        try:
+            ts = datetime.strptime(parts[valid_col], "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        date_key = ts.date().isoformat()
+        try:
+            tmpf = float(parts[tmpf_col])
+        except ValueError:
+            continue
+        if date_key not in by_date or tmpf > by_date[date_key]:
+            by_date[date_key] = tmpf
+    return by_date or None
