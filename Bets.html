@@ -70,6 +70,7 @@ function App() {
   const [liveHistory, setLiveHistory] = useState(null); // session equity curve from /api/equity
   const [liveStats, setLiveStats] = useState(null);     // {settled, won, open, winRate, realizedPl}
   const [autoInfo, setAutoInfo] = useState(null);       // /api/auto-trade/info
+  const [accuracy, setAccuracy] = useState(null);       // /api/accuracy
 
   // Theme + accent
   useEffect(() => {
@@ -172,11 +173,12 @@ function App() {
     }
     let cancelled = false;
     const refresh = async () => {
-      const [edges, equity, stats, auto] = await Promise.all([
+      const [edges, equity, stats, auto, acc] = await Promise.all([
         Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4))),
         MOCK.fetchEquity(72),
         MOCK.fetchStats(),
         MOCK.fetchAutoTradeInfo(),
+        MOCK.fetchAccuracy(),
       ]);
       if (cancelled) return;
       const map = {};
@@ -187,6 +189,7 @@ function App() {
       setLiveHistory(equity && equity.length >= 2 ? equity : null);
       setLiveStats(stats);
       setAutoInfo(auto);
+      setAccuracy(acc);
     };
     refresh();
     const t = setInterval(refresh, 60_000);
@@ -290,6 +293,7 @@ function App() {
           {tab === 'auto' && (
             <AutoTradeView
               info={autoInfo}
+              accuracy={accuracy}
               bets={betLog}
               onSetConfig={async (patch) => {
                 const updated = await MOCK.setAutoTradeConfig(patch);

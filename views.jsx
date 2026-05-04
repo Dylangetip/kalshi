@@ -673,7 +673,7 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
 }
 
 // ====== AUTO-TRADE ======
-function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
+function AutoTradeView({ info, accuracy, bets, onSetConfig, onTriggerNow }) {
   const [busy, setBusy] = useState_v(false);
   const [lastRunResult, setLastRunResult] = useState_v(null);
   const [draft, setDraft] = useState_v({});
@@ -787,6 +787,96 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
                 ))}
               </div>
             )}
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">
+          <span>Model accuracy</span>
+          <span className="panel-title-actions">
+            modelMax vs actual NWS high · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
+          </span>
+        </div>
+        {!accuracy || accuracy.n_predictions === 0 ? (
+          <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+            no settled predictions yet — accuracy populates after the first
+            bet settles tomorrow morning when the NWS Daily Climate Report posts.
+          </div>
+        ) : (
+          <div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10, padding: 14 }}>
+              <div className="signal-card">
+                <div className="label">Mean abs error</div>
+                <div className="big-num">{accuracy.mean_absolute_error}°F</div>
+                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>median {accuracy.median_abs_error}°</div>
+              </div>
+              <div className="signal-card">
+                <div className="label">Within 1°F</div>
+                <div className="big-num pos">{accuracy.within_1_pct}%</div>
+                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>bullseye</div>
+              </div>
+              <div className="signal-card">
+                <div className="label">Within 2°F</div>
+                <div className="big-num pos">{accuracy.within_2_pct}%</div>
+                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>good</div>
+              </div>
+              <div className="signal-card">
+                <div className="label">Within 3°F</div>
+                <div className="big-num">{accuracy.within_3_pct}%</div>
+                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>acceptable</div>
+              </div>
+              <div className="signal-card">
+                <div className="label">N predictions</div>
+                <div className="big-num">{accuracy.n_predictions}</div>
+                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>settled days</div>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, padding: '0 14px 14px' }}>
+              <div>
+                <div className="label" style={{ marginBottom: 8 }}>By city</div>
+                <table className="tbl">
+                  <thead>
+                    <tr><th>City</th><th className="num-r">N</th><th className="num-r">MAE</th><th className="num-r">≤2°F</th></tr>
+                  </thead>
+                  <tbody>
+                    {accuracy.by_city.map(r => (
+                      <tr key={r.city}>
+                        <td className="city-cell">{r.city}</td>
+                        <td className="num-r">{r.n}</td>
+                        <td className="num-r">{r.mae}°</td>
+                        <td className="num-r">{r.within_2_pct}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div>
+                <div className="label" style={{ marginBottom: 8 }}>Recent predictions</div>
+                <table className="tbl">
+                  <thead>
+                    <tr><th>Date</th><th>City</th><th className="num-r">Model</th><th className="num-r">Actual</th><th className="num-r">Δ</th></tr>
+                  </thead>
+                  <tbody>
+                    {accuracy.recent.slice(0, 10).map((r, i) => {
+                      const close = Math.abs(r.error) <= 1;
+                      const ok = Math.abs(r.error) <= 2;
+                      return (
+                        <tr key={i}>
+                          <td>{r.date}</td>
+                          <td className="city-cell">{r.city}</td>
+                          <td className="num-r">{r.prediction}°</td>
+                          <td className="num-r">{r.actual}°</td>
+                          <td className={`num-r ${close ? 'pos' : ok ? 'info' : 'neg'}`}>
+                            {fmtSign(r.error, 1)}°
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
         )}
       </div>

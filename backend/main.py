@@ -99,7 +99,7 @@ SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "3600"))
 _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
-    "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5")),
+    "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "3")),
     "bankroll": float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")),
     # Default max-per-bet = 5% of bankroll (¼-Kelly cap). Recomputed
     # automatically when bankroll changes via /api/auto-trade/config
@@ -624,55 +624,60 @@ async def _settlement_loop() -> None:
 
 
 async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
-    """One iteration of the auto-trader. Picks the SINGLE highest-edge
-    eligible bracket across all 5 cities and places a ¼-Kelly YES bet
-    on it. With a 1h interval that's ~5 bets per day spread across the
-    morning (one per city's daily event), then idle until tomorrow's
-    events open. Idempotent across ticks AND restarts via
+    """One iteration of the auto-trader. Considers every bracket on every
+    city's ladder (not just the top-recommended one) — so once we've bet
+    the headline bracket, subsequent ticks can still find positive edge
+    on neighboring brackets and keep firing. Picks the SINGLE highest-edge
+    eligible bracket across all (city, bracket) pairs and places a
+    ¼-Kelly YES bet on it. Idempotent across ticks AND restarts via
     list_bets_for_target."""
     cfg = _auto_trade_state
-    candidates: List[tuple] = []
+    candidates: List[tuple] = []  # (edge_cents, city, state, bracket, target)
     for city in CITIES:
         try:
             state = await _build_state_cached(city, client)
             if state is None:
                 continue
-            best = state.get("settlementBracket") or {}
-            edge_cents = int(round((best.get("edge") or 0) * 100))
             target = state.get("targetDate")
-            if target is None or edge_cents < cfg["min_edge_cents"]:
+            if target is None:
                 continue
             existing = db.list_bets_for_target(city["code"], target)
-            if any(b["bracket_label"] == best["label"] for b in existing):
-                continue
-            candidates.append((edge_cents, city, state, best, target))
+            existing_labels = {b["bracket_label"] for b in existing}
+            for bracket in state.get("brackets") or []:
+                edge_cents = int(round((bracket.get("edge") or 0) * 100))
+                if edge_cents < cfg["min_edge_cents"]:
+                    continue
+                if bracket.get("label") in existing_labels:
+                    continue
+                candidates.append((edge_cents, city, state, bracket, target))
         except Exception as exc:  # noqa: BLE001
             print(f"[auto-trader] probe error on {city['code']}: {exc}")
 
     placed: List[Dict] = []
     if candidates:
-        # Highest edge wins. Ties broken by city order (stable from CITIES list).
         candidates.sort(key=lambda c: -c[0])
-        edge_cents, city, state, best, target = candidates[0]
-        kelly = state.get("kellyPct") or 0
+        edge_cents, city, state, bracket, target = candidates[0]
+        # Recompute Kelly for the picked bracket since state.kellyPct only
+        # reflects the recommended (max-edge) bracket.
+        kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
         size = max(cfg["min_usd"], round(kelly * cfg["bankroll"]))
         size = int(min(cfg["max_usd"], size))
         if size >= cfg["min_usd"]:
             try:
                 row = db.insert_bet(
                     city=city["code"],
-                    bracket_label=best["label"],
-                    bracket_lo=best["lo"],
-                    bracket_hi=best["hi"],
+                    bracket_label=bracket["label"],
+                    bracket_lo=bracket["lo"],
+                    bracket_hi=bracket["hi"],
                     side="YES",
                     size=size,
-                    entry_cents=int(best.get("yesPrice", 0)),
+                    entry_cents=int(bracket.get("yesPrice", 0)),
                     target_date=target,
                 )
                 placed.append({
                     "id": row["id"],
                     "city": city["code"],
-                    "bracket": best["label"],
+                    "bracket": bracket["label"],
                     "edge_cents": edge_cents,
                     "size_usd": size,
                     "entry_cents": row["entry_cents"],
@@ -680,7 +685,7 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                     "ts": int(time.time()),
                     "considered": len(candidates),
                 })
-                print(f"[auto-trader] picked {city['code']} {best['label']} "
+                print(f"[auto-trader] picked {city['code']} {bracket['label']} "
                       f"(+{edge_cents}¢ edge, beat {len(candidates)-1} others) — "
                       f"size=${size} entry={row['entry_cents']}¢")
             except Exception as exc:  # noqa: BLE001
@@ -721,6 +726,13 @@ async def settle_now():
 @app.get("/api/stats")
 def get_stats():
     return db.stats_summary()
+
+
+@app.get("/api/accuracy")
+def get_accuracy():
+    """How close model_max came to the actual NWS high on each
+    settled day. Joins feature_snapshots × bets.settled_max_f."""
+    return db.accuracy_summary()
 
 
 class PlaceOrderIn(BaseModel):

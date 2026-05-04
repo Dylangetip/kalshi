@@ -395,6 +395,94 @@ def list_bets_for_target(city: str, target_date: str) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def accuracy_summary() -> Dict:
+    """Pair the latest model_max per (city, target_date) with the
+    actual high observed for that day (from any settled bet's
+    settled_max_f) and roll up overall + per-city accuracy stats.
+
+    Empty until at least one bet has settled, since that's how we get
+    the actual NWS reading into the DB."""
+    c = _conn_or_init()
+    rows = c.execute(
+        """
+        WITH latest_pred AS (
+            SELECT city, target_date, model_max,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY city, target_date
+                       ORDER BY ts DESC
+                   ) AS rn
+            FROM feature_snapshots
+            WHERE target_date IS NOT NULL AND model_max IS NOT NULL
+        ),
+        actuals AS (
+            SELECT city, target_date,
+                   AVG(CAST(settled_max_f AS REAL)) AS actual_max
+            FROM bets
+            WHERE status = 'settled'
+              AND settled_max_f IS NOT NULL
+              AND target_date IS NOT NULL
+            GROUP BY city, target_date
+        )
+        SELECT p.city, p.target_date, p.model_max, a.actual_max
+        FROM latest_pred p
+        JOIN actuals a ON a.city = p.city AND a.target_date = p.target_date
+        WHERE p.rn = 1
+        ORDER BY p.target_date DESC, p.city ASC
+        """
+    ).fetchall()
+    pairs = [dict(r) for r in rows]
+
+    if not pairs:
+        return {
+            "n_predictions": 0,
+            "mean_absolute_error": None,
+            "median_abs_error": None,
+            "within_1_pct": None,
+            "within_2_pct": None,
+            "within_3_pct": None,
+            "by_city": [],
+            "recent": [],
+        }
+
+    errors = [abs(p["model_max"] - p["actual_max"]) for p in pairs]
+    n = len(errors)
+    mae = sum(errors) / n
+    med = sorted(errors)[n // 2]
+    pct = lambda t: round(sum(1 for e in errors if e <= t) / n * 100, 1)
+
+    by_city: Dict[str, List[float]] = {}
+    for p in pairs:
+        by_city.setdefault(p["city"], []).append(abs(p["model_max"] - p["actual_max"]))
+
+    return {
+        "n_predictions": n,
+        "mean_absolute_error": round(mae, 2),
+        "median_abs_error": round(med, 2),
+        "within_1_pct": pct(1),
+        "within_2_pct": pct(2),
+        "within_3_pct": pct(3),
+        "by_city": [
+            {
+                "city": city,
+                "n": len(es),
+                "mae": round(sum(es) / len(es), 2),
+                "within_2_pct": round(sum(1 for e in es if e <= 2) / len(es) * 100, 1),
+            }
+            for city, es in sorted(by_city.items())
+        ],
+        "recent": [
+            {
+                "city": p["city"],
+                "date": p["target_date"],
+                "prediction": round(p["model_max"], 1),
+                "actual": round(p["actual_max"], 1),
+                "error": round(p["model_max"] - p["actual_max"], 2),
+            }
+            for p in pairs[:20]
+        ],
+    }
+
+
 def stats_summary() -> Dict:
     """Realized win-rate and bet counts. Cheap to compute, exposed at
     /api/stats for the P&L view to swap in real win-rate."""

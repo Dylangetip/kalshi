@@ -295,6 +295,16 @@ async function fetchStats() {
   }
 }
 
+async function fetchAccuracy() {
+  try {
+    const r = await fetch(`${API_BASE}/api/accuracy`, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 async function fetchAutoTradeInfo() {
   try {
     const r = await fetch(`${API_BASE}/api/auto-trade/info`, { cache: 'no-store' });
@@ -378,7 +388,7 @@ window.MOCK = {
   CITIES, SIGNAL_CATALOG,
   initialState, buildSignals, buildHistory, buildOpenPositions,
   seedRand, gauss, makeBrackets, buildCityState,
-  fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, fetchStats,
+  fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, fetchStats, fetchAccuracy,
   fetchAutoTradeInfo, setAutoTradeConfig, triggerAutoTradeNow,
   persistBet, API_BASE,
 };
