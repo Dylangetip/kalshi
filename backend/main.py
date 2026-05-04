@@ -99,7 +99,6 @@ SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 # Auto paper-trader. Initial config from env, runtime-mutable via
 # POST /api/auto-trade/config. The loop reads from this dict on every
 # iteration so toggles take effect on the next tick (no restart needed).
-AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "600"))  # 10 min — fires within 10m of a new edge appearing
 _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
     "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "3")),
@@ -110,6 +109,9 @@ _auto_trade_state: Dict = {
     "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD",
                                str(float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")) * 0.05))),
     "min_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50")),
+    # Interval is now part of mutable state — loop reads it each
+    # iteration so /api/auto-trade/config can change cadence at runtime.
+    "interval_seconds": int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "600")),
     "last_run_ts": None,
     "last_run_placed": 0,
     "last_run_considered": 0,
@@ -558,12 +560,13 @@ class AutoTradeConfigIn(BaseModel):
     bankroll: Optional[float] = Field(None, gt=0)
     max_usd: Optional[float] = Field(None, gt=0)
     min_usd: Optional[float] = Field(None, ge=0)
+    interval_seconds: Optional[int] = Field(None, ge=10, le=86400)
 
 
 @app.get("/api/auto-trade/info")
 def auto_trade_info():
     """Current runtime config + recent activity stats."""
-    return {**_auto_trade_state, "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS}
+    return {**_auto_trade_state}
 
 
 @app.post("/api/auto-trade/config")
@@ -572,13 +575,14 @@ def auto_trade_config(c: AutoTradeConfigIn):
     loop tick (no restart needed). When bankroll is changed without an
     explicit max_usd in the same request, max_usd is auto-recomputed
     as 5% of bankroll (¼-Kelly cap)."""
-    for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd"):
+    for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd",
+              "interval_seconds"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
     if c.bankroll is not None and c.max_usd is None:
         _auto_trade_state["max_usd"] = round(_auto_trade_state["bankroll"] * 0.05, 2)
-    return {**_auto_trade_state, "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS}
+    return {**_auto_trade_state}
 
 
 @app.post("/api/auto-trade/now")
@@ -589,7 +593,6 @@ async def auto_trade_now():
         placed = await _auto_trade_tick(client)
     return {
         **_auto_trade_state,
-        "interval_seconds": AUTO_TRADE_INTERVAL_SECONDS,
         "placed": placed,
         "count": len(placed),
     }
@@ -839,9 +842,10 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
 
 async def _auto_trader_loop() -> None:
     """Background auto-trader. Always runs (so UI toggles take effect
-    without restart) — checks the enabled flag inside each iteration."""
-    print(f"[auto-trader] loop active — interval={AUTO_TRADE_INTERVAL_SECONDS}s, "
-          f"initial state={_auto_trade_state}")
+    without restart) — checks the enabled flag inside each iteration.
+    Sleep duration also reads from state so cadence changes via
+    /api/auto-trade/config take effect on the next iteration."""
+    print(f"[auto-trader] loop active — initial state={_auto_trade_state}")
     while True:
         try:
             if _auto_trade_state["enabled"]:
@@ -849,7 +853,8 @@ async def _auto_trader_loop() -> None:
                     await _auto_trade_tick(client)
         except Exception as exc:  # noqa: BLE001
             print(f"[auto-trader] loop error: {exc}")
-        await asyncio.sleep(AUTO_TRADE_INTERVAL_SECONDS)
+        # Re-read interval each iteration so config changes apply.
+        await asyncio.sleep(max(10, int(_auto_trade_state.get("interval_seconds") or 600)))
 
 
 @app.post("/api/settle")
