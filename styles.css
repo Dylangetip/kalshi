@@ -172,9 +172,12 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
   background: var(--bg-1);
   border-bottom: 1px solid var(--line);
   height: 56px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 .ticker-item {
-  flex: 1;
+  flex: 1 0 160px;          /* min 160px so 19 cities don't crush; scrolls horizontally */
   padding: 8px 14px;
   border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 2px;
