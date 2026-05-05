@@ -2,6 +2,82 @@
 
 const { useState: useState_v, useEffect: useEffect_v, useMemo: useMemo_v, useRef: useRef_v } = React;
 
+// Plain-English explanation for the current liveStatus, based on the
+// position fields and the city's full state.
+function liveStatusReason(p, cs) {
+  const max = p.maxSoFarF;
+  const rem = cs?.forecastRemainderMaxF ?? null;
+  const lo = cs?.brackets?.find(b => b.label === p.bracket)?.lo;
+  const hi = cs?.brackets?.find(b => b.label === p.bracket)?.hi;
+  if (p.liveStatus === 'locked_win')
+    return `The day's max is already inside ${p.bracket} and the remaining forecast peak (${rem != null ? rem.toFixed(1) + '°' : 'n/a'}) can't push it out.`;
+  if (p.liveStatus === 'locked_loss') {
+    if (max != null && hi != null && max > hi)
+      return `Day's max already hit ${max.toFixed(1)}°, exceeding the ${hi}° cap. Bracket can't be reached.`;
+    return `Both today's max (${max?.toFixed(1) ?? '—'}°) and remaining forecast peak (${rem?.toFixed(1) ?? '—'}°) fall below the bracket floor — can't reach it.`;
+  }
+  if (p.liveStatus === 'in_bracket')
+    return `Currently inside the bracket at ${max?.toFixed(1) ?? '—'}° but forecast remainder (${rem?.toFixed(1) ?? '—'}°) could still push beyond ${hi}°.`;
+  if (p.liveStatus === 'pending') {
+    if (p.degreesFromBracket == null) return 'Awaiting first observation today.';
+    const need = Math.abs(p.degreesFromBracket).toFixed(1);
+    if (p.degreesFromBracket < 0) return `Need to climb +${need}° to reach the bracket floor. Forecast peak: ${rem?.toFixed(1) ?? '—'}°.`;
+    return `Day's max already ${need}° above the bracket cap.`;
+  }
+  return '—';
+}
+
+// Drill-down row content — rich detail when an open-position row is expanded.
+function PositionDrilldown({ position, cityState, colSpan }) {
+  const cs = cityState;
+  const p = position;
+  const fmt = (x, suf = '°') => x == null ? '—' : `${Number(x).toFixed(1)}${suf}`;
+  const sources = cs ? [
+    ['GFS MOS', cs.mosMax],
+    ['NAM MOS', cs.namMos],
+    ['NWS forecast', cs.nwsForecast],
+    ['ECMWF',  cs.ecmwfMax],
+    ['Open-Meteo', cs.omMax],
+    ['ML model', cs.mlMax],
+    ['Ensemble', cs.modelMax],
+    ['Active model', cs.activeMax],
+  ] : [];
+  return (
+    <tr style={{ background: 'var(--bg-2)' }}>
+      <td colSpan={colSpan} style={{ padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18, fontSize: 12 }}>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Today's progress</div>
+            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+              <tbody>
+                <tr><td>Today's max so far</td><td className="num-r mono">{fmt(p.maxSoFarF)}</td></tr>
+                <tr><td>Forecast remainder peak</td><td className="num-r mono">{fmt(cs?.forecastRemainderMaxF)}</td></tr>
+                <tr><td>Current observed temp</td><td className="num-r mono">{fmt(cs?.obsCurrent)}</td></tr>
+                <tr><td>Bracket window</td><td className="num-r mono">{p.bracket}</td></tr>
+                <tr><td>Distance from bracket</td><td className="num-r mono">{p.degreesFromBracket == null ? '—' : (p.degreesFromBracket === 0 ? 'inside' : (p.degreesFromBracket > 0 ? `+${p.degreesFromBracket}° over` : `${p.degreesFromBracket}° below`))}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Forecast sources for day max</div>
+            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+              <tbody>
+                {sources.map(([name, val]) => (
+                  <tr key={name}><td>{name}</td><td className="num-r mono">{fmt(val)}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div style={{ marginTop: 12, padding: 10, background: 'var(--bg-1)', borderRadius: 4, border: '1px solid var(--border)', fontSize: 12, color: 'var(--fg-1)' }}>
+          <span className="label" style={{ marginRight: 8 }}>Status reason:</span>
+          {liveStatusReason(p, cs)}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 // Live "are we hitting?" cell for the open-positions tables. Reads
 // liveStatus / maxSoFarF / degreesFromBracket fields populated by
 // /api/positions and renders a colored badge or distance hint.
@@ -564,7 +640,12 @@ function SignalsView({ signals, state }) {
 }
 
 // ====== P&L ======
-function PnLView({ history, positions, liveHistory = false, stats = null }) {
+function PnLView({ history, positions, states = [], liveHistory = false, stats = null }) {
+  const stateByCity = React.useMemo(() => {
+    const m = {};
+    for (const s of states || []) if (s?.city?.code) m[s.city.code] = s;
+    return m;
+  }, [states]);
   const total = history[history.length - 1].equity;
   const start = history[0].equity;
   const ret = (total - start) / start;
@@ -667,6 +748,7 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
           {(() => {
             const [pageSize, setPageSize] = React.useState(20);
             const [page, setPage] = React.useState(0);
+            const [expandedId, setExpandedId] = React.useState(null);
             const totalPages = Math.ceil(positions.length / pageSize);
             const slice = positions.slice(page * pageSize, (page + 1) * pageSize);
             const sliceExposed = slice.reduce((s, p) => s + p.size, 0);
@@ -688,24 +770,32 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
                 <table className="tbl">
                   <thead>
                     <tr>
+                      <th></th>
                       <th>City</th><th>Bracket</th><th>Live</th><th>Side</th>
                       <th className="num-r">Stake</th><th className="num-r">Entry</th>
                       <th className="num-r pos">If WIN</th><th className="num-r neg">If LOSE</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {slice.map(p => (
-                      <tr key={p.id}>
-                        <td className="city-cell">{p.city}</td>
-                        <td>{p.bracket}</td>
-                        <td><LiveStatusCell position={p} /></td>
-                        <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
-                        <td className="num-r">${p.size}</td>
-                        <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
-                        <td className="num-r pos">+${Math.round(p.ifWin ?? (p.size * (1 - p.entry) / p.entry)).toLocaleString()}</td>
-                        <td className="num-r neg">-${p.size}</td>
-                      </tr>
-                    ))}
+                    {slice.map(p => {
+                      const isOpen = expandedId === p.id;
+                      return (
+                        <React.Fragment key={p.id}>
+                          <tr style={{ cursor: 'pointer' }} onClick={() => setExpandedId(isOpen ? null : p.id)}>
+                            <td style={{ width: 18, textAlign: 'center', color: 'var(--fg-3)' }}>{isOpen ? '▾' : '▸'}</td>
+                            <td className="city-cell">{p.city}</td>
+                            <td>{p.bracket}</td>
+                            <td><LiveStatusCell position={p} /></td>
+                            <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
+                            <td className="num-r">${p.size}</td>
+                            <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
+                            <td className="num-r pos">+${Math.round(p.ifWin ?? (p.size * (1 - p.entry) / p.entry)).toLocaleString()}</td>
+                            <td className="num-r neg">-${p.size}</td>
+                          </tr>
+                          {isOpen && <PositionDrilldown position={p} cityState={stateByCity[p.city]} colSpan={9} />}
+                        </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
                 {totalPages > 1 && (
@@ -1215,7 +1305,7 @@ function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
 }
 
 
-function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [] }) {
+function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], states = [] }) {
   // Build a lookup so each bet row can show its live "are we hitting?" status.
   // Key = city + bracket label; positions only includes open bets, so settled
   // rows just won't have a match and render "—".
@@ -1225,6 +1315,12 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [] }
     return m;
   }, [positions]);
   const lookupLive = (b) => liveByKey[`${b.city}|${(b.bracket?.label || b.bracket)}`];
+  const stateByCity = React.useMemo(() => {
+    const m = {};
+    for (const s of states || []) if (s?.city?.code) m[s.city.code] = s;
+    return m;
+  }, [states]);
+  const [expandedBetId, setExpandedBetId] = useState_v(null);
   const [busy, setBusy] = useState_v(false);
   const [lastRunResult, setLastRunResult] = useState_v(null);
   const [draft, setDraft] = useState_v({});
@@ -1407,6 +1503,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [] }
             <table className="tbl">
               <thead>
                 <tr>
+                  <th></th>
                   <th>Time</th><th>City</th><th>Bracket</th><th>Live</th><th>Side</th>
                   <th className="num-r">Size</th><th className="num-r">Entry</th>
                   <th className="num-r">Closes in</th>
@@ -1421,31 +1518,42 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [] }
                   const isClosingSoon = !settled && b.closeAt &&
                     (new Date(b.closeAt).getTime() - Date.now()) < 3 * 3600 * 1000;
                   const live = lookupLive(b);
+                  const isOpen = expandedBetId === b.id;
+                  const expandable = !!live;
                   return (
-                    <tr key={b.id}>
-                      <td>{b.time}</td>
-                      <td className="city-cell">{b.city}</td>
-                      <td>{b.bracket?.label || b.bracket}</td>
-                      <td>{settled ? <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>
-                                   : (live ? <LiveStatusCell position={live} />
-                                           : <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>)}</td>
-                      <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
-                      <td className="num-r">${b.size}</td>
-                      <td className="num-r">{b.entry}¢</td>
-                      <td className={`num-r ${isClosingSoon ? 'warn' : ''}`}>{closesIn}</td>
-                      <td>
-                        {settled ? (
-                          <Pill kind={won ? 'pos' : 'neg'}>
-                            {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
-                          </Pill>
-                        ) : (
-                          <Pill kind="info">OPEN</Pill>
-                        )}
-                      </td>
-                      <td className={`num-r ${settled ? (won ? 'pos' : 'neg') : ''}`}>
-                        {settled ? fmtSign(b.settledPl, 0) : '—'}
-                      </td>
-                    </tr>
+                    <React.Fragment key={b.id}>
+                      <tr
+                        style={{ cursor: expandable ? 'pointer' : 'default' }}
+                        onClick={expandable ? () => setExpandedBetId(isOpen ? null : b.id) : undefined}
+                      >
+                        <td style={{ width: 18, textAlign: 'center', color: 'var(--fg-3)' }}>
+                          {expandable ? (isOpen ? '▾' : '▸') : ''}
+                        </td>
+                        <td>{b.time}</td>
+                        <td className="city-cell">{b.city}</td>
+                        <td>{b.bracket?.label || b.bracket}</td>
+                        <td>{settled ? <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>
+                                     : (live ? <LiveStatusCell position={live} />
+                                             : <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>)}</td>
+                        <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
+                        <td className="num-r">${b.size}</td>
+                        <td className="num-r">{b.entry}¢</td>
+                        <td className={`num-r ${isClosingSoon ? 'warn' : ''}`}>{closesIn}</td>
+                        <td>
+                          {settled ? (
+                            <Pill kind={won ? 'pos' : 'neg'}>
+                              {won ? 'WON' : 'LOST'} @ {b.settledMaxF}°
+                            </Pill>
+                          ) : (
+                            <Pill kind="info">OPEN</Pill>
+                          )}
+                        </td>
+                        <td className={`num-r ${settled ? (won ? 'pos' : 'neg') : ''}`}>
+                          {settled ? fmtSign(b.settledPl, 0) : '—'}
+                        </td>
+                      </tr>
+                      {isOpen && live && <PositionDrilldown position={live} cityState={stateByCity[b.city]} colSpan={11} />}
+                    </React.Fragment>
                   );
                 })}
               </tbody>

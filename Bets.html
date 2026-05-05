@@ -293,12 +293,13 @@ function App() {
           {tab === 'dashboard' && <DashboardView state={focus} history={effectiveHistory} />}
           {tab === 'terminal' && <TerminalView state={focus} onPlaceBet={placeBet} betLog={betLog} />}
           {tab === 'signals' && <SignalsView signals={signals} state={focus} />}
-          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} liveHistory={liveHistory != null} stats={liveStats} />}
+          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} states={states} liveHistory={liveHistory != null} stats={liveStats} />}
           {tab === 'auto' && (
             <AutoTradeView
               info={autoInfo}
               bets={betLog}
               positions={positions}
+              states={states}
               onSetConfig={async (patch) => {
                 const updated = await MOCK.setAutoTradeConfig(patch);
                 if (updated) setAutoInfo(updated);
