@@ -684,10 +684,13 @@ def _bet_live_status(
     bet: Dict,
     max_so_far: Optional[float],
     forecast_remainder_max: Optional[float],
+    today_target_date: Optional[str] = None,
 ) -> Dict:
     """Decide whether the bet has already locked in a win/loss based on
     today's observed max + remaining forecast. Returns:
       status: 'locked_win' | 'locked_loss' | 'in_bracket' | 'pending'
+              | 'awaiting_settlement' (bet is for a past or future date
+              — today's weather is irrelevant to it)
       degreesFromBracket: signed °F distance (0 if currently inside)
 
     Conservative: only locks when mathematically certain. The rule
@@ -698,6 +701,11 @@ def _bet_live_status(
     Any other lock requires a known forecast remainder; if remainder is
     None we report "pending" / "in_bracket" rather than guessing.
     """
+    # Don't apply today's weather to a bet whose settlement date isn't today.
+    bet_target = bet.get("target_date")
+    if bet_target and today_target_date and bet_target != today_target_date:
+        return {"status": "awaiting_settlement", "degreesFromBracket": None}
+
     if max_so_far is None:
         return {"status": "pending", "degreesFromBracket": None}
 
@@ -776,7 +784,8 @@ def _mark_bet_to_market(
         if_lose = -size
     max_so_far = city_state.get("maxSoFarF") if city_state else None
     forecast_rem = city_state.get("forecastRemainderMaxF") if city_state else None
-    live = _bet_live_status(b, max_so_far, forecast_rem)
+    today_td = city_state.get("targetDate") if city_state else None
+    live = _bet_live_status(b, max_so_far, forecast_rem, today_target_date=today_td)
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
@@ -788,8 +797,9 @@ def _mark_bet_to_market(
         "ifWin": if_win,
         "ifLose": if_lose,
         "liveStatus": live["status"],
-        "maxSoFarF": max_so_far,
+        "maxSoFarF": max_so_far if (today_td and b.get("target_date") == today_td) else None,
         "degreesFromBracket": live["degreesFromBracket"],
+        "targetDate": b.get("target_date"),
     }
 
 
