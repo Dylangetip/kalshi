@@ -2,6 +2,32 @@
 
 const { useState: useState_v, useEffect: useEffect_v, useMemo: useMemo_v, useRef: useRef_v } = React;
 
+// Live "are we hitting?" cell for the open-positions tables. Reads
+// liveStatus / maxSoFarF / degreesFromBracket fields populated by
+// /api/positions and renders a colored badge or distance hint.
+function LiveStatusCell({ position }) {
+  const status = position.liveStatus;
+  const max = position.maxSoFarF;
+  const deg = position.degreesFromBracket;
+  if (status == null || max == null) {
+    return <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>;
+  }
+  const maxStr = `${max.toFixed(1)}°`;
+  if (status === 'locked_win')  return <Pill kind="pos" dot>WON · {maxStr}</Pill>;
+  if (status === 'locked_loss') return <Pill kind="neg" dot>LOST · {maxStr}</Pill>;
+  if (status === 'in_bracket')  return <Pill kind="info" dot>IN · {maxStr}</Pill>;
+  // pending — show how far we still need to move
+  if (deg == null || deg === 0) return <Pill kind="muted">pending · {maxStr}</Pill>;
+  const sign = deg > 0 ? '−' : '+';   // we exceeded by deg → need to come down; we're below → need to climb
+  const need = Math.abs(deg).toFixed(1);
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <span className="mono" style={{ color: 'var(--fg-2)', fontSize: 11 }}>{maxStr}</span>
+      <Pill kind="muted">need {sign}{need}°</Pill>
+    </span>
+  );
+}
+
 // ====== OPPORTUNITIES BOARD ======
 function OpportunitiesView({ states, selectedCity, setSelectedCity, onPlaceBet, history }) {
   const ranked = [...states].sort((a, b) => b.bestEdgeCents - a.bestEdgeCents);
@@ -598,6 +624,24 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
         </div>
       </div>
 
+      {(() => {
+        const lockedW = positions.filter(p => p.liveStatus === 'locked_win').length;
+        const lockedL = positions.filter(p => p.liveStatus === 'locked_loss').length;
+        const inB     = positions.filter(p => p.liveStatus === 'in_bracket').length;
+        if (positions.length === 0) return null;
+        return (
+          <div style={{ padding: '6px 12px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12, display: 'flex', gap: 16, alignItems: 'center' }}>
+            <span style={{ color: 'var(--fg-2)' }}>Already decided:</span>
+            <span className="pos mono">{lockedW} locked WIN</span>
+            <span className="neg mono">{lockedL} locked LOSS</span>
+            <span style={{ color: 'var(--accent)' }} className="mono">{inB} currently in bracket</span>
+            <span style={{ color: 'var(--fg-3)' }} className="mono">{positions.length - lockedW - lockedL - inB} pending</span>
+            <span style={{ flex: 1 }} />
+            <span className="mono" style={{ color: 'var(--fg-3)' }}>{positions.length} open</span>
+          </div>
+        );
+      })()}
+
       <div className="panel">
         <div className="panel-header">
           <span>Equity curve {liveHistory && <Pill kind="pos">LIVE · SESSION</Pill>}</span>
@@ -644,7 +688,7 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
                 <table className="tbl">
                   <thead>
                     <tr>
-                      <th>City</th><th>Bracket</th><th>Side</th>
+                      <th>City</th><th>Bracket</th><th>Live</th><th>Side</th>
                       <th className="num-r">Stake</th><th className="num-r">Entry</th>
                       <th className="num-r pos">If WIN</th><th className="num-r neg">If LOSE</th>
                     </tr>
@@ -654,6 +698,7 @@ function PnLView({ history, positions, liveHistory = false, stats = null }) {
                       <tr key={p.id}>
                         <td className="city-cell">{p.city}</td>
                         <td>{p.bracket}</td>
+                        <td><LiveStatusCell position={p} /></td>
                         <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
                         <td className="num-r">${p.size}</td>
                         <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
@@ -1170,7 +1215,16 @@ function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
 }
 
 
-function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
+function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [] }) {
+  // Build a lookup so each bet row can show its live "are we hitting?" status.
+  // Key = city + bracket label; positions only includes open bets, so settled
+  // rows just won't have a match and render "—".
+  const liveByKey = React.useMemo(() => {
+    const m = {};
+    for (const p of positions) m[`${p.city}|${p.bracket}`] = p;
+    return m;
+  }, [positions]);
+  const lookupLive = (b) => liveByKey[`${b.city}|${(b.bracket?.label || b.bracket)}`];
   const [busy, setBusy] = useState_v(false);
   const [lastRunResult, setLastRunResult] = useState_v(null);
   const [draft, setDraft] = useState_v({});
@@ -1194,8 +1248,19 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
     });
     if (betSort === 'likely')    arr.sort((a, b) => (b.entry || 0) - (a.entry || 0));
     if (betSort === 'open')      arr.sort((a, b) => (a.status === 'open' ? -1 : 1) - (b.status === 'open' ? -1 : 1));
+    if (betSort === 'locked')    arr.sort((a, b) => {
+      const rank = x => {
+        const live = liveByKey[`${x.city}|${(x.bracket?.label || x.bracket)}`];
+        if (live?.liveStatus === 'locked_win')  return 0;
+        if (live?.liveStatus === 'in_bracket')  return 1;
+        if (live?.liveStatus === 'pending')     return 2;
+        if (live?.liveStatus === 'locked_loss') return 3;
+        return 4;
+      };
+      return rank(a) - rank(b);
+    });
     return arr;
-  }, [allBets, betSort]);
+  }, [allBets, betSort, liveByKey]);
 
   const betTotalPages = Math.ceil(sortedBets.length / betPageSize);
   const recent = sortedBets.slice(betPage * betPageSize, (betPage + 1) * betPageSize);
@@ -1322,6 +1387,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
               <option value="biggest">Biggest win</option>
               <option value="likely">Most likely</option>
               <option value="open">Open first</option>
+              <option value="locked">Locked wins first</option>
             </select>
             <select
               value={betPageSize}
@@ -1341,7 +1407,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
             <table className="tbl">
               <thead>
                 <tr>
-                  <th>Time</th><th>City</th><th>Bracket</th><th>Side</th>
+                  <th>Time</th><th>City</th><th>Bracket</th><th>Live</th><th>Side</th>
                   <th className="num-r">Size</th><th className="num-r">Entry</th>
                   <th className="num-r">Closes in</th>
                   <th>Status</th><th className="num-r">Settled P/L</th>
@@ -1354,11 +1420,15 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow }) {
                   const closesIn = settled ? '—' : until(b.closeAt);
                   const isClosingSoon = !settled && b.closeAt &&
                     (new Date(b.closeAt).getTime() - Date.now()) < 3 * 3600 * 1000;
+                  const live = lookupLive(b);
                   return (
                     <tr key={b.id}>
                       <td>{b.time}</td>
                       <td className="city-cell">{b.city}</td>
                       <td>{b.bracket?.label || b.bracket}</td>
+                      <td>{settled ? <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>
+                                   : (live ? <LiveStatusCell position={live} />
+                                           : <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>)}</td>
                       <td className={b.side === 'YES' ? 'pos' : 'neg'}>{b.side}</td>
                       <td className="num-r">${b.size}</td>
                       <td className="num-r">{b.entry}¢</td>

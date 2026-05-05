@@ -225,6 +225,31 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     wspd = hourly["wind_speed_850hPa"][idx]
     ecmwf_max_f = c_to_f(ecmwf_c)
 
+    # Today's max-so-far (observed) + remaining-day forecast max — used by
+    # the open-positions table to flag bets that have already locked in a
+    # win/loss before the official close.
+    tzname = city.get("tz")
+    if ZoneInfo is not None and tzname:
+        local_now = datetime.now(ZoneInfo(tzname))
+    else:
+        local_now = datetime.now(timezone.utc)
+    today_str = local_now.date().isoformat()
+    now_iso_hour = local_now.strftime("%Y-%m-%dT%H:00")
+    past_temps = []
+    future_temps = []
+    for t_iso, t_c in zip(times, hourly["temperature_2m"]):
+        if not t_iso.startswith(today_str) or t_c is None:
+            continue
+        f = c_to_f(t_c)
+        if t_iso <= now_iso_hour:
+            past_temps.append(f)
+        else:
+            future_temps.append(f)
+    max_so_far_f = max(past_temps) if past_temps else None
+    if metar and max_so_far_f is not None:
+        max_so_far_f = max(max_so_far_f, c_to_f(metar["temp_c"]))
+    forecast_remainder_max_f = max(future_temps) if future_temps else None
+
     # Doc §2.1: MOS is the highest-value source; weight it accordingly.
     model_max = ensemble_model_max([
         (gfs_mos_f, 0.40),
@@ -364,6 +389,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "mosMax": round(gfs_mos_f, 1) if gfs_mos_f is not None else round(model_max, 1),
         "namMos": round(nam_mos_f, 1) if nam_mos_f is not None else round(model_max, 1),
         "obsCurrent": round(obs_now_f, 1) if obs_now_f is not None else round(model_max - 6, 1),
+        "maxSoFarF": round(max_so_far_f, 1) if max_so_far_f is not None else None,
+        "forecastRemainderMaxF": round(forecast_remainder_max_f, 1) if forecast_remainder_max_f is not None else None,
         "confidence": round(0.4 + afd["score"] * 0.1, 2),
         "afdConfScore": afd["score"],
         "brackets": ladder,
@@ -653,7 +680,58 @@ def _bet_row_to_log(b: Dict) -> Dict:
     }
 
 
-def _mark_bet_to_market(b: Dict, current_yes_pct: float) -> Dict:
+def _bet_live_status(
+    bet: Dict,
+    max_so_far: Optional[float],
+    forecast_remainder_max: Optional[float],
+) -> Dict:
+    """Decide whether the bet has already locked in a win/loss based on
+    today's observed max + remaining forecast. Returns:
+      status: 'locked_win' | 'locked_loss' | 'in_bracket' | 'pending'
+      degreesFromBracket: signed °F distance (0 if currently inside)
+    """
+    if max_so_far is None:
+        return {"status": "pending", "degreesFromBracket": None}
+    label = bet.get("bracket_label", "") or ""
+    lo, hi = bet["bracket_lo"], bet["bracket_hi"]
+    upper_tail = label.startswith("≥")
+    lower_tail = label.startswith("≤")
+    # Effective bounds: open-ended brackets extend to ±inf.
+    eff_lo = float("-inf") if lower_tail else lo
+    eff_hi = float("inf") if upper_tail else hi
+
+    rem = forecast_remainder_max if forecast_remainder_max is not None else max_so_far
+    in_bracket_now = eff_lo <= max_so_far <= eff_hi
+    can_exceed_hi = rem > eff_hi
+    will_reach_lo = max(max_so_far, rem) >= eff_lo
+    locked_in = in_bracket_now and not can_exceed_hi
+    locked_out = (max_so_far > eff_hi) or (not will_reach_lo)
+
+    yes_side = bet["side"] == "YES"
+    if locked_in:
+        status = "locked_win" if yes_side else "locked_loss"
+    elif locked_out:
+        status = "locked_loss" if yes_side else "locked_win"
+    elif in_bracket_now:
+        status = "in_bracket"
+    else:
+        status = "pending"
+
+    if in_bracket_now:
+        deg = 0.0
+    elif max_so_far > eff_hi:
+        deg = round(max_so_far - eff_hi, 1) if eff_hi != float("inf") else 0.0
+    else:
+        deg = round(eff_lo - max_so_far, 1) if eff_lo != float("-inf") else 0.0
+        deg = -deg  # negative = need to climb up to bracket
+    return {"status": status, "degreesFromBracket": deg}
+
+
+def _mark_bet_to_market(
+    b: Dict,
+    current_yes_pct: float,
+    city_state: Optional[Dict] = None,
+) -> Dict:
     """Return settlement binary outcomes for an open bet.
     ifWin  = net profit if the bet resolves in your favour (payout - stake).
     ifLose = net loss if it resolves against you (always -size, the full stake).
@@ -670,6 +748,9 @@ def _mark_bet_to_market(b: Dict, current_yes_pct: float) -> Dict:
         no_contracts = size / no_entry
         if_win = round((1 - no_entry) * no_contracts, 2)
         if_lose = -size
+    max_so_far = city_state.get("maxSoFarF") if city_state else None
+    forecast_rem = city_state.get("forecastRemainderMaxF") if city_state else None
+    live = _bet_live_status(b, max_so_far, forecast_rem)
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
@@ -680,6 +761,9 @@ def _mark_bet_to_market(b: Dict, current_yes_pct: float) -> Dict:
         "current": round(current_yes_pct, 3),
         "ifWin": if_win,
         "ifLose": if_lose,
+        "liveStatus": live["status"],
+        "maxSoFarF": max_so_far,
+        "degreesFromBracket": live["degreesFromBracket"],
     }
 
 
@@ -1190,7 +1274,7 @@ async def get_positions():
             None,
         )
         current_yes_pct = bracket["kalshiPct"] if bracket else b["entry_cents"] / 100
-        out.append(_mark_bet_to_market(b, current_yes_pct))
+        out.append(_mark_bet_to_market(b, current_yes_pct, city_state=s))
     return out
 
 

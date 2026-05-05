@@ -298,6 +298,7 @@ function App() {
             <AutoTradeView
               info={autoInfo}
               bets={betLog}
+              positions={positions}
               onSetConfig={async (patch) => {
                 const updated = await MOCK.setAutoTradeConfig(patch);
                 if (updated) setAutoInfo(updated);
