@@ -253,6 +253,14 @@ const buildOpenPositions = () => {
 // the prototype remains playable offline.
 const API_BASE = window.__BETS_API__ != null ? window.__BETS_API__ : '';
 
+async function fetchMlDiagnostics() {
+  try {
+    const r = await fetch(API_BASE + '/api/ml/diagnostics', { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
 async function fetchLiveState() {
   try {
     const r = await fetch(API_BASE + '/api/state', { cache: 'no-store' });
@@ -425,6 +433,6 @@ window.MOCK = {
   seedRand, gauss, makeBrackets, buildCityState,
   fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, fetchStats, fetchAccuracy,
   fetchAutoTradeInfo, setAutoTradeConfig, triggerAutoTradeNow,
-  fetchMlInfo, triggerMlBackfill, triggerMlTrain,
+  fetchMlInfo, triggerMlBackfill, triggerMlTrain, fetchMlDiagnostics,
   persistBet, API_BASE,
 };

@@ -72,6 +72,7 @@ function App() {
   const [autoInfo, setAutoInfo] = useState(null);       // /api/auto-trade/info
   const [accuracy, setAccuracy] = useState(null);       // /api/accuracy
   const [mlInfo, setMlInfo] = useState(null);            // /api/ml/info
+  const [mlDiagnostics, setMlDiagnostics] = useState(null); // /api/ml/diagnostics
 
   // Theme + accent
   useEffect(() => {
@@ -174,13 +175,14 @@ function App() {
     }
     let cancelled = false;
     const refresh = async () => {
-      const [edges, equity, stats, auto, acc, ml] = await Promise.all([
+      const [edges, equity, stats, auto, acc, ml, diag] = await Promise.all([
         Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4))),
         MOCK.fetchEquity(72),
         MOCK.fetchStats(),
         MOCK.fetchAutoTradeInfo(),
         MOCK.fetchAccuracy(),
         MOCK.fetchMlInfo(),
+        MOCK.fetchMlDiagnostics(),
       ]);
       if (cancelled) return;
       const map = {};
@@ -193,6 +195,7 @@ function App() {
       setAutoInfo(auto);
       setAccuracy(acc);
       setMlInfo(ml);
+      setMlDiagnostics(diag);
     };
     refresh();
     const t = setInterval(refresh, 60_000);
@@ -318,6 +321,7 @@ function App() {
             <MlView
               mlInfo={mlInfo}
               accuracy={accuracy}
+              diagnostics={mlDiagnostics}
               onMlBackfill={async (opts) => {
                 const r = await MOCK.triggerMlBackfill(opts || {});
                 if (r) setMlInfo(await MOCK.fetchMlInfo());

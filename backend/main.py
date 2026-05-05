@@ -61,6 +61,7 @@ from .cities import CITIES
 from .ml import predict as ml_predict
 from .ml import train as ml_train
 from .ml import backfill as ml_backfill
+from .ml import diagnostics as ml_diagnostics
 from .model import parse_climate_max_yesterday, settle_pl
 from .sources import fetch_climate_report
 
@@ -1108,6 +1109,15 @@ def ml_info():
         "modelmax_source": _model_state["modelmax_source"],
         "blend_alpha": _model_state["blend_alpha"],
     }
+
+
+@app.get("/api/ml/diagnostics")
+def ml_diagnostics_endpoint():
+    """Statistical diagnostics for the active ML model: feature
+    importance, correlation with target, recent residuals, MAE by
+    week, per-city accuracy. Powers the Diagnostics panel on the ML
+    tab — same kind of view you'd build in R-studio after fitting."""
+    return ml_diagnostics.diagnostics_summary()
 
 
 class ModelConfigIn(BaseModel):

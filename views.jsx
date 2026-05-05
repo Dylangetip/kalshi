@@ -1449,12 +1449,189 @@ function ModelSourcePanel({ mlInfo }) {
 }
 
 
-function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
+// Diagnostics panel — feature importance, correlations, MAE-by-week,
+// per-city accuracy, residual scatter. R-studio-style introspection so
+// the user can see what the model is actually learning + how it's
+// improving over time.
+function MlDiagnosticsPanel({ diagnostics }) {
+  if (!diagnostics) {
+    return (
+      <div className="panel">
+        <div className="panel-header"><span>Diagnostics</span></div>
+        <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+          loading… (or no training data yet — run a backfill + train to populate).
+        </div>
+      </div>
+    );
+  }
+  const fi = diagnostics.feature_importances || [];
+  const corr = diagnostics.correlations || [];
+  const week = diagnostics.mae_by_week || [];
+  const city = diagnostics.per_city_mae || [];
+  const resid = diagnostics.recent_residuals || [];
+
+  const maxFi = Math.max(...fi.map(f => f.importance), 0.01);
+  const maxAbsCorr = Math.max(...corr.map(c => Math.abs(c.r)), 0.01);
+  const maxBy = Math.max(...week.map(w => w.mae), 0.01);
+  const maxCityMae = Math.max(...city.map(c => c.mae), 0.01);
+
+  // Residuals scatter — small SVG, predicted on x, actual on y, perfect
+  // line at y=x. Points colored by abs error.
+  const residualScatter = () => {
+    if (resid.length === 0) return null;
+    const xs = resid.map(r => r.predicted);
+    const ys = resid.map(r => r.actual);
+    const all = xs.concat(ys);
+    const lo = Math.min(...all) - 2;
+    const hi = Math.max(...all) + 2;
+    const W = 320, H = 220, pad = 24;
+    const x = v => pad + (v - lo) / (hi - lo) * (W - 2 * pad);
+    const y = v => H - pad - (v - lo) / (hi - lo) * (H - 2 * pad);
+    return (
+      <svg width={W} height={H} style={{ display: 'block' }}>
+        <line x1={x(lo)} y1={y(lo)} x2={x(hi)} y2={y(hi)}
+              stroke="var(--fg-3)" strokeDasharray="4 4" strokeWidth="1" />
+        {resid.map((r, i) => {
+          const ae = Math.abs(r.error);
+          const fill = ae < 1 ? 'var(--pos)' : ae < 3 ? 'var(--warn)' : 'var(--neg)';
+          return <circle key={i} cx={x(r.predicted)} cy={y(r.actual)} r="3" fill={fill} opacity="0.7" />;
+        })}
+        <text x={pad} y={H - 4} fontSize="10" fill="var(--fg-3)">predicted →</text>
+        <text x={4} y={pad - 6} fontSize="10" fill="var(--fg-3)">↑ actual</text>
+      </svg>
+    );
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Diagnostics</span>
+        <span className="panel-title-actions" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+          {fi.length} features · {resid.length} recent residuals · {week.length} weeks of history
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18 }}>
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>
+            Feature importance — what the trained model leans on
+          </div>
+          {fi.length === 0 ? (
+            <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+              not available for this model type (linear / pipeline / stack)
+            </div>
+          ) : (
+            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+              <tbody>
+                {fi.slice(0, 15).map(f => (
+                  <tr key={f.feature}>
+                    <td style={{ width: '40%' }}>{f.feature}</td>
+                    <td style={{ width: '50%', padding: '2px 6px' }}>
+                      <div style={{ height: 8, background: 'var(--accent)',
+                        width: `${(f.importance / maxFi) * 100}%`, opacity: 0.8 }} />
+                    </td>
+                    <td className="num-r mono" style={{ width: '10%' }}>{(f.importance * 100).toFixed(1)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>
+            Pearson correlation with actual high — raw signal strength
+          </div>
+          {corr.length === 0 ? (
+            <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>need ≥ 60 paired rows</div>
+          ) : (
+            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+              <tbody>
+                {corr.map(c => {
+                  const cls = c.r > 0 ? 'pos' : 'neg';
+                  return (
+                    <tr key={c.feature}>
+                      <td style={{ width: '40%' }}>{c.feature}</td>
+                      <td style={{ width: '40%', padding: '2px 6px' }}>
+                        <div style={{
+                          height: 8, background: c.r > 0 ? 'var(--pos)' : 'var(--neg)',
+                          width: `${(Math.abs(c.r) / maxAbsCorr) * 100}%`, opacity: 0.8,
+                        }} />
+                      </td>
+                      <td className={`num-r mono ${cls}`}>{c.r >= 0 ? '+' : ''}{c.r.toFixed(3)}</td>
+                      <td className="num-r mono" style={{ color: 'var(--fg-3)' }}>n={c.n}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>
+            MAE by week — is the model getting better?
+          </div>
+          {week.length === 0 ? (
+            <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>not enough history yet</div>
+          ) : (
+            <svg width="320" height="120" style={{ display: 'block' }}>
+              {week.map((w, i) => {
+                const x = 8 + (i / Math.max(1, week.length - 1)) * 304;
+                const h = (w.mae / maxBy) * 88;
+                return <rect key={i} x={x - 5} y={108 - h} width="9" height={h}
+                  fill="var(--accent)" opacity="0.8" />;
+              })}
+              <text x={8} y={118} fontSize="10" fill="var(--fg-3)">
+                {week[0]?.week} … {week[week.length - 1]?.week}
+              </text>
+              <text x={280} y={10} fontSize="10" fill="var(--fg-3)">
+                max {maxBy.toFixed(2)}°
+              </text>
+            </svg>
+          )}
+        </div>
+
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>
+            Per-city ensemble accuracy
+          </div>
+          <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+            <thead><tr><th>City</th><th className="num-r">N</th><th className="num-r">MAE</th><th className="num-r">Bias</th></tr></thead>
+            <tbody>
+              {city.map(c => (
+                <tr key={c.city}>
+                  <td className="city-cell">{c.city}</td>
+                  <td className="num-r mono">{c.n}</td>
+                  <td className="num-r mono">{c.mae.toFixed(2)}°</td>
+                  <td className={`num-r mono ${c.bias > 0 ? 'pos' : c.bias < 0 ? 'neg' : ''}`}>
+                    {c.bias >= 0 ? '+' : ''}{c.bias.toFixed(2)}°
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ gridColumn: '1 / -1' }}>
+          <div className="label" style={{ marginBottom: 6 }}>
+            Residual scatter — predicted vs actual (last {resid.length}). Green: |err|&lt;1°, yellow: &lt;3°, red: ≥3°.
+          </div>
+          {residualScatter()}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function MlView({ mlInfo, accuracy, diagnostics, onMlBackfill, onMlTrain }) {
   return (
     <div className="pnl-layout">
       <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
 
       <ModelSourcePanel mlInfo={mlInfo} />
+
+      <MlDiagnosticsPanel diagnostics={diagnostics} />
 
       <div className="panel">
         <div className="panel-header">
