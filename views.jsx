@@ -698,11 +698,28 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
           <div className="big-num neg">{fmtUSD(maxDD)}</div>
           <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>peak-to-trough</div>
         </div>
-        <div className="signal-card">
-          <div className="label">Avg edge / bet</div>
-          <div className="big-num pos">+4.2¢</div>
-          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{history.reduce((s, h) => s + h.trades, 0)} trades</div>
-        </div>
+        {(() => {
+          // "Locked P/L" — sum of guaranteed wins minus guaranteed losses
+          // from positions whose outcome is already mathematically certain.
+          const lockedProfit = positions.reduce((s, p) => p.liveStatus === 'locked_win' ? s + (p.ifWin || 0) : s, 0);
+          const lockedLoss   = positions.reduce((s, p) => p.liveStatus === 'locked_loss' ? s + (p.ifLose || 0) : s, 0);
+          const net = lockedProfit + lockedLoss;
+          const cls = net > 0 ? 'pos' : (net < 0 ? 'neg' : '');
+          const lockedW = positions.filter(p => p.liveStatus === 'locked_win').length;
+          const lockedL = positions.filter(p => p.liveStatus === 'locked_loss').length;
+          return (
+            <div className="signal-card">
+              <div className="label">Locked profit (today)</div>
+              <div className={`big-num ${cls}`}>{net >= 0 ? '+' : ''}${Math.round(net).toLocaleString()}</div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                <span className="pos">+${Math.round(lockedProfit).toLocaleString()}</span>
+                <span style={{ color: 'var(--fg-3)' }}> · </span>
+                <span className="neg">${Math.round(lockedLoss).toLocaleString()}</span>
+                <span style={{ color: 'var(--fg-3)' }}> · {lockedW}W/{lockedL}L</span>
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       {(() => {
@@ -749,13 +766,14 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
             const [pageSize, setPageSize] = React.useState(20);
             const [page, setPage] = React.useState(0);
             const [expandedId, setExpandedId] = React.useState(null);
-            // Hide bets whose outcome is already certain — they're shown in
-            // the "Already decided" strip up top. Only undecided rows belong
-            // in the main table.
-            const liveOpen = positions.filter(p =>
-              p.liveStatus !== 'locked_win' && p.liveStatus !== 'locked_loss'
-            );
-            const decidedCount = positions.length - liveOpen.length;
+            const [showResolved, setShowResolved] = React.useState(false);
+            // By default hide bets whose outcome is mathematically certain.
+            // The "Already decided" strip up top shows the counts; user can
+            // toggle "Show resolved" to see them inline.
+            const liveOpen = showResolved
+              ? positions
+              : positions.filter(p => p.liveStatus !== 'locked_win' && p.liveStatus !== 'locked_loss');
+            const decidedCount = positions.length - positions.filter(p => p.liveStatus !== 'locked_win' && p.liveStatus !== 'locked_loss').length;
             const totalPages = Math.ceil(liveOpen.length / pageSize);
             const slice = liveOpen.slice(page * pageSize, (page + 1) * pageSize);
             const sliceExposed = slice.reduce((s, p) => s + p.size, 0);
@@ -765,9 +783,16 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
                   <span>Open positions</span>
                   <span className="panel-title-actions" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span>
-                      {liveOpen.length} undecided · ${liveOpen.reduce((s, p) => s + p.size, 0).toLocaleString()} exposed
-                      {decidedCount > 0 && <span style={{ color: 'var(--fg-3)' }}> · {decidedCount} resolved (hidden)</span>}
+                      {showResolved
+                        ? `${positions.length} total · $${positions.reduce((s, p) => s + p.size, 0).toLocaleString()} exposed`
+                        : `${liveOpen.length} undecided · $${liveOpen.reduce((s, p) => s + p.size, 0).toLocaleString()} exposed${decidedCount > 0 ? ` · ${decidedCount} resolved (hidden)` : ''}`
+                      }
                     </span>
+                    {decidedCount > 0 && (
+                      <button className="btn-sm" onClick={() => { setShowResolved(s => !s); setPage(0); }}>
+                        {showResolved ? 'Hide resolved' : 'Show resolved'}
+                      </button>
+                    )}
                     <select
                       value={pageSize}
                       onChange={e => { setPageSize(+e.target.value); setPage(0); }}
