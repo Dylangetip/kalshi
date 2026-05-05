@@ -228,7 +228,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     # Today's max-so-far (observed) + remaining-day forecast max — used by
     # the open-positions table to flag bets that have already locked in a
     # win/loss before the official close.
-    tzname = city.get("tz")
+    tzname = CITY_TZ.get(city.get("tz"))
     if ZoneInfo is not None and tzname:
         local_now = datetime.now(ZoneInfo(tzname))
     else:
