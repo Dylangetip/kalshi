@@ -286,25 +286,33 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     # yesterday's actual + monthly climatology if available.
     prev_actual = db.get_prev_actual(city["code"], target_iso) if target_iso else None
     seasonal_avg = db.get_seasonal_avg(city["code"], target_iso) if target_iso else None
-    ml_max = ml_predict.predict_max(
-        {
-            "gfs_max": om_max_f,        # surface OM seamless ≈ GFS daily max
-            "ecmwf_max": ecmwf_max_f,
-            "icon_max": None,           # not currently in live state
-            "om_max": om_max_f,
-            "gfs_mos_max": gfs_mos_f,
-            "nam_mos_max": nam_mos_f,
-            "t850_c": t850_c,
-            "t700_c": t700_c,
-            "t500_c": t500_c,
-            "h500_m": h500,
-            "rh850_pct": rh850,
-            "ensemble_max": model_max,
-            "prev_actual_max_f": prev_actual,
-            "seasonal_avg_max_f": seasonal_avg,
-        },
-        city=city["code"],
-    )
+    lag3 = db.get_lag_actual(city["code"], target_iso, 3) if target_iso else None
+    lag7 = db.get_lag_actual(city["code"], target_iso, 7) if target_iso else None
+    roll7 = db.get_rolling_mean_actual(city["code"], target_iso, days=7) if target_iso else None
+    ml_features = {
+        "gfs_max": om_max_f,        # surface OM seamless ≈ GFS daily max
+        "ecmwf_max": ecmwf_max_f,
+        "icon_max": None,           # not currently in live state
+        "om_max": om_max_f,
+        "gfs_mos_max": gfs_mos_f,
+        "nam_mos_max": nam_mos_f,
+        "t850_c": t850_c,
+        "t700_c": t700_c,
+        "t500_c": t500_c,
+        "h500_m": h500,
+        "rh850_pct": rh850,
+        "ensemble_max": model_max,
+        "prev_actual_max_f": prev_actual,
+        "lag3_actual_max_f": lag3,
+        "lag7_actual_max_f": lag7,
+        "roll7_mean_max_f": roll7,
+        "seasonal_avg_max_f": seasonal_avg,
+    }
+    ml_max = ml_predict.predict_max(ml_features, city=city["code"])
+    # Quantile band (p10/p50/p90) for probabilistic bracket-prob
+    # calculations. None until a model with quantile_models has been
+    # trained. Future: bracket_prob will use the empirical CDF directly.
+    ml_quantiles = ml_predict.predict_quantiles(ml_features, city=city["code"])
 
     afd = parse_afd(afd_text)
     # Next-day temp forecasts have ~1.5-2°F std dev empirically, so default
@@ -400,6 +408,9 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "settlementBracket": best,
         "modelMax": round(model_max, 1),
         "mlMax": ml_max,
+        "mlP10": (ml_quantiles or {}).get("p10"),
+        "mlP50": (ml_quantiles or {}).get("p50"),
+        "mlP90": (ml_quantiles or {}).get("p90"),
         "blendedMax": (
             round(blend_alpha * ml_max + (1 - blend_alpha) * model_max, 1)
             if ml_max is not None else None

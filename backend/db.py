@@ -665,10 +665,23 @@ def list_training_data() -> List[Dict]:
         ),
         with_lag AS (
             SELECT j.*,
-                   LAG(j.actual_max_f) OVER (
+                   LAG(j.actual_max_f, 1) OVER (
                        PARTITION BY j.city, j.forecast_horizon_hours
                        ORDER BY j.target_date
                    ) AS prev_actual_max_f,
+                   LAG(j.actual_max_f, 3) OVER (
+                       PARTITION BY j.city, j.forecast_horizon_hours
+                       ORDER BY j.target_date
+                   ) AS lag3_actual_max_f,
+                   LAG(j.actual_max_f, 7) OVER (
+                       PARTITION BY j.city, j.forecast_horizon_hours
+                       ORDER BY j.target_date
+                   ) AS lag7_actual_max_f,
+                   AVG(j.actual_max_f) OVER (
+                       PARTITION BY j.city
+                       ORDER BY j.target_date
+                       ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+                   ) AS roll7_mean_max_f,
                    substr(j.target_date, 6, 2) AS month_str
             FROM joined j
         ),
@@ -686,6 +699,9 @@ def list_training_data() -> List[Dict]:
                w.ensemble_max,
                w.actual_max_f,
                w.prev_actual_max_f,
+               w.lag3_actual_max_f,
+               w.lag7_actual_max_f,
+               w.roll7_mean_max_f,
                c.seasonal_avg_max_f
         FROM with_lag w
         LEFT JOIN climatology c
@@ -717,6 +733,43 @@ def get_prev_actual(city: str, target_date: str) -> Optional[float]:
         "SELECT AVG(CAST(settled_max_f AS REAL)) AS m FROM bets "
         "WHERE city = ? AND target_date = ? AND settled_max_f IS NOT NULL",
         (city, prev),
+    ).fetchone()
+    if row and row["m"] is not None:
+        return float(row["m"])
+    return None
+
+
+def get_lag_actual(city: str, target_date: str, days: int) -> Optional[float]:
+    """Actual high `days` days before target_date. Powers lag3/lag7
+    feature lookups at inference time."""
+    from datetime import date, timedelta
+    try:
+        d = date.fromisoformat(target_date) - timedelta(days=days)
+    except ValueError:
+        return None
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT actual_max_f FROM historical_actuals WHERE city = ? AND target_date = ?",
+        (city, d.isoformat()),
+    ).fetchone()
+    if row and row["actual_max_f"] is not None:
+        return float(row["actual_max_f"])
+    return None
+
+
+def get_rolling_mean_actual(city: str, target_date: str, days: int = 7) -> Optional[float]:
+    """Rolling mean of actual highs over the `days` days before target_date."""
+    from datetime import date, timedelta
+    try:
+        end = date.fromisoformat(target_date) - timedelta(days=1)
+    except ValueError:
+        return None
+    start = end - timedelta(days=days - 1)
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT AVG(actual_max_f) AS m FROM historical_actuals "
+        "WHERE city = ? AND target_date >= ? AND target_date <= ?",
+        (city, start.isoformat(), end.isoformat()),
     ).fetchone()
     if row and row["m"] is not None:
         return float(row["m"])

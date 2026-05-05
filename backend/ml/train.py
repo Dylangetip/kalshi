@@ -46,6 +46,13 @@ FEATURE_COLUMNS_NUMERIC: List[str] = [
     # db.list_training_data's window functions; passed at inference
     # via predict_max(features=...).
     "prev_actual_max_f",
+    # Multi-day lag stack — captures 3-day and 7-day persistence /
+    # synoptic memory beyond the 1-day prev_actual lag.
+    "lag3_actual_max_f",
+    "lag7_actual_max_f",
+    # 7-day rolling mean of actuals — local climatology drift
+    # (heatwaves, fronts, regime shifts).
+    "roll7_mean_max_f",
     "seasonal_avg_max_f",
 ]
 FEATURE_COLUMNS_CATEGORICAL: List[str] = ["city"]
@@ -169,6 +176,23 @@ def _engineer_features(df):
         out["gfsmos_minus_ens"] = out["gfs_mos_max"] - out["ensemble_max"]
     if "gfs_mos_max" in out.columns and "nam_mos_max" in out.columns:
         out["mos_spread"] = out["gfs_mos_max"] - out["nam_mos_max"]
+    # ── Ensemble disagreement (forecast uncertainty proxy) ──
+    # Stdev across the source models. Wider disagreement = harder day,
+    # the model can learn to trust its prior less.
+    src_cols = [c for c in ["gfs_max", "ecmwf_max", "icon_max",
+                            "om_max", "gfs_mos_max", "nam_mos_max"]
+                if c in out.columns]
+    if len(src_cols) >= 2:
+        out["ensemble_disagreement"] = out[src_cols].std(axis=1, skipna=True)
+        out["ensemble_range"] = out[src_cols].max(axis=1, skipna=True) - out[src_cols].min(axis=1, skipna=True)
+    # ── Trend features from the lag stack ──
+    if "prev_actual_max_f" in out.columns and "lag3_actual_max_f" in out.columns:
+        out["trend_3d"] = out["prev_actual_max_f"] - out["lag3_actual_max_f"]
+    if "prev_actual_max_f" in out.columns and "lag7_actual_max_f" in out.columns:
+        out["trend_7d"] = out["prev_actual_max_f"] - out["lag7_actual_max_f"]
+    # ── Forecast vs rolling local climate ──
+    if "ensemble_max" in out.columns and "roll7_mean_max_f" in out.columns:
+        out["ens_minus_roll7"] = out["ensemble_max"] - out["roll7_mean_max_f"]
     return out
 
 
@@ -199,6 +223,26 @@ def _featurize(df, fitted_columns: Optional[List[str]] = None):
         X = X[fitted_columns]
     X = X.replace([np.inf, -np.inf], 0).fillna(0)
     return X, list(X.columns)
+
+
+def fit_quantile_trio(X_train, y_train, n_estimators: int = 200,
+                       max_depth: int = 3, learning_rate: float = 0.05) -> Dict:
+    """Train three GBM quantile regressors at α = 0.1 / 0.5 / 0.9 so we
+    get a 10/50/90 percentile prediction band per inference. The bracket
+    probability calc can then use the empirical CDF directly instead of
+    a fixed-σ gaussian — calibrates Kalshi YES-pricing to the model's
+    own uncertainty."""
+    from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+    models = {}
+    for alpha in (0.1, 0.5, 0.9):
+        m = GradientBoostingRegressor(
+            loss="quantile", alpha=alpha,
+            n_estimators=n_estimators, max_depth=max_depth,
+            learning_rate=learning_rate, random_state=42,
+        )
+        m.fit(X_train, y_train)
+        models[f"p{int(alpha * 100):02d}"] = m
+    return models
 
 
 def _fit_one(algorithm: str, X_train, y_train, X_test, y_test) -> Dict:
@@ -526,11 +570,21 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
                     )
             except Exception as exc:  # noqa: BLE001
                 print(f"[ml-train] permutation audit failed: {exc}")
+            # Quantile trio for probabilistic outputs (p10/p50/p90).
+            # Persisted alongside the point model so predict_max can
+            # emit the band per inference.
+            try:
+                quantiles = fit_quantile_trio(X_train, y_train)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ml-train] quantile fit failed: {exc}")
+                quantiles = None
             for c in candidates:
                 if c is best:
+                    extra = {"quantile_models": quantiles} if quantiles else None
                     best_run = _persist(c, feature_cols, len(train_df), len(test_df),
                                         holdout_mae_ensemble,
-                                        walk_forward_mae_v=wf_mae)
+                                        walk_forward_mae_v=wf_mae,
+                                        extra_payload=extra)
                 else:
                     db.insert_ml_run(
                         algorithm=c["algorithm"],

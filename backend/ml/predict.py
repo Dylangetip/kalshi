@@ -108,10 +108,34 @@ def _predict_with(model, fitted_cols: List[str], features: Dict[str, Any], city:
         return None
 
 
+def predict_quantiles(features: Dict[str, Any], city: str) -> Optional[Dict[str, float]]:
+    """If the active model bundle includes a quantile_models trio, run
+    each one on the input features and return {p10, p50, p90}. None when
+    no quantile models are persisted yet (older model versions) or
+    inference fails."""
+    payload = _load_if_changed()
+    if not payload:
+        return None
+    quantiles = payload.get("quantile_models") or {}
+    if not quantiles:
+        return None
+    cols = payload.get("feature_columns") or []
+    if not cols:
+        return None
+    out = {}
+    for key, model in quantiles.items():
+        v = _predict_with(model, cols, features, city)
+        if v is None:
+            return None
+        out[key] = v
+    return out
+
+
 def info() -> Dict:
     payload = _load_if_changed()
     return {
         "loaded": payload is not None,
         "path": _loaded_path,
         "algorithm": (payload or {}).get("algorithm"),
+        "has_quantiles": bool((payload or {}).get("quantile_models")),
     }
