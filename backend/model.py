@@ -161,14 +161,25 @@ def parse_climate_max_yesterday(text: Optional[str]) -> Optional[int]:
 
 
 def settle_pl(side: str, entry_cents: int, size: int, in_bracket: bool) -> float:
-    """Realized P/L using the prototype's mark-to-market formula at the
-    settlement boundary. `in_bracket` is whether the actual high fell in
-    [lo, hi] — that's the YES outcome regardless of which side was bet.
-    YES bets profit when in_bracket; NO bets profit when not — the sign
-    flip handles both. Matches the (current - entry) × size × sign × 100
-    formula used by /api/positions and the offline tick, so settlement
-    is just the same formula evaluated at the terminal price (1 or 0)."""
+    """Realized P/L using Kalshi's actual binary-contract math.
+    `size` is the USD stake. `in_bracket` is whether the actual high fell
+    in [lo, hi] — that's the YES outcome regardless of which side was bet.
+
+    On LOSS you lose only the stake. On WIN you get
+        profit = contracts × (1 − entry_price)
+    where contracts = size / entry_price. Matches _mark_bet_to_market's
+    if_win / if_lose so the settlement number lines up with what the
+    open-positions table preview promises.
+    """
+    won = (side == "YES" and in_bracket) or (side == "NO" and not in_bracket)
+    if not won:
+        return -float(size)
     entry = entry_cents / 100.0
-    sign = 1 if side == "YES" else -1
-    yes_outcome = 1.0 if in_bracket else 0.0
-    return (yes_outcome - entry) * size * sign * 100
+    if side == "YES":
+        contracts = size / entry if entry > 0 else 0.0
+        return round(contracts * (1 - entry), 2)
+    no_entry = 1 - entry  # what NO contracts cost
+    if no_entry <= 0:
+        return 0.0
+    contracts = size / no_entry
+    return round(contracts * (1 - no_entry), 2)

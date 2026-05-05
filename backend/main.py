@@ -1016,6 +1016,25 @@ async def settle_now():
     return {"settled": results, "count": len(results)}
 
 
+@app.post("/api/settle/recompute")
+def recompute_settled_pl():
+    """Re-run settle_pl on every already-settled bet to repair P/L values
+    that were computed with the old (broken) formula. Idempotent — running
+    again on already-correct rows is a no-op since the math is fixed."""
+    fixed = 0
+    skipped = 0
+    for b in db.list_bets(limit=10_000):
+        if b.get("status") != "settled" or b.get("settled_max_f") is None:
+            skipped += 1
+            continue
+        in_bracket = b["bracket_lo"] <= b["settled_max_f"] <= b["bracket_hi"]
+        new_pl = settle_pl(b["side"], b["entry_cents"], b["size"], in_bracket)
+        if abs(new_pl - (b.get("settled_pl") or 0)) > 0.01:
+            db.settle_bet(b["id"], new_pl, b["settled_max_f"])
+            fixed += 1
+    return {"fixed": fixed, "skipped": skipped}
+
+
 @app.get("/api/stats")
 def get_stats():
     return db.stats_summary()
