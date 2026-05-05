@@ -96,6 +96,42 @@ def _split(df, test_frac: float = 0.2):
     return df.iloc[:n_train], df.iloc[n_train:]
 
 
+def walk_forward_mae(df, fit_fn, n_splits: int = 5, min_train_frac: float = 0.4) -> Optional[float]:
+    """Walk-forward / expanding-window time-series validation. Each fold
+    trains on [start..t] and tests on [t..t+window]. Returns the mean
+    MAE across folds — a much more honest estimate of "how well will
+    this model do on tomorrow's data" than a single 80/20 holdout.
+
+    fit_fn(train_df, test_df) -> mae for that fold; the caller owns the
+    feature build + model fit so we don't recompute the dummies grid.
+    """
+    df = df.sort_values("target_date").reset_index(drop=True)
+    n = len(df)
+    if n < 200:
+        return None
+    min_train = max(int(n * min_train_frac), 100)
+    fold_maes: List[float] = []
+    test_window = max(1, (n - min_train) // n_splits)
+    for k in range(n_splits):
+        end_train = min_train + k * test_window
+        end_test = end_train + test_window
+        if end_test > n:
+            break
+        train_df = df.iloc[:end_train]
+        test_df = df.iloc[end_train:end_test]
+        if test_df.empty:
+            continue
+        try:
+            mae = fit_fn(train_df, test_df)
+            if mae is not None:
+                fold_maes.append(float(mae))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[walk-forward] fold {k} failed: {exc}")
+    if not fold_maes:
+        return None
+    return round(sum(fold_maes) / len(fold_maes), 4)
+
+
 def _engineer_features(df):
     """Add derived columns: model spreads, lapse rate proxy, day-of-year
     cyclic encoding. These typically give 5-15% MAE improvement over
@@ -213,11 +249,10 @@ def _fit_one(algorithm: str, X_train, y_train, X_test, y_test) -> Dict:
 
 def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
              holdout_mae_ensemble: Optional[float],
-             extra_payload: Optional[Dict] = None) -> Dict:
-    """Save a fitted model to disk and record the run in ml_runs.
-    `extra_payload` lets callers (e.g. per-city / stacking) include
-    structured side data in the pickle that predict.py knows how to
-    consume."""
+             extra_payload: Optional[Dict] = None,
+             walk_forward_mae_v: Optional[float] = None,
+             hyperparams: Optional[Dict] = None) -> Dict:
+    """Save a fitted model to disk and record the run in ml_runs."""
     import joblib  # type: ignore
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
@@ -239,7 +274,51 @@ def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
         holdout_mae_ensemble=round(holdout_mae_ensemble, 3) if holdout_mae_ensemble is not None else None,
         feature_columns=feature_cols,
         model_path=str(model_path),
+        walk_forward_mae=walk_forward_mae_v,
+        hyperparams=hyperparams,
     )
+
+
+def permutation_audit(model, X_test, y_test, feature_cols, n_repeats: int = 3):
+    """Run sklearn permutation_importance on the held-out test set and
+    return the features whose importance is below 0.5pp AND whose
+    Pearson |r| with the target is also below 0.05. These are candidates
+    to drop on the next retrain. Logged as a `prune` event so the
+    activity feed shows what's getting weeded out."""
+    try:
+        from sklearn.inspection import permutation_importance  # type: ignore
+        result = permutation_importance(
+            model, X_test, y_test, n_repeats=n_repeats, random_state=42, n_jobs=-1
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None
+    means = list(result.importances_mean)
+    if not means:
+        return None
+    total = sum(abs(m) for m in means) or 1.0
+    rows = sorted(
+        [{"feature": feature_cols[i], "importance": round(means[i] / total, 4)}
+         for i in range(len(feature_cols))],
+        key=lambda r: -r["importance"],
+    )
+    weak = [r for r in rows if abs(r["importance"]) < 0.005]
+    return {"all": rows, "weak": weak}
+
+
+def _make_fit_fn(algo: str):
+    """Returns fit_fn(train_df, test_df) → MAE, used by walk_forward_mae
+    so we can do the full feature-pipeline for each fold without
+    reimplementing it inline."""
+    def fit_fn(tr_df, te_df):
+        if tr_df.empty or te_df.empty:
+            return None
+        X_tr, cols = _featurize(tr_df)
+        X_te, _ = _featurize(te_df, fitted_columns=cols)
+        y_tr = tr_df[TARGET_COLUMN].astype(float)
+        y_te = te_df[TARGET_COLUMN].astype(float)
+        f = _fit_one(algo, X_tr, y_tr, X_te, y_te)
+        return f.get("test_mae")
+    return fit_fn
 
 
 def _train_per_city(df) -> Optional[Dict]:
@@ -429,9 +508,29 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
                 return {"error": "no algorithm in the auto sweep succeeded"}
             best = min(candidates, key=lambda c: c["test_mae"])
             best_run = None
+            # Walk-forward CV on the winning algorithm only (cheap-enough,
+            # ~5 fits, gives an honest "how would this do day-ahead" MAE).
+            best_algo = best["algorithm"]
+            wf_mae = walk_forward_mae(df, _make_fit_fn(best_algo))
+            # Permutation importance audit on the winner — surfaces weak
+            # features that could be pruned on the next retrain.
+            try:
+                audit = permutation_audit(best["model"], X_test, y_test, feature_cols)
+                if audit and audit.get("weak"):
+                    weak_names = [w["feature"] for w in audit["weak"][:10]]
+                    db.log_ml_event(
+                        "prune",
+                        {"weak": audit["weak"][:20]},
+                        f"weak features (candidates to drop next retrain): "
+                        f"{', '.join(weak_names)}",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ml-train] permutation audit failed: {exc}")
             for c in candidates:
                 if c is best:
-                    best_run = _persist(c, feature_cols, len(train_df), len(test_df), holdout_mae_ensemble)
+                    best_run = _persist(c, feature_cols, len(train_df), len(test_df),
+                                        holdout_mae_ensemble,
+                                        walk_forward_mae_v=wf_mae)
                 else:
                     db.insert_ml_run(
                         algorithm=c["algorithm"],
@@ -452,7 +551,9 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
 
         algo_key = algorithm if algorithm in ("linear", "rf", "gbm", "gbm-best") else "linear"
         fit = _fit_one(algo_key, X_train, y_train, X_test, y_test)
-        return _persist(fit, feature_cols, len(train_df), len(test_df), holdout_mae_ensemble)
+        wf_mae = walk_forward_mae(df, _make_fit_fn(algo_key))
+        return _persist(fit, feature_cols, len(train_df), len(test_df),
+                        holdout_mae_ensemble, walk_forward_mae_v=wf_mae)
     except Exception as exc:
         import traceback
         return {

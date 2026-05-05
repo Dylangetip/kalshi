@@ -580,6 +580,20 @@ async def _ml_retrain_loop() -> None:
                         f"model swap — test_mae {prev['test_mae']:.3f} {arrow} "
                         f"{run['test_mae']:.3f} ({pct:+.1f}%)",
                     )
+                # Drift check on the freshly-trained model — alerts when
+                # last week's MAE is materially worse than the trailing 4w.
+                try:
+                    drift = ml_diagnostics.drift_check()
+                    if drift.get("drifting"):
+                        db.log_ml_event(
+                            "drift_alert",
+                            drift,
+                            f"drift alert — last-week MAE {drift['last_week_mae']}° "
+                            f"vs trailing-4w {drift['trailing_4w_mae']}° "
+                            f"(ratio {drift['ratio']}×)",
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[ml-retrain] drift check failed: {exc}")
                 last_paired_count = cur_paired
         except Exception as exc:  # noqa: BLE001
             print(f"[ml-retrain] error: {exc}")
@@ -958,6 +972,26 @@ async def _settle_open_bets(client: httpx.AsyncClient) -> List[Dict]:
             in_bracket = bet["bracket_lo"] <= actual_max <= bet["bracket_hi"]
             pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
             db.settle_bet(bet["id"], pl, actual_max)
+            # Data-quality cross-check: NWS Climate Report's actual_max
+            # should match the IEM ASOS hourly archive value we
+            # backfilled into historical_actuals. If they disagree by
+            # more than 0.5°F, log a data_quality event so the user
+            # knows there's a discrepancy worth investigating.
+            try:
+                ha = db.get_historical_actual(bet["city"], cli_covers)
+                if ha is not None and ha.get("actual_max_f") is not None:
+                    iem = float(ha["actual_max_f"])
+                    if abs(iem - actual_max) > 0.5:
+                        db.log_ml_event(
+                            "data_quality",
+                            {"city": bet["city"], "date": cli_covers,
+                             "nws_climate": actual_max, "iem_asos": iem,
+                             "delta": round(iem - actual_max, 2)},
+                            f"data quality: {bet['city']} {cli_covers} "
+                            f"NWS={actual_max}° vs IEM={iem}° (Δ{iem - actual_max:+.1f}°)",
+                        )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[settle] data_quality check failed: {exc}")
             settled.append({
                 "id": bet["id"],
                 "city": bet["city"],

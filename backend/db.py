@@ -575,6 +575,16 @@ def upsert_historical_actual(city: str, target_date: str, actual_max_f: float, s
         c.commit()
 
 
+def get_historical_actual(city: str, target_date: str) -> Optional[Dict]:
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT city, target_date, actual_max_f, source FROM historical_actuals "
+        "WHERE city = ? AND target_date = ? LIMIT 1",
+        (city, target_date),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def historical_counts() -> Dict:
     """Quick stats for the UI: how much data we have to train on, plus
     feature coverage so we can diagnose why a model might be struggling
@@ -738,19 +748,25 @@ def insert_ml_run(
     holdout_mae_ensemble: Optional[float],
     feature_columns: List[str],
     model_path: str,
+    walk_forward_mae: Optional[float] = None,
+    hyperparams: Optional[Dict] = None,
+    role: str = "champion",
 ) -> Dict:
-    import json, time as _time
     c = _conn_or_init()
     with _lock:
         cur = c.execute(
             """INSERT INTO ml_runs (
                 trained_at, algorithm, n_train, n_test,
                 train_mae, test_mae, holdout_mae_ensemble,
-                feature_columns, model_path
-            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                feature_columns, model_path,
+                walk_forward_mae, hyperparams, role
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (int(_time.time()), algorithm, n_train, n_test,
              train_mae, test_mae, holdout_mae_ensemble,
-             json.dumps(feature_columns), model_path),
+             json.dumps(feature_columns), model_path,
+             walk_forward_mae,
+             json.dumps(hyperparams) if hyperparams else None,
+             role),
         )
         c.commit()
         row = c.execute("SELECT * FROM ml_runs WHERE id = ?", (cur.lastrowid,)).fetchone()

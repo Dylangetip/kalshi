@@ -226,6 +226,46 @@ def model_diff() -> Optional[Dict]:
     }
 
 
+def drift_check() -> Dict:
+    """Compare last 7 days of paired actuals vs the prior 28 days. If
+    last_week's MAE is significantly worse, the model is drifting and
+    we should alert. Returns the comparison numbers + a `drifting` flag.
+    Designed to be called right after each retrain so the activity feed
+    can log a `drift_alert` event."""
+    df = _build_dataframe()
+    if df is None or df.empty:
+        return {"available": False}
+    import pandas as pd  # type: ignore
+    df = df.copy()
+    df["target_date"] = pd.to_datetime(df["target_date"])
+    today = pd.Timestamp.utcnow().normalize()
+    last_week = df[df["target_date"] > today - pd.Timedelta(days=7)]
+    prior_4w = df[(df["target_date"] <= today - pd.Timedelta(days=7)) &
+                  (df["target_date"] > today - pd.Timedelta(days=35))]
+    if len(last_week) < 5 or len(prior_4w) < 20:
+        return {"available": False, "reason": "not enough data in either window"}
+
+    def mae(window):
+        err = (window["ensemble_max"] - window[TARGET_COLUMN]).abs().dropna()
+        return float(err.mean()) if len(err) else None
+
+    last_mae = mae(last_week)
+    prior_mae = mae(prior_4w)
+    if last_mae is None or prior_mae is None or prior_mae == 0:
+        return {"available": False}
+    ratio = last_mae / prior_mae
+    drifting = ratio > 1.3
+    return {
+        "available": True,
+        "drifting": drifting,
+        "last_week_mae": round(last_mae, 3),
+        "trailing_4w_mae": round(prior_mae, 3),
+        "ratio": round(ratio, 3),
+        "last_week_n": int(len(last_week)),
+        "prior_4w_n": int(len(prior_4w)),
+    }
+
+
 def diagnostics_summary() -> Dict:
     """Bundle everything the /api/ml/diagnostics endpoint returns."""
     return {
