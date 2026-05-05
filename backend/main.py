@@ -532,17 +532,59 @@ async def _ml_retrain_loop() -> None:
     historical tables daily), the model genuinely improves over time
     as more settled data accrues AND as the sweep finds better
     configurations on that data."""
+    last_paired_count = db.count_paired_total()
     while True:
+        # Data-driven trigger: also fire if at least 50 new paired rows
+        # have arrived since the last retrain. Logged with `trigger`
+        # field in the start event so the activity feed shows why.
+        cur_paired = db.count_paired_total()
+        new_rows = cur_paired - last_paired_count
+        trigger = "data_threshold" if new_rows >= 50 else "scheduled"
         try:
+            db.log_ml_event(
+                "retrain_start",
+                {"trigger": trigger, "n_paired": cur_paired, "new_since_last": new_rows},
+                f"retrain started — trigger={trigger}, n_paired={cur_paired:,}",
+            )
+            prev = db.latest_ml_run()
             run = ml_train.train(algorithm="auto")
             if run.get("error"):
                 print(f"[ml-retrain] auto skipped: {run['error']}")
+                db.log_ml_event(
+                    "retrain_done",
+                    {"error": run["error"]},
+                    f"retrain skipped: {run['error']}",
+                )
             else:
                 cands = run.get("auto_candidates") or []
                 summary = ", ".join(f"{c['algorithm']}={c['test_mae']}" for c in cands)
                 print(f"[ml-retrain] auto sweep: {summary} → kept {run.get('algorithm')}")
+                db.log_ml_event(
+                    "retrain_done",
+                    {"algorithm": run.get("algorithm"), "test_mae": run.get("test_mae"),
+                     "n_train": run.get("n_train"), "n_test": run.get("n_test"),
+                     "candidates": cands},
+                    f"retrain done — kept {run.get('algorithm')} "
+                    f"(test_mae={run.get('test_mae')})",
+                )
+                if prev and prev.get("test_mae") and run.get("test_mae"):
+                    delta = run["test_mae"] - prev["test_mae"]
+                    pct = (delta / prev["test_mae"]) * 100 if prev["test_mae"] else 0.0
+                    arrow = "↘" if delta < 0 else "↗"
+                    db.log_ml_event(
+                        "model_swap",
+                        {"from": prev.get("algorithm"), "to": run.get("algorithm"),
+                         "from_test_mae": prev.get("test_mae"),
+                         "to_test_mae": run.get("test_mae"),
+                         "delta": round(delta, 4), "pct": round(pct, 2)},
+                        f"model swap — test_mae {prev['test_mae']:.3f} {arrow} "
+                        f"{run['test_mae']:.3f} ({pct:+.1f}%)",
+                    )
+                last_paired_count = cur_paired
         except Exception as exc:  # noqa: BLE001
             print(f"[ml-retrain] error: {exc}")
+            db.log_ml_event("retrain_done", {"error": str(exc)},
+                            f"retrain error: {exc}")
         await asyncio.sleep(ML_RETRAIN_INTERVAL_SECONDS)
 
 
@@ -560,12 +602,28 @@ async def _ml_incremental_backfill_loop() -> None:
             start = (today - timedelta(days=7)).isoformat()
             end = (today - timedelta(days=1)).isoformat()
             print(f"[ml-backfill] daily incremental: {start} → {end}")
+            before_paired = db.count_paired_total()
+            db.log_ml_event(
+                "backfill_start",
+                {"start": start, "end": end, "before_paired": before_paired},
+                f"backfill started — pulling {start} → {end}",
+            )
             async with httpx.AsyncClient() as client:
                 await ml_backfill.run_backfill(start, end, _ml_backfill_progress)
             counts = db.historical_counts()
+            after_paired = int(counts.get("paired") or 0)
+            added = after_paired - before_paired
             print(f"[ml-backfill] tables now: {counts.get('paired')} paired rows")
+            db.log_ml_event(
+                "backfill_done",
+                {"start": start, "end": end, "added": added,
+                 "total_paired": after_paired},
+                f"backfill done — +{added} new pairs ({after_paired:,} total)",
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[ml-backfill] error: {exc}")
+            db.log_ml_event("backfill_done", {"error": str(exc)},
+                            f"backfill error: {exc}")
         # Sleep the configured interval BEFORE the next pull (the initial
         # 5-min wait above only runs once).
         await asyncio.sleep(max(1, ML_BACKFILL_INTERVAL_SECONDS - 300))
@@ -1108,6 +1166,35 @@ def ml_info():
         "backfill_progress": _ml_backfill_progress,
         "modelmax_source": _model_state["modelmax_source"],
         "blend_alpha": _model_state["blend_alpha"],
+    }
+
+
+@app.get("/api/ml/events")
+def ml_events(limit: int = 200, since_ts: Optional[int] = None,
+              kinds: Optional[str] = None):
+    """Activity feed for the ML pipeline. Each event is one entry the
+    UI can render: backfill_start, retrain_done, model_swap, drift_alert,
+    etc. `kinds` is comma-separated for client-side filtering."""
+    kinds_list = [k.strip() for k in kinds.split(",")] if kinds else None
+    events = db.list_ml_events(limit=limit, since_ts=since_ts, kinds=kinds_list)
+
+    # Live status: training/backfilling in flight if a *_start event is
+    # newer than its matching *_done. Cheap to compute on top of the list.
+    def in_flight(start_kind, done_kind):
+        s = db.latest_event(start_kind)
+        d = db.latest_event(done_kind)
+        if not s:
+            return False
+        if not d:
+            return True
+        return s["ts"] > d["ts"]
+
+    return {
+        "events": events,
+        "in_flight": {
+            "backfill": in_flight("backfill_start", "backfill_done"),
+            "retrain": in_flight("retrain_start", "retrain_done"),
+        },
     }
 
 

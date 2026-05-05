@@ -12,9 +12,11 @@ sqlite3 is shared across threads with check_same_thread=False because
 FastAPI runs sync endpoints in a thread pool.
 """
 
+import json
 import sqlite3
 import threading
 import time
+import time as _time  # alias for legacy in-function imports below
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -151,6 +153,21 @@ CREATE TABLE IF NOT EXISTS ml_runs (
     model_path            TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mlruns_trained ON ml_runs(trained_at DESC);
+
+-- Activity log surfacing what the ML pipeline is doing in real time.
+-- Powers the "what's it actively learning / changing" feed on the ML tab.
+-- Kinds: backfill_start | backfill_done | retrain_start | retrain_done
+--      | model_swap | drift_alert | prune | data_quality | dist_shift
+--      | model_promoted | model_rolled_back | online_update
+CREATE TABLE IF NOT EXISTS ml_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    kind      TEXT    NOT NULL,
+    payload   TEXT    NOT NULL,   -- JSON
+    message   TEXT    NOT NULL    -- human-readable line
+);
+CREATE INDEX IF NOT EXISTS idx_mlevents_ts ON ml_events(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_mlevents_kind ON ml_events(kind, ts DESC);
 """
 
 _lock = threading.Lock()
@@ -197,6 +214,14 @@ def init() -> None:
             for col in ("gfs_mos_max", "nam_mos_max"):
                 if col not in hp_cols:
                     _conn.execute(f"ALTER TABLE historical_predictions ADD COLUMN {col} REAL")
+            # ml_runs gained role (champion/challenger/archived) + hyperparams JSON
+            mlrun_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(ml_runs)").fetchall()}
+            if "role" not in mlrun_cols:
+                _conn.execute("ALTER TABLE ml_runs ADD COLUMN role TEXT DEFAULT 'champion'")
+            if "hyperparams" not in mlrun_cols:
+                _conn.execute("ALTER TABLE ml_runs ADD COLUMN hyperparams TEXT")
+            if "walk_forward_mae" not in mlrun_cols:
+                _conn.execute("ALTER TABLE ml_runs ADD COLUMN walk_forward_mae REAL")
             _conn.commit()
 
 
@@ -748,10 +773,102 @@ def latest_ml_run() -> Optional[Dict]:
 def list_ml_runs(limit: int = 20) -> List[Dict]:
     c = _conn_or_init()
     rows = c.execute(
-        "SELECT id, trained_at, algorithm, n_train, n_test, train_mae, test_mae, holdout_mae_ensemble, model_path "
+        "SELECT id, trained_at, algorithm, n_train, n_test, train_mae, test_mae, "
+        "holdout_mae_ensemble, model_path, role, walk_forward_mae "
         "FROM ml_runs ORDER BY trained_at DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ───── ML activity events ─────────────────────────────────────────────────
+# Powers the "what's it actively learning + changing" feed on the ML tab.
+# Every meaningful pipeline event (backfill, retrain, model swap, drift
+# alert, etc) lands in ml_events with a JSON payload + a one-line message
+# the UI can render verbatim.
+
+def log_ml_event(kind: str, payload: Optional[Dict] = None, message: str = "") -> int:
+    """Append a single event to the ml_events log. Idempotent; safe to
+    call from any background task. Never raises — logging shouldn't take
+    down a training run."""
+    try:
+        c = _conn_or_init()
+        with _lock:
+            cur = c.execute(
+                "INSERT INTO ml_events (ts, kind, payload, message) VALUES (?,?,?,?)",
+                (int(_time.time()), kind, json.dumps(payload or {}), message or kind),
+            )
+            c.commit()
+            return cur.lastrowid
+    except Exception as exc:  # noqa: BLE001
+        # ml_events not critical — fall through silently so a logging
+        # failure can't block the actual training/backfill work.
+        print(f"[db] log_ml_event swallowed error: {exc}")
+        return 0
+
+
+def list_ml_events(limit: int = 200, since_ts: Optional[int] = None,
+                   kinds: Optional[List[str]] = None) -> List[Dict]:
+    """Newest-first list of recent ml_events. payload is parsed JSON;
+    callers can filter by since_ts for cheap polling."""
+    c = _conn_or_init()
+    sql = "SELECT id, ts, kind, payload, message FROM ml_events"
+    params: List = []
+    where = []
+    if since_ts is not None:
+        where.append("ts >= ?")
+        params.append(int(since_ts))
+    if kinds:
+        placeholders = ",".join("?" * len(kinds))
+        where.append(f"kind IN ({placeholders})")
+        params.extend(kinds)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = c.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d["payload"]) if d.get("payload") else {}
+        except (TypeError, ValueError):
+            d["payload"] = {}
+        out.append(d)
+    return out
+
+
+def latest_event(kind: str) -> Optional[Dict]:
+    """Most-recent event of a given kind, or None. Used to compute
+    'currently training/backfilling' status — a 'retrain_start' newer
+    than the matching 'retrain_done' means a run is in flight."""
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT id, ts, kind, payload, message FROM ml_events "
+        "WHERE kind = ? ORDER BY ts DESC, id DESC LIMIT 1",
+        (kind,),
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["payload"] = json.loads(d["payload"]) if d.get("payload") else {}
+    except (TypeError, ValueError):
+        d["payload"] = {}
+    return d
+
+
+def count_paired_total() -> int:
+    """Total number of joined (city, target_date) pairs available for
+    training. Drives the data-threshold retrain trigger by comparing
+    against a stored count from the last successful retrain."""
+    c = _conn_or_init()
+    row = c.execute(
+        """SELECT COUNT(*) AS n
+           FROM historical_predictions p
+           JOIN historical_actuals a USING (city, target_date)
+           WHERE p.ensemble_max IS NOT NULL""",
+    ).fetchone()
+    return int(row["n"]) if row else 0
 
 
 def _bucket_stats(errors: List[float]) -> Dict:

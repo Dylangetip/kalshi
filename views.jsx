@@ -1624,9 +1624,97 @@ function MlDiagnosticsPanel({ diagnostics }) {
 }
 
 
-function MlView({ mlInfo, accuracy, diagnostics, onMlBackfill, onMlTrain }) {
+// ── Activity feed: live timeline of what the ML pipeline is doing.
+// Polls /api/ml/events every 10s. Each event renders with a kind-icon,
+// timestamp, message, and a chip strip pulled from the JSON payload so
+// the user can see exactly what changed (n_train, test_mae, delta, etc).
+function MlActivityPanel({ events }) {
+  const data = events || { events: [], in_flight: { backfill: false, retrain: false } };
+  const list = data.events || [];
+  const flight = data.in_flight || {};
+
+  const kindMeta = {
+    backfill_start: { icon: '↘', cls: 'info' },
+    backfill_done:  { icon: '✓', cls: 'pos' },
+    retrain_start:  { icon: '▶', cls: 'info' },
+    retrain_done:   { icon: '✓', cls: 'pos' },
+    model_swap:     { icon: '↻', cls: 'pos' },
+    drift_alert:    { icon: '⚠', cls: 'warn' },
+    prune:          { icon: '✂', cls: 'muted' },
+    data_quality:   { icon: '⚠', cls: 'warn' },
+    dist_shift:     { icon: '⚠', cls: 'warn' },
+    model_promoted: { icon: '★', cls: 'pos' },
+    model_rolled_back: { icon: '↺', cls: 'neg' },
+    online_update:  { icon: '·', cls: 'muted' },
+  };
+
+  const fmtTs = (ts) => {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  const renderChips = (payload) => {
+    if (!payload || typeof payload !== 'object') return null;
+    return Object.entries(payload).slice(0, 6).map(([k, v]) => {
+      if (v == null || typeof v === 'object') return null;
+      const sv = typeof v === 'number' ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(3)) : String(v);
+      return <span key={k} className="mono" style={{
+        fontSize: 10, padding: '1px 5px', background: 'var(--bg-2)',
+        border: '1px solid var(--border)', borderRadius: 3, color: 'var(--fg-3)',
+      }}>{k}={sv}</span>;
+    });
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Activity feed</span>
+        <span className="panel-title-actions" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {flight.backfill && <Pill kind="info" dot>BACKFILLING</Pill>}
+          {flight.retrain && <Pill kind="pos" dot>TRAINING</Pill>}
+          {!flight.backfill && !flight.retrain && (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>idle</span>
+          )}
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>{list.length} events</span>
+        </span>
+      </div>
+      {list.length === 0 ? (
+        <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+          No ML events yet. The first backfill or retrain run will populate this feed.
+        </div>
+      ) : (
+        <div style={{ maxHeight: 320, overflowY: 'auto', padding: '4px 0' }}>
+          {list.map(ev => {
+            const meta = kindMeta[ev.kind] || { icon: '·', cls: 'muted' };
+            return (
+              <div key={ev.id} style={{
+                display: 'grid', gridTemplateColumns: '70px 22px 1fr',
+                gap: 10, padding: '6px 14px', fontSize: 12,
+                borderBottom: '1px solid var(--border)', alignItems: 'baseline',
+              }}>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>{fmtTs(ev.ts)}</span>
+                <span className={meta.cls} style={{ textAlign: 'center' }}>{meta.icon}</span>
+                <div>
+                  <div>{ev.message}</div>
+                  <div style={{ display: 'flex', gap: 4, marginTop: 3, flexWrap: 'wrap' }}>
+                    {renderChips(ev.payload)}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function MlView({ mlInfo, accuracy, diagnostics, events, onMlBackfill, onMlTrain }) {
   return (
     <div className="pnl-layout">
+      <MlActivityPanel events={events} />
+
       <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
 
       <ModelSourcePanel mlInfo={mlInfo} />
