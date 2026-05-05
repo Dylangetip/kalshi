@@ -749,15 +749,25 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
             const [pageSize, setPageSize] = React.useState(20);
             const [page, setPage] = React.useState(0);
             const [expandedId, setExpandedId] = React.useState(null);
-            const totalPages = Math.ceil(positions.length / pageSize);
-            const slice = positions.slice(page * pageSize, (page + 1) * pageSize);
+            // Hide bets whose outcome is already certain — they're shown in
+            // the "Already decided" strip up top. Only undecided rows belong
+            // in the main table.
+            const liveOpen = positions.filter(p =>
+              p.liveStatus !== 'locked_win' && p.liveStatus !== 'locked_loss'
+            );
+            const decidedCount = positions.length - liveOpen.length;
+            const totalPages = Math.ceil(liveOpen.length / pageSize);
+            const slice = liveOpen.slice(page * pageSize, (page + 1) * pageSize);
             const sliceExposed = slice.reduce((s, p) => s + p.size, 0);
             return (
               <>
                 <div className="panel-header">
                   <span>Open positions</span>
                   <span className="panel-title-actions" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span>{positions.length} total · ${positions.reduce((s, p) => s + p.size, 0).toLocaleString()} exposed</span>
+                    <span>
+                      {liveOpen.length} undecided · ${liveOpen.reduce((s, p) => s + p.size, 0).toLocaleString()} exposed
+                      {decidedCount > 0 && <span style={{ color: 'var(--fg-3)' }}> · {decidedCount} resolved (hidden)</span>}
+                    </span>
                     <select
                       value={pageSize}
                       onChange={e => { setPageSize(+e.target.value); setPage(0); }}
@@ -800,7 +810,7 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
                 </table>
                 {totalPages > 1 && (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--fg-2)' }}>
-                    <span>Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, positions.length)} of {positions.length} · ${sliceExposed.toLocaleString()} on this page</span>
+                    <span>Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, liveOpen.length)} of {liveOpen.length} · ${sliceExposed.toLocaleString()} on this page</span>
                     <span style={{ display: 'flex', gap: 4 }}>
                       <button className="btn-sm" onClick={() => setPage(0)} disabled={page === 0}>«</button>
                       <button className="btn-sm" onClick={() => setPage(p => p - 1)} disabled={page === 0}>‹</button>
