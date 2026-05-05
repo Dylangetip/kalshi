@@ -5,3 +5,17 @@ cryptography>=42.0,<46
 scikit-learn>=1.3,<2.0
 pandas>=2.0,<3.0
 joblib>=1.3,<2.0
+
+# ── Optional ML deps (Tier 4 + 5) ─────────────────────────────────────────
+# All imports below are gated with try/except in the code so the backend
+# still boots if you haven't run `pip install -r requirements.txt` after
+# pulling. Adds ~80MB total install size; only pulled in when a feature
+# needs them.
+optuna>=3.5,<5.0          # Bayesian hyperparameter optimization
+lightgbm>=4.0,<5.0        # Modern gradient booster (leaf-wise)
+xgboost>=2.0,<3.0         # XGBoost (DART regularization, monotonic constraints)
+catboost>=1.2,<2.0        # Best-in-class for categorical features
+ngboost>=0.5,<1.0         # Natural gradient boosting (probabilistic outputs)
+mapie>=0.8,<1.0           # Conformal prediction intervals
+shap>=0.44,<1.0           # Per-prediction explanations
+river>=0.21,<1.0          # Incremental / online learning

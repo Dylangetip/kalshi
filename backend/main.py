@@ -62,6 +62,8 @@ from .ml import predict as ml_predict
 from .ml import train as ml_train
 from .ml import backfill as ml_backfill
 from .ml import diagnostics as ml_diagnostics
+from .ml import explain as ml_explain
+from .ml import online as ml_online
 from .model import parse_climate_max_yesterday, settle_pl
 from .sources import fetch_climate_report
 
@@ -313,6 +315,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     # calculations. None until a model with quantile_models has been
     # trained. Future: bracket_prob will use the empirical CDF directly.
     ml_quantiles = ml_predict.predict_quantiles(ml_features, city=city["code"])
+    # Conformal prediction interval — distribution-free 90% coverage.
+    ml_conformal = ml_predict.conformal_interval(ml_features, city=city["code"])
 
     afd = parse_afd(afd_text)
     # Next-day temp forecasts have ~1.5-2°F std dev empirically, so default
@@ -411,6 +415,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "mlP10": (ml_quantiles or {}).get("p10"),
         "mlP50": (ml_quantiles or {}).get("p50"),
         "mlP90": (ml_quantiles or {}).get("p90"),
+        "mlConformal": ml_conformal,
         "blendedMax": (
             round(blend_alpha * ml_max + (1 - blend_alpha) * model_max, 1)
             if ml_max is not None else None
@@ -645,6 +650,29 @@ async def _ml_incremental_backfill_loop() -> None:
                  "total_paired": after_paired},
                 f"backfill done — +{added} new pairs ({after_paired:,} total)",
             )
+            # Online learning: feed each new pair into the River model.
+            # Cheap (~ms per learn_one) and lets the online side catch
+            # regime shifts faster than the daily batch retrain.
+            if added > 0 and ml_online.info().get("available"):
+                try:
+                    new_rows = db.list_training_data()[-added:]  # newest pairs
+                    for row in new_rows:
+                        target = row.get("actual_max_f")
+                        if target is None:
+                            continue
+                        feats = {k: v for k, v in row.items()
+                                 if k not in ("city", "target_date",
+                                              "forecast_horizon_hours",
+                                              "actual_max_f")}
+                        ml_online.learn_one(feats, float(target))
+                    info = ml_online.info()
+                    db.log_ml_event(
+                        "online_update",
+                        {"new_updates": added, "total_updates": info["n_updates"]},
+                        f"online learner: +{added} samples (total {info['n_updates']})",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[ml-online] learn batch failed: {exc}")
         except Exception as exc:  # noqa: BLE001
             print(f"[ml-backfill] error: {exc}")
             db.log_ml_event("backfill_done", {"error": str(exc)},
@@ -1212,6 +1240,41 @@ def ml_info():
         "modelmax_source": _model_state["modelmax_source"],
         "blend_alpha": _model_state["blend_alpha"],
     }
+
+
+@app.get("/api/ml/explain/{city_code}")
+def ml_explain_endpoint(city_code: str):
+    """Top-k SHAP contributions for the active prediction at this city.
+    Returns null when shap isn't installed or the model type isn't
+    introspectable. The Opportunities city drill-down can show this
+    inline as 'why we predict X for NYC tomorrow'."""
+    city = next((c for c in CITIES if c["code"] == city_code.upper()), None)
+    if not city:
+        return {"available": False, "error": "unknown city"}
+    # Build a fresh feature dict the same way _build_city_state does. We
+    # don't have the live numbers in this isolated handler, so we use
+    # only the historical / aggregate features that are city-only.
+    target_iso = _city_target_date(city)
+    features = {
+        "prev_actual_max_f": db.get_prev_actual(city["code"], target_iso) if target_iso else None,
+        "lag3_actual_max_f": db.get_lag_actual(city["code"], target_iso, 3) if target_iso else None,
+        "lag7_actual_max_f": db.get_lag_actual(city["code"], target_iso, 7) if target_iso else None,
+        "roll7_mean_max_f": db.get_rolling_mean_actual(city["code"], target_iso, days=7) if target_iso else None,
+        "seasonal_avg_max_f": db.get_seasonal_avg(city["code"], target_iso) if target_iso else None,
+    }
+    rows = ml_explain.explain_one(features, city["code"], top_k=8)
+    return {
+        "city": city["code"],
+        "available": rows is not None,
+        "top_features": rows or [],
+    }
+
+
+@app.get("/api/ml/online/info")
+def ml_online_info():
+    """Status of the incremental / online model (n_updates, last update ts,
+    whether River is installed)."""
+    return ml_online.info()
 
 
 @app.get("/api/ml/events")

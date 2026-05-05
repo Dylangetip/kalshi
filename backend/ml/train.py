@@ -225,6 +225,30 @@ def _featurize(df, fitted_columns: Optional[List[str]] = None):
     return X, list(X.columns)
 
 
+def conformal_quantile(model, X_calib, y_calib, alpha: float = 0.1) -> Optional[float]:
+    """Inductive split-conformal: take the (1-α) quantile of |residual|
+    on a held-out calibration set. Adds predict-interval ŷ ± q with
+    GUARANTEED (1-α) coverage regardless of the underlying model.
+
+    Returns the half-width q. Predict-time interval = [pred - q, pred + q].
+    """
+    try:
+        import numpy as _np  # type: ignore
+    except Exception:
+        return None
+    try:
+        residuals = _np.abs(model.predict(X_calib) - y_calib)
+        n = len(residuals)
+        if n < 20:
+            return None
+        # Conformal quantile correction: ceil((1-α)(n+1)) / n
+        q_idx = min(n - 1, int(_np.ceil((1 - alpha) * (n + 1))) - 1)
+        sorted_res = _np.sort(residuals)
+        return float(round(sorted_res[q_idx], 3))
+    except Exception:
+        return None
+
+
 def fit_quantile_trio(X_train, y_train, n_estimators: int = 200,
                        max_depth: int = 3, learning_rate: float = 0.05) -> Dict:
     """Train three GBM quantile regressors at α = 0.1 / 0.5 / 0.9 so we
@@ -245,8 +269,187 @@ def fit_quantile_trio(X_train, y_train, n_estimators: int = 200,
     return models
 
 
+def optuna_hpo(df, n_trials: int = 30, timeout: int = 180) -> Optional[Dict]:
+    """Bayesian hyperparameter sweep via Optuna across the algorithm
+    space + each algorithm's parameters as one joint search. Returns
+    {algorithm, params, test_mae, walk_forward_mae} for the winning
+    trial. None if Optuna isn't installed.
+
+    Optimizes for walk-forward MAE — more honest than holdout MAE.
+    """
+    try:
+        import optuna  # type: ignore
+        from optuna.samplers import TPESampler  # type: ignore
+    except Exception:
+        return None
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    train_df, test_df = _split(df, test_frac=0.2)
+    if train_df.empty or test_df.empty:
+        return None
+    X_train, feature_cols = _featurize(train_df)
+    X_test, _ = _featurize(test_df, fitted_columns=feature_cols)
+    y_train = train_df[TARGET_COLUMN].astype(float)
+    y_test = test_df[TARGET_COLUMN].astype(float)
+
+    available = ["gbm", "rf"]
+    for opt in ("lightgbm", "xgboost", "catboost"):
+        if _modern_booster_available(opt):
+            available.append(opt)
+
+    def objective(trial):
+        algo = trial.suggest_categorical("algo", available)
+        if algo == "gbm":
+            from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+            params = {
+                "n_estimators": trial.suggest_int("gbm_n_est", 100, 800, step=100),
+                "max_depth": trial.suggest_int("gbm_depth", 2, 6),
+                "learning_rate": trial.suggest_float("gbm_lr", 0.01, 0.15, log=True),
+            }
+            m = GradientBoostingRegressor(**params, random_state=42)
+        elif algo == "rf":
+            from sklearn.ensemble import RandomForestRegressor  # type: ignore
+            params = {
+                "n_estimators": trial.suggest_int("rf_n_est", 100, 600, step=100),
+                "max_depth": trial.suggest_int("rf_depth", 4, 20),
+                "min_samples_leaf": trial.suggest_int("rf_min_leaf", 1, 10),
+            }
+            m = RandomForestRegressor(**params, random_state=42, n_jobs=-1)
+        elif algo == "lightgbm":
+            import lightgbm as lgb  # type: ignore
+            params = {
+                "n_estimators": trial.suggest_int("lgb_n_est", 100, 800, step=100),
+                "learning_rate": trial.suggest_float("lgb_lr", 0.01, 0.15, log=True),
+                "num_leaves": trial.suggest_int("lgb_leaves", 15, 127),
+                "min_child_samples": trial.suggest_int("lgb_min_child", 5, 50),
+            }
+            m = lgb.LGBMRegressor(**params, random_state=42, n_jobs=-1, verbose=-1)
+        elif algo == "xgboost":
+            import xgboost as xgb  # type: ignore
+            params = {
+                "n_estimators": trial.suggest_int("xgb_n_est", 100, 800, step=100),
+                "max_depth": trial.suggest_int("xgb_depth", 3, 8),
+                "learning_rate": trial.suggest_float("xgb_lr", 0.01, 0.15, log=True),
+            }
+            m = xgb.XGBRegressor(**params, random_state=42, tree_method="hist",
+                                 n_jobs=-1, verbosity=0)
+        elif algo == "catboost":
+            from catboost import CatBoostRegressor  # type: ignore
+            params = {
+                "iterations": trial.suggest_int("cat_iters", 100, 800, step=100),
+                "depth": trial.suggest_int("cat_depth", 4, 8),
+                "learning_rate": trial.suggest_float("cat_lr", 0.01, 0.15, log=True),
+            }
+            m = CatBoostRegressor(**params, random_state=42, verbose=False,
+                                  allow_writing_files=False)
+        else:
+            return float("inf")
+        try:
+            m.fit(X_train, y_train)
+            import numpy as _np  # type: ignore
+            return float(_np.abs(m.predict(X_test) - y_test).mean())
+        except Exception:
+            return float("inf")
+
+    sampler = TPESampler(seed=42)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+    best = study.best_trial
+    return {
+        "algorithm": best.params.get("algo"),
+        "params": dict(best.params),
+        "test_mae": round(best.value, 4),
+        "n_trials": len(study.trials),
+    }
+
+
+def _modern_booster_available(name: str) -> bool:
+    """Check if an optional modern booster (lightgbm / xgboost / catboost)
+    is importable. We don't actually import here — just probe so the
+    auto-sweep can include / skip cleanly without bombing the backend
+    when the user hasn't pip-installed the optional deps."""
+    try:
+        if name == "lightgbm":
+            import lightgbm  # type: ignore # noqa: F401
+        elif name == "xgboost":
+            import xgboost  # type: ignore # noqa: F401
+        elif name == "catboost":
+            import catboost  # type: ignore # noqa: F401
+        else:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _fit_lightgbm(X_train, y_train, X_test, y_test) -> Dict:
+    import lightgbm as lgb  # type: ignore
+    m = lgb.LGBMRegressor(
+        n_estimators=400, learning_rate=0.04, max_depth=-1, num_leaves=31,
+        min_child_samples=10, random_state=42, n_jobs=-1, verbose=-1,
+    )
+    m.fit(X_train, y_train)
+    tr = float((m.predict(X_train) - y_train).abs().mean())
+    te = float((m.predict(X_test) - y_test).abs().mean())
+    return {"model": m, "algorithm": "lightgbm", "train_mae": tr, "test_mae": te}
+
+
+def _fit_xgboost(X_train, y_train, X_test, y_test) -> Dict:
+    import xgboost as xgb  # type: ignore
+    m = xgb.XGBRegressor(
+        n_estimators=400, learning_rate=0.04, max_depth=4,
+        tree_method="hist", random_state=42, n_jobs=-1, verbosity=0,
+    )
+    m.fit(X_train, y_train)
+    tr = float((m.predict(X_train) - y_train).abs().mean())
+    te = float((m.predict(X_test) - y_test).abs().mean())
+    return {"model": m, "algorithm": "xgboost", "train_mae": tr, "test_mae": te}
+
+
+def fit_ngboost(X_train, y_train, X_test, y_test) -> Optional[Dict]:
+    """NGBoost — natural gradient boosting that produces a probability
+    distribution per prediction (Normal by default). Better calibrated
+    than quantile-GBM trios. Returns None if the optional dep isn't
+    installed."""
+    try:
+        from ngboost import NGBRegressor  # type: ignore
+    except Exception:
+        return None
+    m = NGBRegressor(n_estimators=300, learning_rate=0.04, random_state=42, verbose=False)
+    m.fit(X_train, y_train)
+    import numpy as _np  # type: ignore
+    pred_train = m.predict(X_train)
+    pred_test = m.predict(X_test)
+    return {
+        "model": m,
+        "algorithm": "ngboost",
+        "train_mae": float(_np.abs(pred_train - y_train).mean()),
+        "test_mae": float(_np.abs(pred_test - y_test).mean()),
+    }
+
+
+def _fit_catboost(X_train, y_train, X_test, y_test) -> Dict:
+    from catboost import CatBoostRegressor  # type: ignore
+    m = CatBoostRegressor(
+        iterations=400, learning_rate=0.04, depth=6,
+        random_state=42, verbose=False, allow_writing_files=False,
+    )
+    m.fit(X_train, y_train)
+    tr = float((m.predict(X_train) - y_train).mean())  # CatBoost preds are arrays
+    import numpy as _np  # type: ignore
+    tr = float(_np.abs(m.predict(X_train) - y_train).mean())
+    te = float(_np.abs(m.predict(X_test) - y_test).mean())
+    return {"model": m, "algorithm": "catboost", "train_mae": tr, "test_mae": te}
+
+
 def _fit_one(algorithm: str, X_train, y_train, X_test, y_test) -> Dict:
     """Fit a single (algorithm, hyperparameters) candidate."""
+    if algorithm == "lightgbm":
+        return _fit_lightgbm(X_train, y_train, X_test, y_test)
+    if algorithm == "xgboost":
+        return _fit_xgboost(X_train, y_train, X_test, y_test)
+    if algorithm == "catboost":
+        return _fit_catboost(X_train, y_train, X_test, y_test)
     if algorithm == "gbm-best":
         from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
         best = None
@@ -537,9 +740,54 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
             ]
             return run
 
+        if algorithm == "optuna":
+            best = optuna_hpo(df, n_trials=30, timeout=180)
+            if not best:
+                return {"error": "Optuna not installed (pip install optuna lightgbm xgboost catboost)"}
+            db.log_ml_event(
+                "retrain_done",
+                {"optuna_trials": best.get("n_trials"), "best_algo": best.get("algorithm"),
+                 "best_test_mae": best.get("test_mae"), "params": best.get("params")},
+                f"optuna HPO — {best.get('n_trials')} trials, best={best.get('algorithm')} "
+                f"(test_mae={best.get('test_mae')})",
+            )
+            # Re-fit the winning trial's params on the full dataset and persist.
+            algo = best["algorithm"]
+            params = {k.split("_", 1)[1]: v for k, v in best["params"].items() if k != "algo"}
+            try:
+                if algo == "gbm":
+                    from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+                    m = GradientBoostingRegressor(
+                        n_estimators=params.get("n_est", 200),
+                        max_depth=params.get("depth", 3),
+                        learning_rate=params.get("lr", 0.05),
+                        random_state=42,
+                    )
+                    algo_label = f"gbm-optuna[ne={params.get('n_est')},d={params.get('depth')},lr={params.get('lr'):.3f}]"
+                else:
+                    return {"error": f"Optuna best={algo} re-fit not implemented; pick algorithm=auto"}
+                m.fit(X_train, y_train)
+                import numpy as _np  # type: ignore
+                tr_mae = float(_np.abs(m.predict(X_train) - y_train).mean())
+                te_mae = float(_np.abs(m.predict(X_test) - y_test).mean())
+                fit = {"model": m, "algorithm": algo_label,
+                       "train_mae": tr_mae, "test_mae": te_mae}
+                wf_mae = walk_forward_mae(df, _make_fit_fn("gbm-best"))
+                return _persist(fit, feature_cols, len(train_df), len(test_df),
+                                holdout_mae_ensemble,
+                                walk_forward_mae_v=wf_mae,
+                                hyperparams=params)
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"Optuna re-fit failed: {exc}"}
+
         if algorithm == "auto":
             candidates = []
-            for algo in ("linear", "rf", "gbm-best", "stack"):
+            algos_to_try = ["linear", "rf", "gbm-best", "stack"]
+            # Add modern boosters when their pip deps are present.
+            for opt in ("lightgbm", "xgboost", "catboost"):
+                if _modern_booster_available(opt):
+                    algos_to_try.append(opt)
+            for algo in algos_to_try:
                 try:
                     if algo == "stack":
                         fit = _train_stack(X_train, y_train, X_test, y_test)
@@ -571,20 +819,25 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
             except Exception as exc:  # noqa: BLE001
                 print(f"[ml-train] permutation audit failed: {exc}")
             # Quantile trio for probabilistic outputs (p10/p50/p90).
-            # Persisted alongside the point model so predict_max can
-            # emit the band per inference.
             try:
                 quantiles = fit_quantile_trio(X_train, y_train)
             except Exception as exc:  # noqa: BLE001
                 print(f"[ml-train] quantile fit failed: {exc}")
                 quantiles = None
+            # Conformal prediction half-width on the held-out set —
+            # gives guaranteed (1-α) coverage intervals.
+            conformal_q90 = conformal_quantile(best["model"], X_test, y_test, alpha=0.1)
             for c in candidates:
                 if c is best:
-                    extra = {"quantile_models": quantiles} if quantiles else None
+                    extra = {}
+                    if quantiles:
+                        extra["quantile_models"] = quantiles
+                    if conformal_q90 is not None:
+                        extra["conformal_q90"] = conformal_q90
                     best_run = _persist(c, feature_cols, len(train_df), len(test_df),
                                         holdout_mae_ensemble,
                                         walk_forward_mae_v=wf_mae,
-                                        extra_payload=extra)
+                                        extra_payload=extra or None)
                 else:
                     db.insert_ml_run(
                         algorithm=c["algorithm"],

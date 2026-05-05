@@ -108,6 +108,27 @@ def _predict_with(model, fitted_cols: List[str], features: Dict[str, Any], city:
         return None
 
 
+def conformal_interval(features: Dict[str, Any], city: str) -> Optional[Dict[str, float]]:
+    """Returns {center, halfwidth, low, high} where the interval has
+    guaranteed (1-α) coverage. None if the model wasn't trained with a
+    conformal step (older model versions)."""
+    payload = _load_if_changed()
+    if not payload:
+        return None
+    q = payload.get("conformal_q90")
+    if q is None:
+        return None
+    pt = predict_max(features, city)
+    if pt is None:
+        return None
+    return {
+        "center": pt,
+        "halfwidth": float(q),
+        "low": round(pt - q, 1),
+        "high": round(pt + q, 1),
+    }
+
+
 def predict_quantiles(features: Dict[str, Any], city: str) -> Optional[Dict[str, float]]:
     """If the active model bundle includes a quantile_models trio, run
     each one on the input features and return {p10, p50, p90}. None when
