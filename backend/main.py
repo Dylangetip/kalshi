@@ -689,42 +689,68 @@ def _bet_live_status(
     today's observed max + remaining forecast. Returns:
       status: 'locked_win' | 'locked_loss' | 'in_bracket' | 'pending'
       degreesFromBracket: signed °F distance (0 if currently inside)
+
+    Conservative: only locks when mathematically certain. The rule
+    "max-temp-of-the-day only goes up" is leveraged so we can lock based
+    on max_so_far alone in two cases:
+      • max already exceeded a closed-bracket cap → locked LOSS for YES
+      • max already reached an upper-tail (≥X) floor → locked WIN for YES
+    Any other lock requires a known forecast remainder; if remainder is
+    None we report "pending" / "in_bracket" rather than guessing.
     """
     if max_so_far is None:
         return {"status": "pending", "degreesFromBracket": None}
+
     label = bet.get("bracket_label", "") or ""
     lo, hi = bet["bracket_lo"], bet["bracket_hi"]
     upper_tail = label.startswith("≥")
     lower_tail = label.startswith("≤")
-    # Effective bounds: open-ended brackets extend to ±inf.
     eff_lo = float("-inf") if lower_tail else lo
     eff_hi = float("inf") if upper_tail else hi
-
-    rem = forecast_remainder_max if forecast_remainder_max is not None else max_so_far
+    yes_side = bet["side"] == "YES"
     in_bracket_now = eff_lo <= max_so_far <= eff_hi
+
+    # ─── Locks that don't need forecast (max only goes up during the day) ──
+    if not upper_tail and max_so_far > eff_hi:
+        return {
+            "status": "locked_loss" if yes_side else "locked_win",
+            "degreesFromBracket": round(max_so_far - eff_hi, 1),
+        }
+    if upper_tail and max_so_far >= eff_lo:
+        return {
+            "status": "locked_win" if yes_side else "locked_loss",
+            "degreesFromBracket": 0.0,
+        }
+
+    # ─── Locks that need forecast — bail to non-locked state if missing ────
+    if forecast_remainder_max is None:
+        if in_bracket_now:
+            return {"status": "in_bracket", "degreesFromBracket": 0.0}
+        deg = round(eff_lo - max_so_far, 1) if max_so_far < eff_lo else 0.0
+        return {"status": "pending", "degreesFromBracket": -deg if deg else 0.0}
+
+    rem = forecast_remainder_max
     can_exceed_hi = rem > eff_hi
     will_reach_lo = max(max_so_far, rem) >= eff_lo
-    locked_in = in_bracket_now and not can_exceed_hi
-    locked_out = (max_so_far > eff_hi) or (not will_reach_lo)
 
-    yes_side = bet["side"] == "YES"
-    if locked_in:
-        status = "locked_win" if yes_side else "locked_loss"
-    elif locked_out:
-        status = "locked_loss" if yes_side else "locked_win"
-    elif in_bracket_now:
-        status = "in_bracket"
-    else:
-        status = "pending"
-
+    # Forecast says the day's peak still won't reach the floor → locked LOSS
+    if not will_reach_lo:
+        deg = round(eff_lo - max(max_so_far, rem), 1)
+        return {
+            "status": "locked_loss" if yes_side else "locked_win",
+            "degreesFromBracket": -deg,
+        }
+    # Currently inside the bracket AND forecast can't push beyond the cap → locked WIN
+    if in_bracket_now and not can_exceed_hi:
+        return {
+            "status": "locked_win" if yes_side else "locked_loss",
+            "degreesFromBracket": 0.0,
+        }
     if in_bracket_now:
-        deg = 0.0
-    elif max_so_far > eff_hi:
-        deg = round(max_so_far - eff_hi, 1) if eff_hi != float("inf") else 0.0
-    else:
-        deg = round(eff_lo - max_so_far, 1) if eff_lo != float("-inf") else 0.0
-        deg = -deg  # negative = need to climb up to bracket
-    return {"status": status, "degreesFromBracket": deg}
+        return {"status": "in_bracket", "degreesFromBracket": 0.0}
+    # Below the bracket; forecast can still reach → pending
+    deg = round(eff_lo - max_so_far, 1) if max_so_far < eff_lo else 0.0
+    return {"status": "pending", "degreesFromBracket": -deg if deg else 0.0}
 
 
 def _mark_bet_to_market(
