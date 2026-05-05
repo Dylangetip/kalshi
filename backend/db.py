@@ -875,23 +875,34 @@ def accuracy_summary() -> Dict:
 
 def stats_summary() -> Dict:
     """Realized win-rate and bet counts. Cheap to compute, exposed at
-    /api/stats for the P&L view to swap in real win-rate."""
+    /api/stats for the P&L view to swap in real win-rate.
+
+    Also computes the rolling bankroll the auto-trader treats as a bank
+    account:
+      starting_cash + sum(settled_pl) − sum(open bet stakes)
+    Money leaves the account when a bet is placed (stake committed),
+    returns + profit when it wins, and stays gone when it loses.
+    """
     c = _conn_or_init()
     row = c.execute(
         """SELECT
               COUNT(*) FILTER (WHERE status='settled')                       AS settled,
               COUNT(*) FILTER (WHERE status='settled' AND settled_pl > 0)    AS won,
               COUNT(*) FILTER (WHERE status='open')                          AS open,
-              COALESCE(SUM(settled_pl) FILTER (WHERE status='settled'), 0.0) AS realized_pl
+              COALESCE(SUM(settled_pl) FILTER (WHERE status='settled'), 0.0) AS realized_pl,
+              COALESCE(SUM(size) FILTER (WHERE status='open'), 0)            AS open_stakes
            FROM bets"""
     ).fetchone()
     settled = int(row["settled"])
+    realized_pl = float(row["realized_pl"])
+    open_stakes = float(row["open_stakes"])
     return {
         "settled": settled,
         "won": int(row["won"]),
         "open": int(row["open"]),
         "winRate": (float(row["won"]) / settled) if settled else None,
-        "realizedPl": round(float(row["realized_pl"]), 2),
+        "realizedPl": round(realized_pl, 2),
+        "openStakes": round(open_stakes, 2),
     }
 
 

@@ -935,15 +935,24 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
         except Exception as exc:  # noqa: BLE001
             print(f"[auto-trader] probe error on {city['code']}: {exc}")
 
+    # Rolling bank-account math: starting_cash + realized_pl − open stakes.
+    # Money leaves the account when a bet is placed and returns + profit
+    # when it wins. We sit out a tick if available cash is below min_usd.
+    stats = db.stats_summary()
+    starting_cash = float(cfg.get("bankroll") or 10000)
+    available_cash = starting_cash + stats["realizedPl"] - stats["openStakes"]
+    cfg["available_cash"] = round(available_cash, 2)
+    cfg["realized_pl"] = stats["realizedPl"]
+    cfg["open_stakes"] = stats["openStakes"]
+
     placed: List[Dict] = []
-    if candidates:
+    if candidates and available_cash >= cfg["min_usd"]:
         candidates.sort(key=lambda c: -c[0])
         edge_cents, city, state, bracket, target = candidates[0]
-        # Recompute Kelly for the picked bracket since state.kellyPct only
-        # reflects the recommended (max-edge) bracket.
+        # Kelly off the LIVE bankroll (available cash), not the static config
         kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
-        size = max(cfg["min_usd"], round(kelly * cfg["bankroll"]))
-        size = int(min(cfg["max_usd"], size))
+        size = max(cfg["min_usd"], round(kelly * available_cash))
+        size = int(min(cfg["max_usd"], available_cash, size))
         if size >= cfg["min_usd"]:
             try:
                 row = db.insert_bet(

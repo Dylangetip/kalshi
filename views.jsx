@@ -683,25 +683,24 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
     <div className="pnl-layout">
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
         {(() => {
-          // Equity = real cash only. Starting bankroll + realized P/L from
-          // bets that have actually settled tonight (NWS Climate Report).
-          // Locked-but-unsettled positions DON'T count here — they show up
-          // separately in the "Locked profit" card as a preview of what
-          // equity becomes once those bets close.
+          // Bank-account model: starting cash + realized P/L − stakes locked
+          // up in open bets = the actual cash you can deploy right now.
+          // Stake leaves the account at placement, full payout returns on
+          // a win, lost stake stays gone on a loss. Open stakes are still
+          // YOUR money but not deployable until the bet resolves.
           const baseline = 10000;
           const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
-          const real = baseline + realized;
-          const realRet = (real - baseline) / baseline;
-          const cls = realRet > 0 ? 'pos' : (realRet < 0 ? 'neg' : '');
-          const settledCount = stats?.settled ?? 0;
+          const openStakes = (stats && typeof stats.openStakes === 'number') ? stats.openStakes : 0;
+          const cash = baseline + realized - openStakes;
+          const totalEquity = baseline + realized;  // cash + open stakes
+          const ret = (totalEquity - baseline) / baseline;
+          const cls = ret > 0 ? 'pos' : (ret < 0 ? 'neg' : '');
           return (
             <div className="signal-card">
-              <div className="label">Equity</div>
-              <div className={`big-num ${cls || ''}`}>{fmtUSD(real)}</div>
+              <div className="label">Bankroll</div>
+              <div className={`big-num ${cls || ''}`}>{fmtUSD(cash)}</div>
               <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
-                {settledCount > 0
-                  ? `${fmtSign(realRet * 100, 2)}% · ${settledCount} settled`
-                  : `0 settled · awaiting tonight`}
+                cash · ${Math.round(openStakes).toLocaleString()} in open bets · {fmtSign(realized, 0)} settled
               </div>
             </div>
           );
