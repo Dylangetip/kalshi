@@ -1357,10 +1357,104 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
   );
 }
 
+// ── Model source picker — choose which prediction drives the auto-trader
+// edge calculations and the bracket-probability ladder.
+function ModelSourcePanel({ mlInfo }) {
+  const [busy, setBusy] = useState_v(false);
+  const [src, setSrc] = useState_v(null);
+  const [alpha, setAlpha] = useState_v(null);
+  const liveSrc = mlInfo?.modelmax_source || 'auto';
+  const liveAlpha = mlInfo?.blend_alpha ?? 0.7;
+  const curSrc = src ?? liveSrc;
+  const curAlpha = alpha ?? liveAlpha;
+  const dirty = curSrc !== liveSrc || curAlpha !== liveAlpha;
+
+  const apply = async () => {
+    setBusy(true);
+    try {
+      await fetch((window.__BETS_API__ || '') + '/api/model/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelmax_source: curSrc, blend_alpha: curAlpha }),
+      });
+      setSrc(null); setAlpha(null);
+    } finally { setBusy(false); }
+  };
+
+  const sources = [
+    { key: 'auto',     label: 'Auto',     desc: 'Use the blend if the ML model is trained, otherwise fall back to the ensemble. Safest default.' },
+    { key: 'ml',       label: 'ML only',  desc: 'Pure trained scikit-learn model. Best raw accuracy on holdout (~0.95°F MAE) but doesn\'t see live MOS data.' },
+    { key: 'blend',    label: 'Blend',    desc: 'α · ML + (1−α) · Ensemble. Captures both the trained model and the live MOS signal.' },
+    { key: 'ensemble', label: 'Ensemble', desc: 'Naive weighted average of MOS / NWS / ECMWF / Open-Meteo. Disables ML entirely.' },
+  ];
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Active prediction model</span>
+        <span className="panel-title-actions" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+            currently: {liveSrc}{liveSrc === 'blend' || liveSrc === 'auto' ? ` · α=${liveAlpha.toFixed(2)}` : ''}
+          </span>
+          <button className="btn primary sm" disabled={busy || !dirty} onClick={apply}>
+            {busy ? 'applying…' : 'Apply'}
+          </button>
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10 }}>
+        {sources.map(s => (
+          <label key={s.key} style={{
+            display: 'flex', gap: 10, padding: 10, border: '1px solid var(--border)', borderRadius: 4,
+            background: curSrc === s.key ? 'var(--bg-2)' : 'transparent', cursor: 'pointer',
+          }}>
+            <input
+              type="radio"
+              name="modelmax_source"
+              value={s.key}
+              checked={curSrc === s.key}
+              onChange={() => setSrc(s.key)}
+              style={{ marginTop: 2 }}
+            />
+            <div>
+              <div className="label" style={{ marginBottom: 2 }}>{s.label}</div>
+              <div style={{ fontSize: 11, color: 'var(--fg-3)', lineHeight: 1.4 }}>{s.desc}</div>
+            </div>
+          </label>
+        ))}
+      </div>
+      {(curSrc === 'blend' || curSrc === 'auto') && (
+        <div style={{ padding: '0 14px 14px' }}>
+          <div className="label" style={{ marginBottom: 4 }}>
+            Blend α (ML weight) — {(curAlpha * 100).toFixed(0)}% ML / {((1 - curAlpha) * 100).toFixed(0)}% Ensemble
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={curAlpha}
+            onChange={e => setAlpha(+e.target.value)}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 11, color: 'var(--fg-3)', marginTop: 4 }}>
+            Higher α = more weight on the trained ML model. Lower α = more weight on the live ensemble (which has access to MOS data the ML didn\'t train on). 0.7 is a sensible default.
+          </div>
+        </div>
+      )}
+      <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-3)' }}>
+        Changing the model invalidates the city-state cache so new edges show up immediately. The auto-trader uses the same active prediction.
+      </div>
+    </div>
+  );
+}
+
+
 function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
   return (
     <div className="pnl-layout">
       <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
+
+      <ModelSourcePanel mlInfo={mlInfo} />
 
       <div className="panel">
         <div className="panel-header">

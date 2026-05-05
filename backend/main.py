@@ -155,16 +155,12 @@ ML_BACKFILL_INTERVAL_SECONDS = int(os.getenv("BETS_ML_BACKFILL_INTERVAL", "86400
 ML_BACKFILL_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_BACKFILL_LOOP") == "1"
 
 # Blend weight for blended_max = α · ml_max + (1−α) · model_max.
-# 0.7 = 70% ML / 30% ensemble. The ML model never trained on MOS, so
-# leaving 30% on the ensemble keeps the MOS signal alive in the
-# blended prediction. Override with BETS_BLEND_ALPHA in the env.
-ML_BLEND_ALPHA = float(os.getenv("BETS_BLEND_ALPHA", "0.7"))
-
-# Which prediction drives the bracket-prob calc + auto-trader edges.
-# Default 'auto' = use blended ML+ensemble when ML is trained, fall
-# back to ensemble. Set BETS_MODELMAX_SOURCE=ml to force pure ML, =blend
-# to force blend even when ML alone is better, =ensemble to disable ML.
-MODELMAX_SOURCE = os.getenv("BETS_MODELMAX_SOURCE", "auto").lower()
+# Runtime-mutable model controls (UI can change without restart).
+# Defaults seeded from env vars. _model_state is read every state build.
+_model_state: Dict = {
+    "modelmax_source": os.getenv("BETS_MODELMAX_SOURCE", "auto").lower(),
+    "blend_alpha": float(os.getenv("BETS_BLEND_ALPHA", "0.7")),
+}
 
 # Backfill progress shared dict (read by /api/ml/backfill/status).
 _ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
@@ -325,11 +321,12 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     #   auto     - blend if ml available, else ensemble
     # ML wins on holdout but the live ensemble has access to MOS that the
     # trained model didn't see in backfill, so blend captures both.
+    blend_alpha = float(_model_state.get("blend_alpha", 0.7))
     blended_for_ladder = (
-        ML_BLEND_ALPHA * ml_max + (1 - ML_BLEND_ALPHA) * model_max
+        blend_alpha * ml_max + (1 - blend_alpha) * model_max
         if ml_max is not None else None
     )
-    src = MODELMAX_SOURCE
+    src = str(_model_state.get("modelmax_source", "auto")).lower()
     if src == "ml" and ml_max is not None:
         active_max, active_source = ml_max, "ml"
     elif src == "blend" and blended_for_ladder is not None:
@@ -403,7 +400,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "modelMax": round(model_max, 1),
         "mlMax": ml_max,
         "blendedMax": (
-            round(ML_BLEND_ALPHA * ml_max + (1 - ML_BLEND_ALPHA) * model_max, 1)
+            round(blend_alpha * ml_max + (1 - blend_alpha) * model_max, 1)
             if ml_max is not None else None
         ),
         "activeMax": round(active_max, 1),
@@ -1108,7 +1105,28 @@ def ml_info():
         "retrain_loop_disabled": ML_RETRAIN_LOOP_DISABLED,
         "backfill_loop_disabled": ML_BACKFILL_LOOP_DISABLED,
         "backfill_progress": _ml_backfill_progress,
+        "modelmax_source": _model_state["modelmax_source"],
+        "blend_alpha": _model_state["blend_alpha"],
     }
+
+
+class ModelConfigIn(BaseModel):
+    modelmax_source: Optional[str] = Field(None, pattern="^(auto|ml|blend|ensemble)$")
+    blend_alpha: Optional[float] = Field(None, ge=0, le=1)
+
+
+@app.post("/api/model/config")
+def model_config(c: ModelConfigIn):
+    """Switch the active prediction source at runtime — no restart needed.
+    Each new state build picks up the new value on the next call."""
+    if c.modelmax_source is not None:
+        _model_state["modelmax_source"] = c.modelmax_source
+    if c.blend_alpha is not None:
+        _model_state["blend_alpha"] = c.blend_alpha
+    # Invalidate the state cache so the change is visible immediately
+    # rather than waiting up to 10 minutes for the cache TTL.
+    _state_cache.clear()
+    return {**_model_state}
 
 
 @app.post("/api/ml/backfill")
