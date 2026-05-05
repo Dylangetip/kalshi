@@ -74,6 +74,7 @@ function App() {
   const [mlInfo, setMlInfo] = useState(null);            // /api/ml/info
   const [mlDiagnostics, setMlDiagnostics] = useState(null); // /api/ml/diagnostics
   const [mlEvents, setMlEvents] = useState(null);           // /api/ml/events
+  const [mlModelDiff, setMlModelDiff] = useState(null);     // /api/ml/model-diff
 
   // Theme + accent
   useEffect(() => {
@@ -176,7 +177,7 @@ function App() {
     }
     let cancelled = false;
     const refresh = async () => {
-      const [edges, equity, stats, auto, acc, ml, diag, events] = await Promise.all([
+      const [edges, equity, stats, auto, acc, ml, diag, events, mdiff] = await Promise.all([
         Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4))),
         MOCK.fetchEquity(72),
         MOCK.fetchStats(),
@@ -185,6 +186,7 @@ function App() {
         MOCK.fetchMlInfo(),
         MOCK.fetchMlDiagnostics(),
         MOCK.fetchMlEvents(100),
+        MOCK.fetchMlModelDiff(),
       ]);
       if (cancelled) return;
       const map = {};
@@ -199,6 +201,7 @@ function App() {
       setMlInfo(ml);
       setMlDiagnostics(diag);
       setMlEvents(events);
+      setMlModelDiff(mdiff);
     };
     refresh();
     const t = setInterval(refresh, 60_000);
@@ -326,6 +329,7 @@ function App() {
               accuracy={accuracy}
               diagnostics={mlDiagnostics}
               events={mlEvents}
+              modelDiff={mlModelDiff}
               onMlBackfill={async (opts) => {
                 const r = await MOCK.triggerMlBackfill(opts || {});
                 if (r) setMlInfo(await MOCK.fetchMlInfo());

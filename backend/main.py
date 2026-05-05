@@ -1198,6 +1198,14 @@ def ml_events(limit: int = 200, since_ts: Optional[int] = None,
     }
 
 
+@app.get("/api/ml/model-diff")
+def ml_model_diff_endpoint():
+    """Compare the two most-recent persisted models — what changed in
+    accuracy + which features shifted in importance."""
+    diff = ml_diagnostics.model_diff()
+    return diff or {"available": False}
+
+
 @app.get("/api/ml/diagnostics")
 def ml_diagnostics_endpoint():
     """Statistical diagnostics for the active ML model: feature

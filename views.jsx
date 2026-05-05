@@ -1219,26 +1219,66 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
 
       {banner}
 
+      {(() => {
+        // Backfill split into "Initial seed" (one-shot, disabled when
+        // sufficient data) vs "Daily refresh" (automatic, status-only).
+        const seeded = (data.paired || 0) >= 1000;
+        const lastReSeed = useState_v(false);
+        const [forceShowSeed, setForceShowSeed] = lastReSeed;
+        return (
+          <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8,
+                        alignItems: 'center', flexWrap: 'wrap' }}>
+            {seeded ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <Pill kind="pos" dot>Historical seed: {data.paired?.toLocaleString() || 0} pairs</Pill>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                  {data.earliest_target_date} → {data.latest_target_date}
+                </span>
+                <button className="btn-sm" onClick={() => setForceShowSeed(s => !s)}>
+                  {forceShowSeed ? 'cancel re-seed' : 'force re-seed'}
+                </button>
+                {forceShowSeed && (
+                  <>
+                    <input
+                      type="number" min={1} max={20} value={years}
+                      disabled={!!busy || backfillRunning}
+                      onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
+                      style={{ width: 60, fontSize: 13, padding: '6px 8px' }} />
+                    <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
+                    <button
+                      className="btn primary"
+                      disabled={!!busy || backfillRunning}
+                      onClick={() => click('backfill', () => onMlBackfill({ years }))}>
+                      Re-seed {years} yr{years === 1 ? '' : 's'}
+                    </button>
+                  </>
+                )}
+              </div>
+            ) : (
+              <>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                  Initial historical seed:
+                </span>
+                <input
+                  type="number" min={1} max={20} value={years}
+                  disabled={!!busy || backfillRunning}
+                  onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
+                  style={{ width: 60, fontSize: 13, padding: '6px 8px' }}
+                  title="Years of historical data to pull." />
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
+                <button
+                  className="btn primary"
+                  disabled={!!busy || backfillRunning}
+                  onClick={() => click('backfill', () => onMlBackfill({ years }))}>
+                  {backfillRunning ? <><span className="spinner" />Backfilling {progress.cities_done || 0}/5</> :
+                   busy === 'backfill' ? <><span className="spinner" />starting…</> : `Pull initial ${years} yr${years === 1 ? '' : 's'}`}
+                </button>
+              </>
+            )}
+          </div>
+        );
+      })()}
       <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input
-            type="number"
-            min={1}
-            max={20}
-            value={years}
-            disabled={!!busy || backfillRunning}
-            onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
-            style={{ width: 60, fontSize: 13, padding: '6px 8px' }}
-            title="Years of historical data to pull. Open-Meteo's forecast archive only goes back to ~2022 — older years may have gaps." />
-          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
-        </div>
-        <button
-          className="btn primary"
-          disabled={!!busy || backfillRunning}
-          onClick={() => click('backfill', () => onMlBackfill({ years }))}>
-          {backfillRunning ? <><span className="spinner" />Backfilling {progress.cities_done || 0}/5</> :
-           busy === 'backfill' ? <><span className="spinner" />starting…</> : `Backfill ${years} yr${years === 1 ? '' : 's'}`}
-        </button>
         <button
           className="btn success"
           disabled={!!busy || backfillRunning || (data.paired || 0) < 50}
@@ -1710,14 +1750,173 @@ function MlActivityPanel({ events }) {
 }
 
 
-function MlView({ mlInfo, accuracy, diagnostics, events, onMlBackfill, onMlTrain }) {
+// ── Model-to-model diff: side-by-side compare of the two most recent
+// persisted ML runs, showing test/train MAE delta and the per-feature
+// importance shift. Tells the user "what changed when I retrained."
+function MlModelDiffPanel({ modelDiff }) {
+  const d = modelDiff;
+  if (!d || d.available === false || !d.previous || !d.current) {
+    return (
+      <div className="panel">
+        <div className="panel-header"><span>Model diff (previous → current)</span></div>
+        <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+          Need at least two persisted models to compute a diff. Trigger another retrain to populate.
+        </div>
+      </div>
+    );
+  }
+  const fmtTs = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '—';
+  const maeDelta = d.test_mae_delta;
+  const maeCls = maeDelta == null ? '' : (maeDelta < 0 ? 'pos' : maeDelta > 0 ? 'neg' : '');
+  const maePct = (d.previous.test_mae && maeDelta != null)
+    ? (maeDelta / d.previous.test_mae * 100) : null;
+  const importance = d.importance_delta || [];
+  const maxAbs = Math.max(...importance.map(r => Math.abs(r.delta)), 0.005);
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Model diff (previous → current)</span>
+        <span className="panel-title-actions" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+          test MAE {d.previous.test_mae?.toFixed(3) ?? '—'}° → {d.current.test_mae?.toFixed(3) ?? '—'}°
+          {maeDelta != null && maePct != null && (
+            <span className={maeCls} style={{ marginLeft: 6 }}>
+              ({maeDelta >= 0 ? '+' : ''}{maeDelta.toFixed(3)}, {maePct >= 0 ? '+' : ''}{maePct.toFixed(1)}%)
+            </span>
+          )}
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18 }}>
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>Previous</div>
+          <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+            <tbody>
+              <tr><td>Algorithm</td><td className="num-r mono">{d.previous.algorithm}</td></tr>
+              <tr><td>Trained at</td><td className="num-r mono">{fmtTs(d.previous.trained_at)}</td></tr>
+              <tr><td>Train MAE</td><td className="num-r mono">{d.previous.train_mae?.toFixed(3) ?? '—'}°</td></tr>
+              <tr><td>Test MAE</td><td className="num-r mono">{d.previous.test_mae?.toFixed(3) ?? '—'}°</td></tr>
+              <tr><td>n_train / n_test</td><td className="num-r mono">{d.previous.n_train} / {d.previous.n_test}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>Current</div>
+          <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+            <tbody>
+              <tr><td>Algorithm</td><td className="num-r mono">{d.current.algorithm}</td></tr>
+              <tr><td>Trained at</td><td className="num-r mono">{fmtTs(d.current.trained_at)}</td></tr>
+              <tr><td>Train MAE</td><td className="num-r mono">{d.current.train_mae?.toFixed(3) ?? '—'}°</td></tr>
+              <tr><td>Test MAE</td><td className="num-r mono">{d.current.test_mae?.toFixed(3) ?? '—'}°</td></tr>
+              <tr><td>n_train / n_test</td><td className="num-r mono">{d.current.n_train} / {d.current.n_test}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        {importance.length > 0 && (
+          <div style={{ gridColumn: '1 / -1' }}>
+            <div className="label" style={{ marginBottom: 6 }}>
+              Feature importance shift (Δ ≥ 0.5pp shown)
+            </div>
+            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+              <thead>
+                <tr><th>Feature</th><th className="num-r">Before</th><th></th><th className="num-r">After</th><th className="num-r">Δ</th></tr>
+              </thead>
+              <tbody>
+                {importance.slice(0, 12).map(r => {
+                  const cls = r.delta > 0 ? 'pos' : 'neg';
+                  return (
+                    <tr key={r.feature}>
+                      <td>{r.feature}</td>
+                      <td className="num-r mono">{(r.before * 100).toFixed(1)}%</td>
+                      <td style={{ width: '40%', padding: '2px 6px' }}>
+                        <div style={{
+                          height: 8, background: r.delta > 0 ? 'var(--pos)' : 'var(--neg)',
+                          width: `${(Math.abs(r.delta) / maxAbs) * 100}%`, opacity: 0.8,
+                        }} />
+                      </td>
+                      <td className="num-r mono">{(r.after * 100).toFixed(1)}%</td>
+                      <td className={`num-r mono ${cls}`}>{r.delta >= 0 ? '+' : ''}{(r.delta * 100).toFixed(1)}pp</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// Compact data-freshness strip — answers "is fresh data flowing?"
+// at a glance. Shows total paired rows, latest target_date, hours since
+// last successful backfill_done, and ETA to next scheduled retrain.
+function MlDataFreshnessBadge({ mlInfo, events }) {
+  const data = mlInfo?.data || {};
+  const list = events?.events || [];
+  const lastBackfillDone = list.find(e => e.kind === 'backfill_done' && !(e.payload || {}).error);
+  const lastRetrainDone = list.find(e => e.kind === 'retrain_done' && !(e.payload || {}).error);
+  const now = Date.now() / 1000;
+  const fmtAgo = (ts) => {
+    if (!ts) return 'never';
+    const sec = Math.max(0, now - ts);
+    if (sec < 60) return `${Math.round(sec)}s ago`;
+    if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
+    if (sec < 86400) return `${(sec / 3600).toFixed(1)}h ago`;
+    return `${Math.round(sec / 86400)}d ago`;
+  };
+  const retrainInterval = mlInfo?.retrain_interval_seconds || 86400;
+  const nextRetrain = lastRetrainDone
+    ? Math.max(0, retrainInterval - (now - lastRetrainDone.ts))
+    : null;
+  const fmtIn = (sec) => {
+    if (sec == null) return '—';
+    if (sec < 60) return `<1m`;
+    if (sec < 3600) return `${Math.round(sec / 60)}m`;
+    return `${(sec / 3600).toFixed(1)}h`;
+  };
+
+  return (
+    <div style={{
+      padding: '6px 12px', background: 'var(--bg-2)',
+      border: '1px solid var(--border)', borderRadius: 4,
+      fontSize: 12, display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap',
+    }}>
+      <span style={{ color: 'var(--fg-2)' }}>Data:</span>
+      <span className="mono pos">{(data.paired || 0).toLocaleString()} paired rows</span>
+      <span style={{ color: 'var(--fg-3)' }}>·</span>
+      <span className="mono" style={{ color: 'var(--fg-2)' }}>
+        latest {data.latest_target_date || '—'}
+      </span>
+      <span style={{ color: 'var(--fg-3)' }}>·</span>
+      <span className="mono" style={{ color: 'var(--fg-2)' }}>
+        last backfill {fmtAgo(lastBackfillDone?.ts)}
+      </span>
+      <span style={{ color: 'var(--fg-3)' }}>·</span>
+      <span className="mono" style={{ color: 'var(--fg-2)' }}>
+        last retrain {fmtAgo(lastRetrainDone?.ts)}
+      </span>
+      <span style={{ flex: 1 }} />
+      <span className="mono" style={{ color: 'var(--fg-3)' }}>
+        next scheduled retrain in {fmtIn(nextRetrain)}
+      </span>
+    </div>
+  );
+}
+
+
+function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill, onMlTrain }) {
   return (
     <div className="pnl-layout">
+      <MlDataFreshnessBadge mlInfo={mlInfo} events={events} />
+
       <MlActivityPanel events={events} />
 
       <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
 
       <ModelSourcePanel mlInfo={mlInfo} />
+
+      <MlModelDiffPanel modelDiff={modelDiff} />
 
       <MlDiagnosticsPanel diagnostics={diagnostics} />
 

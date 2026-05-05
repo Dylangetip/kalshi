@@ -142,6 +142,90 @@ def per_city_mae() -> List[Dict]:
     ]
 
 
+def model_diff() -> Optional[Dict]:
+    """Compare the two most-recent persisted models so the UI can show
+    "what changed" between them: test_mae delta, train_mae delta, and a
+    per-feature importance diff. If only one model has been persisted
+    we return None — there's nothing to compare yet."""
+    runs = db.list_ml_runs(limit=10)
+    persisted = [r for r in runs if r.get("model_path") and r.get("model_path") != "(not-persisted)"]
+    if len(persisted) < 2:
+        return None
+    cur, prev = persisted[0], persisted[1]
+
+    def importances_for(run):
+        try:
+            import joblib  # type: ignore
+            payload = joblib.load(run["model_path"])
+        except Exception:  # noqa: BLE001
+            return None
+        m = payload.get("model")
+        cols = payload.get("feature_columns") or []
+        imp = None
+        if hasattr(m, "feature_importances_"):
+            imp = list(m.feature_importances_)
+        elif hasattr(m, "coef_"):
+            try:
+                imp = [abs(float(c)) for c in m.coef_]
+            except Exception:  # noqa: BLE001
+                imp = None
+        elif hasattr(m, "named_steps"):
+            for step in reversed(list(m.named_steps.values())):
+                if hasattr(step, "coef_"):
+                    imp = [abs(float(c)) for c in step.coef_]
+                    break
+        if imp is None or not cols or len(imp) != len(cols):
+            return None
+        total = sum(imp) or 1.0
+        return {cols[i]: imp[i] / total for i in range(len(cols))}
+
+    cur_imp = importances_for(cur) or {}
+    prev_imp = importances_for(prev) or {}
+    all_cols = sorted(set(cur_imp) | set(prev_imp))
+    importance_delta = []
+    for col in all_cols:
+        before = prev_imp.get(col, 0.0)
+        after = cur_imp.get(col, 0.0)
+        delta = after - before
+        if abs(delta) >= 0.005:  # 0.5pp threshold so we don't drown in noise
+            importance_delta.append({
+                "feature": col,
+                "before": round(before, 4),
+                "after": round(after, 4),
+                "delta": round(delta, 4),
+            })
+    importance_delta.sort(key=lambda r: -abs(r["delta"]))
+
+    def safe_delta(a, b):
+        if a is None or b is None:
+            return None
+        return round(float(a) - float(b), 4)
+
+    return {
+        "previous": {
+            "id": prev.get("id"),
+            "trained_at": prev.get("trained_at"),
+            "algorithm": prev.get("algorithm"),
+            "test_mae": prev.get("test_mae"),
+            "train_mae": prev.get("train_mae"),
+            "n_train": prev.get("n_train"),
+            "n_test": prev.get("n_test"),
+        },
+        "current": {
+            "id": cur.get("id"),
+            "trained_at": cur.get("trained_at"),
+            "algorithm": cur.get("algorithm"),
+            "test_mae": cur.get("test_mae"),
+            "train_mae": cur.get("train_mae"),
+            "n_train": cur.get("n_train"),
+            "n_test": cur.get("n_test"),
+        },
+        "test_mae_delta": safe_delta(cur.get("test_mae"), prev.get("test_mae")),
+        "train_mae_delta": safe_delta(cur.get("train_mae"), prev.get("train_mae")),
+        "importance_delta": importance_delta[:25],
+    }
+
+
 def diagnostics_summary() -> Dict:
     """Bundle everything the /api/ml/diagnostics endpoint returns."""
     return {
