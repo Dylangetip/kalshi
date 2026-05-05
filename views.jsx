@@ -1456,6 +1456,114 @@ function MlView({ mlInfo, accuracy, onMlBackfill, onMlTrain }) {
 }
 
 
+// ── Auto-trader settings panel — every tunable with a plain-English
+// explanation. Each row: label + numeric input + helper text describing
+// what it does and a sensible range. Hitting "Apply" sends a single
+// PATCH to /api/auto-trade/config; preset buttons swap the entire draft
+// to opinionated defaults so users can pick a stance without thinking.
+function AutoTradeSettings({ cfg, draft, setDraft, apply, busy }) {
+  const v = (key, def) => draft[key] ?? cfg[key] ?? def;
+
+  const fields = [
+    {
+      key: 'min_edge_cents', label: 'Minimum edge (¢)', def: 5, step: 1, min: 0, max: 50,
+      help: 'Only fire when our model thinks the bracket is at least this many cents under-priced. Lower = more bets, lower conviction. Higher = fewer, stronger bets. Sweet spot 5-8¢.',
+    },
+    {
+      key: 'min_model_pct', label: 'Minimum model probability', def: 0.12, step: 0.01, min: 0, max: 1,
+      help: 'Refuse to take YES bets where our model thinks the outcome is below this probability. Filters out long-shot lottery tickets. 0.12 = 12%. Raise to 0.20+ to only bet plausible outcomes.',
+    },
+    {
+      key: 'skip_entry_below_cents', label: 'Skip entries below (¢)', def: 5, step: 1, min: 0, max: 50,
+      help: 'Hard skip on bets priced below this. Tiny entries (1-3¢) are pure variance — even when our edge is real, you lose 95%+ of the time and one big drawdown can blow up the account.',
+    },
+    {
+      key: 'min_kelly', label: 'Minimum Kelly fraction', def: 0.005, step: 0.001, min: 0, max: 0.5,
+      help: 'Refuse trades where Kelly says risk less than this fraction of bankroll. 0.005 = 0.5%. Filters out marginal edges. Raise to 0.01-0.02 for only meaningful bets.',
+    },
+    {
+      key: 'max_bets_per_city_per_day', label: 'Max bets per city per day', def: 2, step: 1, min: 1, max: 10,
+      help: 'Cap concurrent bets in one city for a settlement date. Stops the auto-trader from taking 5 overlapping brackets in the same city. 1 = highest-conviction only; 2-3 = balanced.',
+    },
+    {
+      key: 'max_usd', label: 'Max stake per bet ($)', def: 500, step: 50, min: 10, max: 100000,
+      help: 'Hard cap on a single bet size, regardless of what Kelly suggests. Default is 5% of bankroll. Lower = smoother equity curve, less ruin risk.',
+    },
+    {
+      key: 'min_usd', label: 'Min stake per bet ($)', def: 50, step: 10, min: 1, max: 10000,
+      help: 'Skip a tick if Kelly suggests a stake below this — too small to be worth the position. Default $50 keeps fees-and-friction reasonable.',
+    },
+    {
+      key: 'interval_seconds', label: 'Tick interval (seconds)', def: 600, step: 30, min: 10, max: 86400,
+      help: 'How often the auto-trader scans for bets. 600 = every 10 minutes. Lower = more reactive, more API load. The model+market only update slowly (hourly), so 5-15 minutes is plenty.',
+    },
+    {
+      key: 'bankroll', label: 'Configured bankroll ($)', def: 10000, step: 100, min: 100, max: 10000000,
+      help: 'Reference bankroll for Kelly sizing. The actual cash deployed scales with this — bigger bankroll = bigger bets at the same Kelly fraction.',
+    },
+  ];
+
+  const setPreset = (preset) => {
+    setDraft(d => ({ ...d, ...preset }));
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Settings</span>
+        <span className="panel-title-actions" style={{ display: 'flex', gap: 6 }}>
+          <button className="btn-sm" onClick={() => setPreset({
+            min_edge_cents: 3, min_model_pct: 0.05, skip_entry_below_cents: 1,
+            min_kelly: 0.001, max_bets_per_city_per_day: 5,
+          })}>Aggressive</button>
+          <button className="btn-sm" onClick={() => setPreset({
+            min_edge_cents: 5, min_model_pct: 0.12, skip_entry_below_cents: 5,
+            min_kelly: 0.005, max_bets_per_city_per_day: 2,
+          })}>Balanced</button>
+          <button className="btn-sm" onClick={() => setPreset({
+            min_edge_cents: 8, min_model_pct: 0.20, skip_entry_below_cents: 10,
+            min_kelly: 0.01, max_bets_per_city_per_day: 1,
+          })}>Conservative</button>
+          <button className="btn primary sm" disabled={busy || Object.keys(draft).length === 0}
+            onClick={() => apply(draft)}>
+            Apply
+          </button>
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+        {fields.map(f => {
+          const cur = v(f.key, f.def);
+          const dirty = draft[f.key] !== undefined && draft[f.key] !== (cfg[f.key] ?? f.def);
+          return (
+            <div key={f.key} style={{ display: 'grid', gridTemplateColumns: '1fr 110px', gap: 8, alignItems: 'start' }}>
+              <div>
+                <div className="label" style={{ marginBottom: 2 }}>
+                  {f.label}
+                  {dirty && <span className="warn" style={{ marginLeft: 6, fontSize: 10 }}>● modified</span>}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--fg-3)', lineHeight: 1.4 }}>{f.help}</div>
+              </div>
+              <input
+                type="number"
+                value={cur}
+                step={f.step}
+                min={f.min}
+                max={f.max}
+                onChange={e => setDraft(d => ({ ...d, [f.key]: +e.target.value }))}
+                style={{ fontSize: 13, textAlign: 'right' }}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-3)' }}>
+        Changes take effect on the next auto-trader tick. Presets reset all relevant fields; "Apply" sends only the modified fields.
+      </div>
+    </div>
+  );
+}
+
+
 function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], states = [] }) {
   // Build a lookup so each bet row can show its live "are we hitting?" status.
   // Key = city + bracket label; positions only includes open bets, so settled
@@ -1618,6 +1726,8 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
           </div>
         )}
       </div>
+
+      <AutoTradeSettings cfg={cfg} draft={draft} setDraft={setDraft} apply={apply} busy={busy} />
 
       <div className="panel">
         <div className="panel-header">
