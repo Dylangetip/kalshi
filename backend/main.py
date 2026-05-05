@@ -249,6 +249,12 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     if metar and max_so_far_f is not None:
         max_so_far_f = max(max_so_far_f, c_to_f(metar["temp_c"]))
     forecast_remainder_max_f = max(future_temps) if future_temps else None
+    # Capture the calendar date the live observations actually cover so
+    # _bet_live_status can refuse to score a bet whose target_date doesn't
+    # match. (Distinct from `targetDate` below, which is the date a NEW
+    # bet placed right now would settle against — that flips to tomorrow
+    # after the daily cutoff.)
+    data_date_local = today_str
 
     # Doc §2.1: MOS is the highest-value source; weight it accordingly.
     model_max = ensemble_model_max([
@@ -391,6 +397,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "obsCurrent": round(obs_now_f, 1) if obs_now_f is not None else round(model_max - 6, 1),
         "maxSoFarF": round(max_so_far_f, 1) if max_so_far_f is not None else None,
         "forecastRemainderMaxF": round(forecast_remainder_max_f, 1) if forecast_remainder_max_f is not None else None,
+        "dataDate": data_date_local,
         "confidence": round(0.4 + afd["score"] * 0.1, 2),
         "afdConfScore": afd["score"],
         "brackets": ladder,
@@ -784,8 +791,11 @@ def _mark_bet_to_market(
         if_lose = -size
     max_so_far = city_state.get("maxSoFarF") if city_state else None
     forecast_rem = city_state.get("forecastRemainderMaxF") if city_state else None
-    today_td = city_state.get("targetDate") if city_state else None
-    live = _bet_live_status(b, max_so_far, forecast_rem, today_target_date=today_td)
+    # Compare bet's settlement date against the date the weather data
+    # ACTUALLY covers (today in city tz), not against city_state.targetDate
+    # which can be tomorrow if we're past the daily cutoff.
+    data_date = city_state.get("dataDate") if city_state else None
+    live = _bet_live_status(b, max_so_far, forecast_rem, today_target_date=data_date)
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
@@ -797,7 +807,7 @@ def _mark_bet_to_market(
         "ifWin": if_win,
         "ifLose": if_lose,
         "liveStatus": live["status"],
-        "maxSoFarF": max_so_far if (today_td and b.get("target_date") == today_td) else None,
+        "maxSoFarF": max_so_far if (data_date and b.get("target_date") == data_date) else None,
         "degreesFromBracket": live["degreesFromBracket"],
         "targetDate": b.get("target_date"),
     }
