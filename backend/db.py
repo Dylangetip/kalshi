@@ -826,6 +826,26 @@ def insert_ml_run(
     return dict(row)
 
 
+def list_runs_by_role(role: str, limit: int = 10) -> List[Dict]:
+    """Filter ml_runs by role (champion / challenger / archived)."""
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT * FROM ml_runs WHERE role = ? AND model_path != '(not-persisted)' "
+        "ORDER BY trained_at DESC LIMIT ?",
+        (role, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_ml_run_role(run_id: int, role: str) -> None:
+    """Promote / demote a single ml_runs row. Used by champion/challenger
+    logic to track which model is live."""
+    c = _conn_or_init()
+    with _lock:
+        c.execute("UPDATE ml_runs SET role = ? WHERE id = ?", (role, run_id))
+        c.commit()
+
+
 def latest_ml_run() -> Optional[Dict]:
     """Most recent ml_runs row whose pickle was actually persisted to
     disk (i.e. won an auto-sweep or was a single-algo train). Excludes

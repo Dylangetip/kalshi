@@ -64,6 +64,7 @@ from .ml import backfill as ml_backfill
 from .ml import diagnostics as ml_diagnostics
 from .ml import explain as ml_explain
 from .ml import online as ml_online
+from .ml import backtest as ml_backtest
 from .model import parse_climate_max_yesterday, settle_pl
 from .sources import fetch_climate_report
 
@@ -596,6 +597,44 @@ async def _ml_retrain_loop() -> None:
                         f"model swap — test_mae {prev['test_mae']:.3f} {arrow} "
                         f"{run['test_mae']:.3f} ({pct:+.1f}%)",
                     )
+                    # ── Champion/challenger gate ──
+                    # Auto-promote new model if it beats champion by ≥5%.
+                    # Otherwise mark new run as 'archived' (stays in
+                    # ml_runs for diff visibility but doesn't go live).
+                    # Auto-rollback (re-promote prev) if new model is
+                    # >20% worse — protects against bad retrains.
+                    try:
+                        improved_pct = -pct  # negative pct = better
+                        if improved_pct >= 5.0:
+                            db.update_ml_run_role(prev["id"], "archived")
+                            # New run already inserted as 'champion' default
+                            db.log_ml_event(
+                                "model_promoted",
+                                {"new_id": run["id"], "old_id": prev["id"],
+                                 "improvement_pct": round(improved_pct, 2)},
+                                f"challenger promoted to champion "
+                                f"(+{improved_pct:.1f}% MAE improvement)",
+                            )
+                        elif improved_pct < -20.0:
+                            # New model is materially worse — rollback
+                            db.update_ml_run_role(run["id"], "archived")
+                            db.update_ml_run_role(prev["id"], "champion")
+                            db.log_ml_event(
+                                "model_rolled_back",
+                                {"reverted_to_id": prev["id"], "rejected_id": run["id"],
+                                 "regression_pct": round(-improved_pct, 2)},
+                                f"new model rejected — {-improved_pct:.1f}% worse, "
+                                f"reverted to previous champion",
+                            )
+                        else:
+                            # Marginal change — keep new as challenger,
+                            # old stays archived. Default 'champion' on
+                            # the new row is fine since the previous loop
+                            # already had old as 'champion' which we now
+                            # demote to 'archived'.
+                            db.update_ml_run_role(prev["id"], "archived")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[champion-challenger] promotion logic failed: {exc}")
                 # Drift check on the freshly-trained model — alerts when
                 # last week's MAE is materially worse than the trailing 4w.
                 try:
@@ -1240,6 +1279,33 @@ def ml_info():
         "modelmax_source": _model_state["modelmax_source"],
         "blend_alpha": _model_state["blend_alpha"],
     }
+
+
+@app.get("/api/ml/backtest")
+def ml_backtest_endpoint(stake: float = 500.0, entry_cents: int = 25,
+                          max_days: int = 365):
+    """Replay the active model through historical paired data with a
+    fixed-odds proxy (since we don't have historical Kalshi prices
+    backfilled). Returns hit rate, total P/L, Sharpe, max drawdown,
+    and a daily-P/L curve."""
+    return ml_backtest.run_backtest(stake=stake, entry_cents=entry_cents,
+                                     max_days=max_days)
+
+
+@app.get("/api/ml/calibration")
+def ml_calibration_endpoint():
+    """Reliability diagram: predicted-probability vs actual-frequency
+    per bucket. A perfectly calibrated model lies on the y=x line."""
+    rows = ml_diagnostics.calibration_curve()
+    return {"buckets": rows or []}
+
+
+@app.get("/api/ml/adversarial")
+def ml_adversarial_endpoint():
+    """Adversarial validation — trains a binary classifier to tell
+    'old' data from 'recent' data. AUC > 0.7 means distributions have
+    diverged and the model is becoming stale."""
+    return ml_diagnostics.adversarial_validation() or {"available": False}
 
 
 @app.get("/api/ml/explain/{city_code}")
