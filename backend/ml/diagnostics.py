@@ -14,33 +14,72 @@ from .train import FEATURE_COLUMNS_NUMERIC, TARGET_COLUMN, _build_dataframe
 
 def feature_importances() -> Optional[List[Dict]]:
     """Pull feature_importances_ off the active GBR/RF model. Linear
-    models get their absolute coefficients instead. Returns None for an
-    untrained model or types we can't introspect (e.g. stack/per-city)."""
+    models get their absolute coefficients instead. Stack models get
+    permutation importance computed on the held-out training tail.
+    Returns None for an untrained model or types we can't introspect."""
     info = ml_predict.info()
-    if not info or not info.get("model_path"):
+    if not info or not info.get("path"):
         return None
     try:
         import joblib  # type: ignore
-        payload = joblib.load(info["model_path"])
+        payload = joblib.load(info["path"])
     except Exception:  # noqa: BLE001
         return None
     model = payload.get("model")
     cols = payload.get("feature_columns") or []
+    if not cols:
+        return None
 
     importances = None
+    # Standard tree / boosted models
     if hasattr(model, "feature_importances_"):
         importances = list(model.feature_importances_)
+    # Linear models
     elif hasattr(model, "coef_"):
         try:
             importances = [abs(float(c)) for c in model.coef_]
         except Exception:  # noqa: BLE001
             importances = None
+    # Sklearn pipelines (Ridge wrapped in StandardScaler)
     elif hasattr(model, "named_steps"):
-        # Pipeline (Ridge wrapped in StandardScaler) — pull from the last step
         for step in reversed(list(model.named_steps.values())):
             if hasattr(step, "coef_"):
                 importances = [abs(float(c)) for c in step.coef_]
                 break
+    # Stack models — model is a dict {base, meta, base_order}. Use
+    # permutation importance on the entire stack predict() for true
+    # per-feature importance (slower, ~10-20s on 5k holdout rows).
+    if importances is None and isinstance(model, dict) and "base" in model and "meta" in model:
+        try:
+            from sklearn.inspection import permutation_importance  # type: ignore
+            import pandas as pd  # type: ignore
+            df = _build_dataframe()
+            if df is None or len(df) < 200:
+                return None
+            tail = df.tail(2000)
+            from .train import _featurize, TARGET_COLUMN
+            X, _ = _featurize(tail, fitted_columns=cols)
+            y = tail[TARGET_COLUMN].astype(float)
+            base_models = model["base"]
+            meta = model["meta"]
+            base_order = model.get("base_order") or list(base_models.keys())
+
+            class _StackWrapper:
+                def predict(self, X_in):
+                    base_preds = pd.DataFrame(
+                        {name: base_models[name].predict(X_in) for name in base_order},
+                        columns=base_order,
+                    )
+                    return meta.predict(base_preds)
+
+            wrapper = _StackWrapper()
+            result = permutation_importance(
+                wrapper, X, y, n_repeats=2, random_state=42, n_jobs=1
+            )
+            importances = [max(0.0, float(v)) for v in result.importances_mean]
+        except Exception as exc:  # noqa: BLE001
+            print(f"[diagnostics] stack permutation importance failed: {exc}")
+            importances = None
 
     if importances is None or not cols or len(cols) != len(importances):
         return None
