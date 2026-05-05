@@ -556,6 +556,16 @@ def _make_fit_fn(algo: str):
     """Returns fit_fn(train_df, test_df) → MAE, used by walk_forward_mae
     so we can do the full feature-pipeline for each fold without
     reimplementing it inline."""
+    # Stack winners come back as 'stack[linear+rf+gbm]' which _fit_one
+    # doesn't know about — proxy walk-forward to the best base learner
+    # (gbm-best) since stack ≈ gbm in MAE.
+    if algo.startswith("stack"):
+        algo = "gbm-best"
+    elif algo.startswith("gbm["):
+        # Specific gbm config from the gbm-best grid; rerun the grid each fold.
+        algo = "gbm-best"
+    elif algo.startswith("gbm-optuna"):
+        algo = "gbm-best"
     def fit_fn(tr_df, te_df):
         if tr_df.empty or te_df.empty:
             return None
