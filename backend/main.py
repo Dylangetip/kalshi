@@ -109,6 +109,10 @@ _auto_trade_state: Dict = {
     "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD",
                                str(float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")) * 0.05))),
     "min_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50")),
+    # Hard cap on bets per (city, target_date) to stop neighbor-bracket
+    # spam (e.g., NYC ≤77, NYC ≥77, NYC 77-78, NYC 76-77 all on the same
+    # day — they overlap and we end up betting against ourselves).
+    "max_bets_per_city_per_day": int(os.getenv("BETS_AUTO_TRADE_MAX_PER_CITY_DAY", "2")),
     # Interval is now part of mutable state — loop reads it each
     # iteration so /api/auto-trade/config can change cadence at runtime.
     "interval_seconds": int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "600")),
@@ -595,6 +599,7 @@ class AutoTradeConfigIn(BaseModel):
     max_usd: Optional[float] = Field(None, gt=0)
     min_usd: Optional[float] = Field(None, ge=0)
     interval_seconds: Optional[int] = Field(None, ge=10, le=86400)
+    max_bets_per_city_per_day: Optional[int] = Field(None, ge=1, le=20)
 
 
 @app.get("/api/auto-trade/info")
@@ -610,7 +615,7 @@ def auto_trade_config(c: AutoTradeConfigIn):
     explicit max_usd in the same request, max_usd is auto-recomputed
     as 5% of bankroll (¼-Kelly cap)."""
     for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd",
-              "interval_seconds"):
+              "interval_seconds", "max_bets_per_city_per_day"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
@@ -914,6 +919,7 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     ¼-Kelly YES bet on it. Idempotent across ticks AND restarts via
     list_bets_for_target."""
     cfg = _auto_trade_state
+    max_per_day = int(cfg.get("max_bets_per_city_per_day") or 2)
     candidates: List[tuple] = []  # (edge_cents, city, state, bracket, target)
     for city in CITIES:
         try:
@@ -925,6 +931,10 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                 continue
             existing = db.list_bets_for_target(city["code"], target)
             existing_labels = {b["bracket_label"] for b in existing}
+            # Hard per-city-per-day cap — skip the whole city once we've
+            # already opened max_per_day bets for this target_date.
+            if len(existing) >= max_per_day:
+                continue
             for bracket in state.get("brackets") or []:
                 edge_cents = int(round((bracket.get("edge") or 0) * 100))
                 if edge_cents < cfg["min_edge_cents"]:
