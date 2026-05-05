@@ -664,24 +664,25 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
     <div className="pnl-layout">
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
         {(() => {
-          // REAL equity: starting bankroll + realized P/L from settled bets +
-          // net P/L from positions whose outcome is 100% mathematically locked.
-          // Anything still uncertain (in_bracket / pending) is excluded — even
-          // a 1% chance of going the other way means we don't count it.
+          // Equity = real cash only. Starting bankroll + realized P/L from
+          // bets that have actually settled tonight (NWS Climate Report).
+          // Locked-but-unsettled positions DON'T count here — they show up
+          // separately in the "Locked profit" card as a preview of what
+          // equity becomes once those bets close.
           const baseline = 10000;
           const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
-          const lockedProfit = positions.reduce((s, p) => p.liveStatus === 'locked_win' ? s + (p.ifWin || 0) : s, 0);
-          const lockedLoss   = positions.reduce((s, p) => p.liveStatus === 'locked_loss' ? s + (p.ifLose || 0) : s, 0);
-          const lockedNet = lockedProfit + lockedLoss;
-          const real = baseline + realized + lockedNet;
+          const real = baseline + realized;
           const realRet = (real - baseline) / baseline;
           const cls = realRet > 0 ? 'pos' : (realRet < 0 ? 'neg' : '');
+          const settledCount = stats?.settled ?? 0;
           return (
             <div className="signal-card">
-              <div className="label">Equity (real)</div>
-              <div className={`big-num ${cls}`}>{fmtUSD(real)}</div>
-              <div className={`mono ${cls}`} style={{ fontSize: 11 }}>
-                {fmtSign(realRet * 100, 2)}% · ${baseline.toLocaleString()} start + ${Math.round(realized + lockedNet).toLocaleString()} locked
+              <div className="label">Equity</div>
+              <div className={`big-num ${cls || ''}`}>{fmtUSD(real)}</div>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                {settledCount > 0
+                  ? `${fmtSign(realRet * 100, 2)}% · ${settledCount} settled`
+                  : `0 settled · awaiting tonight`}
               </div>
             </div>
           );
