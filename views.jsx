@@ -663,11 +663,29 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
   return (
     <div className="pnl-layout">
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
-        <div className="signal-card">
-          <div className="label">Equity</div>
-          <div className="big-num">{fmtUSD(total)}</div>
-          <div className={`mono ${ret > 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{fmtSign(ret * 100, 2)}% · {liveHistory ? 'session' : '60d'}</div>
-        </div>
+        {(() => {
+          // REAL equity: starting bankroll + realized P/L from settled bets +
+          // net P/L from positions whose outcome is 100% mathematically locked.
+          // Anything still uncertain (in_bracket / pending) is excluded — even
+          // a 1% chance of going the other way means we don't count it.
+          const baseline = 10000;
+          const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
+          const lockedProfit = positions.reduce((s, p) => p.liveStatus === 'locked_win' ? s + (p.ifWin || 0) : s, 0);
+          const lockedLoss   = positions.reduce((s, p) => p.liveStatus === 'locked_loss' ? s + (p.ifLose || 0) : s, 0);
+          const lockedNet = lockedProfit + lockedLoss;
+          const real = baseline + realized + lockedNet;
+          const realRet = (real - baseline) / baseline;
+          const cls = realRet > 0 ? 'pos' : (realRet < 0 ? 'neg' : '');
+          return (
+            <div className="signal-card">
+              <div className="label">Equity (real)</div>
+              <div className={`big-num ${cls}`}>{fmtUSD(real)}</div>
+              <div className={`mono ${cls}`} style={{ fontSize: 11 }}>
+                {fmtSign(realRet * 100, 2)}% · ${baseline.toLocaleString()} start + ${Math.round(realized + lockedNet).toLocaleString()} locked
+              </div>
+            </div>
+          );
+        })()}
         <div className="signal-card">
           <div className="label">Win rate {stats && stats.settled > 0 && <Pill kind="pos">REAL</Pill>}</div>
           {stats && stats.settled > 0 ? (
