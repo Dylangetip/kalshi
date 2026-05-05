@@ -692,6 +692,7 @@ def _bet_live_status(
     max_so_far: Optional[float],
     forecast_remainder_max: Optional[float],
     today_target_date: Optional[str] = None,
+    market_closed: bool = False,
 ) -> Dict:
     """Decide whether the bet has already locked in a win/loss based on
     today's observed max + remaining forecast. Returns:
@@ -700,13 +701,11 @@ def _bet_live_status(
               — today's weather is irrelevant to it)
       degreesFromBracket: signed °F distance (0 if currently inside)
 
-    Conservative: only locks when mathematically certain. The rule
-    "max-temp-of-the-day only goes up" is leveraged so we can lock based
-    on max_so_far alone in two cases:
-      • max already exceeded a closed-bracket cap → locked LOSS for YES
-      • max already reached an upper-tail (≥X) floor → locked WIN for YES
-    Any other lock requires a known forecast remainder; if remainder is
-    None we report "pending" / "in_bracket" rather than guessing.
+    Locking rule: ONLY lock when the trading window has already closed
+    (`market_closed=True`). Until then we show the live progress
+    (in_bracket / pending) informationally but never declare a winner —
+    even if the math currently looks certain, late-day spikes or a
+    revised forecast could still flip the outcome.
     """
     # Don't apply today's weather to a bet whose settlement date isn't today.
     bet_target = bet.get("target_date")
@@ -724,48 +723,36 @@ def _bet_live_status(
     eff_hi = float("inf") if upper_tail else hi
     yes_side = bet["side"] == "YES"
     in_bracket_now = eff_lo <= max_so_far <= eff_hi
+    deg_below = round(eff_lo - max_so_far, 1) if (max_so_far < eff_lo and eff_lo != float("-inf")) else 0.0
+    deg_above = round(max_so_far - eff_hi, 1) if (max_so_far > eff_hi and eff_hi != float("inf")) else 0.0
+    deg = 0.0 if in_bracket_now else (deg_above if deg_above else -deg_below)
 
-    # ─── Locks that don't need forecast (max only goes up during the day) ──
-    if not upper_tail and max_so_far > eff_hi:
-        return {
-            "status": "locked_loss" if yes_side else "locked_win",
-            "degreesFromBracket": round(max_so_far - eff_hi, 1),
-        }
-    if upper_tail and max_so_far >= eff_lo:
-        return {
-            "status": "locked_win" if yes_side else "locked_loss",
-            "degreesFromBracket": 0.0,
-        }
-
-    # ─── Locks that need forecast — bail to non-locked state if missing ────
-    if forecast_remainder_max is None:
+    # If the trading window is still open, never lock — only report the
+    # current relationship to the bracket. Outcome can still flip.
+    if not market_closed:
         if in_bracket_now:
             return {"status": "in_bracket", "degreesFromBracket": 0.0}
-        deg = round(eff_lo - max_so_far, 1) if max_so_far < eff_lo else 0.0
-        return {"status": "pending", "degreesFromBracket": -deg if deg else 0.0}
+        return {"status": "pending", "degreesFromBracket": deg}
 
-    rem = forecast_remainder_max
+    # Market closed → safe to call the outcome based on the day's max.
+    rem = forecast_remainder_max if forecast_remainder_max is not None else max_so_far
     can_exceed_hi = rem > eff_hi
     will_reach_lo = max(max_so_far, rem) >= eff_lo
-
-    # Forecast says the day's peak still won't reach the floor → locked LOSS
-    if not will_reach_lo:
-        deg = round(eff_lo - max(max_so_far, rem), 1)
-        return {
-            "status": "locked_loss" if yes_side else "locked_win",
-            "degreesFromBracket": -deg,
-        }
-    # Currently inside the bracket AND forecast can't push beyond the cap → locked WIN
-    if in_bracket_now and not can_exceed_hi:
+    locked_in = in_bracket_now and not can_exceed_hi
+    locked_out = (max_so_far > eff_hi) or (not will_reach_lo)
+    if locked_in:
         return {
             "status": "locked_win" if yes_side else "locked_loss",
             "degreesFromBracket": 0.0,
+        }
+    if locked_out:
+        return {
+            "status": "locked_loss" if yes_side else "locked_win",
+            "degreesFromBracket": deg,
         }
     if in_bracket_now:
         return {"status": "in_bracket", "degreesFromBracket": 0.0}
-    # Below the bracket; forecast can still reach → pending
-    deg = round(eff_lo - max_so_far, 1) if max_so_far < eff_lo else 0.0
-    return {"status": "pending", "degreesFromBracket": -deg if deg else 0.0}
+    return {"status": "pending", "degreesFromBracket": deg}
 
 
 def _mark_bet_to_market(
@@ -791,11 +778,23 @@ def _mark_bet_to_market(
         if_lose = -size
     max_so_far = city_state.get("maxSoFarF") if city_state else None
     forecast_rem = city_state.get("forecastRemainderMaxF") if city_state else None
-    # Compare bet's settlement date against the date the weather data
-    # ACTUALLY covers (today in city tz), not against city_state.targetDate
-    # which can be tomorrow if we're past the daily cutoff.
     data_date = city_state.get("dataDate") if city_state else None
-    live = _bet_live_status(b, max_so_far, forecast_rem, today_target_date=data_date)
+    # Has the trading window already closed for this bet? (closeAt = end of
+    # day on target_date in city local tz). We only declare winners /
+    # losers after the window shuts — until then it's pending/in_bracket.
+    market_closed = False
+    close_iso = _close_at_for_bet(b)
+    if close_iso:
+        try:
+            close_dt = datetime.fromisoformat(close_iso)
+            market_closed = datetime.now(close_dt.tzinfo) >= close_dt
+        except (ValueError, TypeError):
+            pass
+    live = _bet_live_status(
+        b, max_so_far, forecast_rem,
+        today_target_date=data_date,
+        market_closed=market_closed,
+    )
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
