@@ -1042,6 +1042,70 @@ function AccuracyBlock({ title, stats }) {
   );
 }
 
+// Sub-component so its useState_v doesn't conflict with hook ordering
+// inside the parent's IIFE-rendered branches. Always shows the seeded
+// pill + "force re-seed" expander when paired ≥ 1000; otherwise the
+// initial-seed input/button row.
+function BackfillSeedRow({ data, years, setYears, busy, backfillRunning, progress, click, onMlBackfill }) {
+  const [forceShowSeed, setForceShowSeed] = useState_v(false);
+  const seeded = (data?.paired || 0) >= 1000;
+  return (
+    <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8,
+                  alignItems: 'center', flexWrap: 'wrap' }}>
+      {seeded ? (
+        <>
+          <Pill kind="pos" dot>Historical seed: {data.paired?.toLocaleString() || 0} pairs</Pill>
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+            {data.earliest_target_date} → {data.latest_target_date}
+          </span>
+          <button className="btn-sm" onClick={() => setForceShowSeed(s => !s)}>
+            {forceShowSeed ? 'cancel re-seed' : 'force re-seed'}
+          </button>
+          {forceShowSeed && (
+            <>
+              <input
+                type="number" min={1} max={20} value={years}
+                disabled={!!busy || backfillRunning}
+                onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
+                style={{ width: 60, fontSize: 13, padding: '6px 8px' }} />
+              <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
+              <button
+                className="btn primary"
+                disabled={!!busy || backfillRunning}
+                onClick={() => click('backfill', () => onMlBackfill({ years }))}>
+                {backfillRunning ? <><span className="spinner" />Re-seeding…</> :
+                 busy === 'backfill' ? <><span className="spinner" />starting…</> :
+                 `Re-seed ${years} yr${years === 1 ? '' : 's'}`}
+              </button>
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+            Initial historical seed:
+          </span>
+          <input
+            type="number" min={1} max={20} value={years}
+            disabled={!!busy || backfillRunning}
+            onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
+            style={{ width: 60, fontSize: 13, padding: '6px 8px' }}
+            title="Years of historical data to pull." />
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
+          <button
+            className="btn primary"
+            disabled={!!busy || backfillRunning}
+            onClick={() => click('backfill', () => onMlBackfill({ years }))}>
+            {backfillRunning ? <><span className="spinner" />Backfilling {progress.cities_done || 0}/5</> :
+             busy === 'backfill' ? <><span className="spinner" />starting…</> : `Pull initial ${years} yr${years === 1 ? '' : 's'}`}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+
 function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
   const [busy, setBusy] = useState_v(null);  // 'backfill' | 'train-linear' | 'train-gbm' | null
   const [busyStartedAt, setBusyStartedAt] = useState_v(null);
@@ -1219,65 +1283,9 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
 
       {banner}
 
-      {(() => {
-        // Backfill split into "Initial seed" (one-shot, disabled when
-        // sufficient data) vs "Daily refresh" (automatic, status-only).
-        const seeded = (data.paired || 0) >= 1000;
-        const lastReSeed = useState_v(false);
-        const [forceShowSeed, setForceShowSeed] = lastReSeed;
-        return (
-          <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8,
-                        alignItems: 'center', flexWrap: 'wrap' }}>
-            {seeded ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <Pill kind="pos" dot>Historical seed: {data.paired?.toLocaleString() || 0} pairs</Pill>
-                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
-                  {data.earliest_target_date} → {data.latest_target_date}
-                </span>
-                <button className="btn-sm" onClick={() => setForceShowSeed(s => !s)}>
-                  {forceShowSeed ? 'cancel re-seed' : 'force re-seed'}
-                </button>
-                {forceShowSeed && (
-                  <>
-                    <input
-                      type="number" min={1} max={20} value={years}
-                      disabled={!!busy || backfillRunning}
-                      onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
-                      style={{ width: 60, fontSize: 13, padding: '6px 8px' }} />
-                    <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
-                    <button
-                      className="btn primary"
-                      disabled={!!busy || backfillRunning}
-                      onClick={() => click('backfill', () => onMlBackfill({ years }))}>
-                      Re-seed {years} yr{years === 1 ? '' : 's'}
-                    </button>
-                  </>
-                )}
-              </div>
-            ) : (
-              <>
-                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
-                  Initial historical seed:
-                </span>
-                <input
-                  type="number" min={1} max={20} value={years}
-                  disabled={!!busy || backfillRunning}
-                  onChange={(e) => setYears(Math.max(1, Math.min(20, +e.target.value || 3)))}
-                  style={{ width: 60, fontSize: 13, padding: '6px 8px' }}
-                  title="Years of historical data to pull." />
-                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>yrs</span>
-                <button
-                  className="btn primary"
-                  disabled={!!busy || backfillRunning}
-                  onClick={() => click('backfill', () => onMlBackfill({ years }))}>
-                  {backfillRunning ? <><span className="spinner" />Backfilling {progress.cities_done || 0}/5</> :
-                   busy === 'backfill' ? <><span className="spinner" />starting…</> : `Pull initial ${years} yr${years === 1 ? '' : 's'}`}
-                </button>
-              </>
-            )}
-          </div>
-        );
-      })()}
+      <BackfillSeedRow data={data} years={years} setYears={setYears}
+        busy={busy} backfillRunning={backfillRunning}
+        progress={progress} click={click} onMlBackfill={onMlBackfill} />
       <div style={{ padding: '0 14px 14px', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <button
           className="btn success"
