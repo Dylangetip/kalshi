@@ -7,22 +7,33 @@ const { useState: useState_v, useEffect: useEffect_v, useMemo: useMemo_v, useRef
 function liveStatusReason(p, cs) {
   const max = p.maxSoFarF;
   const rem = cs?.forecastRemainderMaxF ?? null;
-  const lo = cs?.brackets?.find(b => b.label === p.bracket)?.lo;
-  const hi = cs?.brackets?.find(b => b.label === p.bracket)?.hi;
+  // Use the bet's own bracket bounds — the kalshi ladder may have rotated
+  // since the bet was placed, so cs.brackets.find() is unreliable.
+  const lo = p.bracketLo;
+  const hi = p.bracketHi;
+  const isUpperTail = (p.bracket || '').startsWith('≥');
+  const isLowerTail = (p.bracket || '').startsWith('≤');
+  const showHi = isUpperTail ? '∞' : `${hi}°`;
+  const showLo = isLowerTail ? '−∞' : `${lo}°`;
+  if (p.liveStatus === 'awaiting_settlement') {
+    if (p.marketClosed)
+      return `Market closed on ${p.targetDate}. Awaiting the NWS Climate Report to settle.`;
+    return `Bet is for ${p.targetDate}; today's weather doesn't apply yet.`;
+  }
   if (p.liveStatus === 'locked_win')
     return `The day's max is already inside ${p.bracket} and the remaining forecast peak (${rem != null ? rem.toFixed(1) + '°' : 'n/a'}) can't push it out.`;
   if (p.liveStatus === 'locked_loss') {
-    if (max != null && hi != null && max > hi)
+    if (max != null && hi != null && !isUpperTail && max > hi)
       return `Day's max already hit ${max.toFixed(1)}°, exceeding the ${hi}° cap. Bracket can't be reached.`;
     return `Both today's max (${max?.toFixed(1) ?? '—'}°) and remaining forecast peak (${rem?.toFixed(1) ?? '—'}°) fall below the bracket floor — can't reach it.`;
   }
   if (p.liveStatus === 'in_bracket')
-    return `Currently inside the bracket at ${max?.toFixed(1) ?? '—'}° but forecast remainder (${rem?.toFixed(1) ?? '—'}°) could still push beyond ${hi}°.`;
+    return `Currently inside ${p.bracket} at ${max?.toFixed(1) ?? '—'}°. Forecast remainder (${rem?.toFixed(1) ?? '—'}°) could still push beyond ${showHi}.`;
   if (p.liveStatus === 'pending') {
     if (p.degreesFromBracket == null) return 'Awaiting first observation today.';
     const need = Math.abs(p.degreesFromBracket).toFixed(1);
-    if (p.degreesFromBracket < 0) return `Need to climb +${need}° to reach the bracket floor. Forecast peak: ${rem?.toFixed(1) ?? '—'}°.`;
-    return `Day's max already ${need}° above the bracket cap.`;
+    if (p.degreesFromBracket < 0) return `Need to climb +${need}° to reach ${showLo} (bracket floor). Forecast peak: ${rem?.toFixed(1) ?? '—'}°.`;
+    return `Day's max already ${need}° above ${showHi} (bracket cap).`;
   }
   return '—';
 }
@@ -86,7 +97,12 @@ function LiveStatusCell({ position }) {
   const max = position.maxSoFarF;
   const deg = position.degreesFromBracket;
   if (status === 'awaiting_settlement') {
-    return <Pill kind="muted">awaiting · {position.targetDate || ''}</Pill>;
+    if (position.marketClosed) {
+      // Trading window closed; bet is sitting waiting on NWS Climate Report.
+      return <Pill kind="warn">needs settlement · {position.targetDate || ''}</Pill>;
+    }
+    // Bet for a future date — today's weather doesn't apply yet.
+    return <Pill kind="muted">future · {position.targetDate || ''}</Pill>;
   }
   if (status == null || max == null) {
     return <span className="mono" style={{ color: 'var(--fg-3)' }}>—</span>;

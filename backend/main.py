@@ -799,6 +799,8 @@ def _mark_bet_to_market(
         "id": f"P{b['id']}",
         "city": b["city"],
         "bracket": b["bracket_label"],
+        "bracketLo": b.get("bracket_lo"),
+        "bracketHi": b.get("bracket_hi"),
         "side": b["side"],
         "size": size,
         "entry": round(entry, 3),
@@ -809,6 +811,7 @@ def _mark_bet_to_market(
         "maxSoFarF": max_so_far if (data_date and b.get("target_date") == data_date) else None,
         "degreesFromBracket": live["degreesFromBracket"],
         "targetDate": b.get("target_date"),
+        "marketClosed": market_closed,
     }
 
 
