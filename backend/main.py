@@ -101,7 +101,7 @@ SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 # iteration so toggles take effect on the next tick (no restart needed).
 _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
-    "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "3")),
+    "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5")),
     "bankroll": float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")),
     # Default max-per-bet = 5% of bankroll (¼-Kelly cap). Recomputed
     # automatically when bankroll changes via /api/auto-trade/config
@@ -113,6 +113,19 @@ _auto_trade_state: Dict = {
     # spam (e.g., NYC ≤77, NYC ≥77, NYC 77-78, NYC 76-77 all on the same
     # day — they overlap and we end up betting against ourselves).
     "max_bets_per_city_per_day": int(os.getenv("BETS_AUTO_TRADE_MAX_PER_CITY_DAY", "2")),
+    # Quality filters — prevent garbage long-shot bets that have "edge"
+    # on paper but lose 95% of the time:
+    #   min_model_pct: refuse to buy YES below this model probability.
+    #     A 3¢ edge over a 1¢ market = model says 4% — still loses 96%
+    #     of the time. Default 12% knocks out the worst tails.
+    #   min_kelly: refuse if Kelly says we should risk less than this
+    #     fraction of bankroll (i.e., the bet isn't materially +EV).
+    #   skip_extreme_entry_cents: hard skip on entries under N cents.
+    #     These are pure variance plays — even a "right" prediction
+    #     leaves you wrong most days.
+    "min_model_pct": float(os.getenv("BETS_AUTO_TRADE_MIN_MODEL_PCT", "0.12")),
+    "min_kelly": float(os.getenv("BETS_AUTO_TRADE_MIN_KELLY", "0.005")),
+    "skip_entry_below_cents": int(os.getenv("BETS_AUTO_TRADE_SKIP_BELOW", "5")),
     # Interval is now part of mutable state — loop reads it each
     # iteration so /api/auto-trade/config can change cadence at runtime.
     "interval_seconds": int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "600")),
@@ -600,6 +613,9 @@ class AutoTradeConfigIn(BaseModel):
     min_usd: Optional[float] = Field(None, ge=0)
     interval_seconds: Optional[int] = Field(None, ge=10, le=86400)
     max_bets_per_city_per_day: Optional[int] = Field(None, ge=1, le=20)
+    min_model_pct: Optional[float] = Field(None, ge=0, le=1)
+    min_kelly: Optional[float] = Field(None, ge=0, le=1)
+    skip_entry_below_cents: Optional[int] = Field(None, ge=0, le=100)
 
 
 @app.get("/api/auto-trade/info")
@@ -615,7 +631,8 @@ def auto_trade_config(c: AutoTradeConfigIn):
     explicit max_usd in the same request, max_usd is auto-recomputed
     as 5% of bankroll (¼-Kelly cap)."""
     for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd",
-              "interval_seconds", "max_bets_per_city_per_day"):
+              "interval_seconds", "max_bets_per_city_per_day",
+              "min_model_pct", "min_kelly", "skip_entry_below_cents"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
@@ -921,29 +938,48 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     cfg = _auto_trade_state
     max_per_day = int(cfg.get("max_bets_per_city_per_day") or 2)
     candidates: List[tuple] = []  # (edge_cents, city, state, bracket, target)
-    for city in CITIES:
-        try:
-            state = await _build_state_cached(city, client)
-            if state is None:
+
+    # Probe cities in parallel; one slow upstream shouldn't stall the
+    # whole tick. asyncio.gather with return_exceptions so a single
+    # failure is logged, not propagated.
+    results = await asyncio.gather(
+        *[_build_state_cached(c, client) for c in CITIES],
+        return_exceptions=True,
+    )
+    for city, state in zip(CITIES, results):
+        if isinstance(state, Exception):
+            print(f"[auto-trader] probe error on {city['code']}: {state}")
+            continue
+        if state is None:
+            continue
+        target = state.get("targetDate")
+        if target is None:
+            continue
+        existing = db.list_bets_for_target(city["code"], target)
+        existing_labels = {b["bracket_label"] for b in existing}
+        # Hard per-city-per-day cap — skip the whole city once we've
+        # already opened max_per_day bets for this target_date.
+        if len(existing) >= max_per_day:
+            continue
+        for bracket in state.get("brackets") or []:
+            edge_cents = int(round((bracket.get("edge") or 0) * 100))
+            if edge_cents < cfg["min_edge_cents"]:
                 continue
-            target = state.get("targetDate")
-            if target is None:
+            if bracket.get("label") in existing_labels:
                 continue
-            existing = db.list_bets_for_target(city["code"], target)
-            existing_labels = {b["bracket_label"] for b in existing}
-            # Hard per-city-per-day cap — skip the whole city once we've
-            # already opened max_per_day bets for this target_date.
-            if len(existing) >= max_per_day:
+            # Quality gate — drop garbage long-shots even when they
+            # show "edge" because a small probability error compounds
+            # into a near-guaranteed loss when entry is tiny.
+            model_pct = bracket.get("modelPct") or 0
+            yes_cents = bracket.get("yesPrice") or 0
+            if model_pct < cfg.get("min_model_pct", 0.12):
                 continue
-            for bracket in state.get("brackets") or []:
-                edge_cents = int(round((bracket.get("edge") or 0) * 100))
-                if edge_cents < cfg["min_edge_cents"]:
-                    continue
-                if bracket.get("label") in existing_labels:
-                    continue
-                candidates.append((edge_cents, city, state, bracket, target))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[auto-trader] probe error on {city['code']}: {exc}")
+            if yes_cents < cfg.get("skip_entry_below_cents", 5):
+                continue
+            k = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
+            if k < cfg.get("min_kelly", 0.005):
+                continue
+            candidates.append((edge_cents, city, state, bracket, target))
 
     # Rolling bank-account math: starting_cash + realized_pl − open stakes.
     # Money leaves the account when a bet is placed and returns + profit
