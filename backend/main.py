@@ -132,21 +132,21 @@ _auto_trade_state: Dict = {
     "min_kelly": float(os.getenv("BETS_AUTO_TRADE_MIN_KELLY", "0.005")),
     "skip_entry_below_cents": int(os.getenv("BETS_AUTO_TRADE_SKIP_BELOW", "5")),
     # Bet-sizing strategy:
-    #   "kelly" (default) — size = round(kelly_fraction * available_cash),
-    #            clamped to [min_usd, max_usd]. Smooth and theoretically
-    #            optimal for repeated independent bets, but harder to reason
-    #            about because the dollar amount changes by edge ¢ AND price.
-    #   "tiers" — bucket the edge into discrete confidence tiers, each with
-    #            a fixed dollar size. Easier to predict — a 5¢ edge always
-    #            stakes the same amount. Tiers are evaluated highest-edge
-    #            first and the first match wins. Edges below all thresholds
-    #            fall through to the kelly path (still capped by max_usd).
+    #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
+    #             [min_usd, max_usd]. Theoretically optimal but the dollar
+    #             amount jumps around with edge ¢ AND price.
+    #   "tiers" (default) — bucket the edge into confidence tiers, each
+    #             specifying a PERCENT of account equity to stake. Stakes
+    #             scale fluidly as the account grows or shrinks. Highest
+    #             min-edge match wins; below-threshold falls through to
+    #             kelly. Final stake is always clamped to available cash
+    #             and [min_usd, max_usd].
     "bet_sizing_mode": os.getenv("BETS_AUTO_TRADE_SIZING", "tiers"),
     "size_tiers": [
-        {"min_edge_cents": 12, "size_usd": 1000},
-        {"min_edge_cents": 8,  "size_usd": 750},
-        {"min_edge_cents": 5,  "size_usd": 500},
-        {"min_edge_cents": 3,  "size_usd": 250},
+        {"min_edge_cents": 12, "pct_of_balance": 0.10},   # 10% of equity
+        {"min_edge_cents": 8,  "pct_of_balance": 0.075},  # 7.5%
+        {"min_edge_cents": 5,  "pct_of_balance": 0.05},   # 5%
+        {"min_edge_cents": 3,  "pct_of_balance": 0.025},  # 2.5%
     ],
     # Interval is now part of mutable state — loop reads it each
     # iteration so /api/auto-trade/config can change cadence at runtime.
@@ -792,7 +792,10 @@ async def _shutdown() -> None:
 
 class SizeTierIn(BaseModel):
     min_edge_cents: float = Field(..., ge=0, le=100)
-    size_usd: float = Field(..., ge=0)
+    # Either a percent of account equity (preferred — scales with balance)
+    # or a fixed dollar amount (legacy override). At least one must be set.
+    pct_of_balance: Optional[float] = Field(None, ge=0, le=1)
+    size_usd: Optional[float] = Field(None, ge=0)
 
 
 class AutoTradeConfigIn(BaseModel):
@@ -831,11 +834,15 @@ def auto_trade_config(c: AutoTradeConfigIn):
             _auto_trade_state[k] = v
     if c.size_tiers is not None:
         # Persist as plain dicts (Pydantic models would JSON-roundtrip but
-        # the rest of the code reads with dict.get).
-        _auto_trade_state["size_tiers"] = [
-            {"min_edge_cents": t.min_edge_cents, "size_usd": t.size_usd}
-            for t in c.size_tiers
-        ]
+        # the rest of the code reads with dict.get). Drop unset fields so
+        # the size_for_bet preference order (pct → usd → fallback) works.
+        out = []
+        for t in c.size_tiers:
+            row = {"min_edge_cents": t.min_edge_cents}
+            if t.pct_of_balance is not None: row["pct_of_balance"] = t.pct_of_balance
+            if t.size_usd is not None:       row["size_usd"]       = t.size_usd
+            out.append(row)
+        _auto_trade_state["size_tiers"] = out
     if c.bankroll is not None and c.max_usd is None:
         _auto_trade_state["max_usd"] = round(_auto_trade_state["bankroll"] * 0.05, 2)
     return {**_auto_trade_state}
@@ -1160,13 +1167,24 @@ async def _settlement_loop() -> None:
         await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
 
 
-def _size_for_bet(cfg: Dict, edge_cents: float, kelly: float, available_cash: float) -> int:
-    """Pick the dollar stake for a bet. Returns 0 if cfg blocks placement
-    (below min_usd, above caps, etc.). Honors cfg['bet_sizing_mode']:
+def _size_for_bet(
+    cfg: Dict,
+    edge_cents: float,
+    kelly: float,
+    available_cash: float,
+    total_equity: Optional[float] = None,
+) -> int:
+    """Pick the dollar stake for a bet. Returns 0 if cfg blocks placement.
 
-      - 'tiers': scan size_tiers (highest min_edge_cents first), the first
-                 tier whose threshold is satisfied sets the stake. Falls
-                 through to kelly if nothing matches (small edge).
+    Honors cfg['bet_sizing_mode']:
+
+      - 'tiers': scan size_tiers (highest min_edge_cents first); the first
+                 matching tier picks the stake. Tier defines the stake as a
+                 PERCENT of total_equity (pct_of_balance), so the dollar
+                 amount scales fluidly as the account grows or shrinks.
+                 (Legacy size_usd field still honored if present, treated
+                 as a fixed dollar override on that tier.)
+                 Falls through to kelly if nothing matches.
       - 'kelly' (or anything else): kelly_fraction × available_cash.
 
     The result is always clamped to [min_usd, min(max_usd, available_cash)].
@@ -1174,19 +1192,28 @@ def _size_for_bet(cfg: Dict, edge_cents: float, kelly: float, available_cash: fl
     min_usd = float(cfg.get("min_usd") or 0)
     max_usd = float(cfg.get("max_usd") or available_cash)
     cap = max(0.0, min(max_usd, available_cash))
+    # Default total_equity to available_cash if the caller didn't supply
+    # the headline-equity number — keeps unit tests / older callers working.
+    equity = float(total_equity) if total_equity is not None else float(available_cash)
     raw = 0.0
     mode = (cfg.get("bet_sizing_mode") or "kelly").lower()
     if mode == "tiers":
         tiers = sorted(
-            [t for t in (cfg.get("size_tiers") or []) if t.get("size_usd") is not None],
+            cfg.get("size_tiers") or [],
             key=lambda t: -float(t.get("min_edge_cents") or 0),
         )
         for tier in tiers:
             if edge_cents >= float(tier.get("min_edge_cents") or 0):
-                raw = float(tier.get("size_usd") or 0)
+                # Prefer a percent-of-balance spec; fall back to an
+                # explicit dollar amount for back-compat with old tiers.
+                pct = tier.get("pct_of_balance")
+                if pct is not None:
+                    raw = float(pct) * equity
+                elif tier.get("size_usd") is not None:
+                    raw = float(tier["size_usd"])
                 break
-        # No tier matched (edge too small) — fall through to kelly so we
-        # still scale gracefully near the threshold.
+        # No tier matched — fall through to kelly so we still scale
+        # gracefully near the lowest threshold.
         if raw <= 0:
             raw = kelly * available_cash
     else:
@@ -1255,8 +1282,10 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     # when it wins. We sit out a tick if available cash is below min_usd.
     stats = db.stats_summary()
     starting_cash = float(cfg.get("bankroll") or 10000)
-    available_cash = starting_cash + stats["realizedPl"] - stats["openStakes"]
+    total_equity = starting_cash + stats["realizedPl"]            # bank-account "balance"
+    available_cash = total_equity - stats["openStakes"]           # deployable right now
     cfg["available_cash"] = round(available_cash, 2)
+    cfg["total_equity"] = round(total_equity, 2)
     cfg["realized_pl"] = stats["realizedPl"]
     cfg["open_stakes"] = stats["openStakes"]
 
@@ -1266,7 +1295,7 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
         edge_cents, city, state, bracket, target = candidates[0]
         # Kelly off the LIVE bankroll (available cash), not the static config
         kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
-        size = _size_for_bet(cfg, edge_cents, kelly, available_cash)
+        size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
         if size >= cfg["min_usd"]:
             try:
                 row = db.insert_bet(

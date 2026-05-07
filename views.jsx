@@ -2501,6 +2501,12 @@ function BetSizingPanel({ info, onSetConfig }) {
   const liveTiers = info?.size_tiers || [];
   const liveMin = info?.min_usd ?? 50;
   const liveMax = info?.max_usd ?? 500;
+  // Total account equity from the most recent auto-trader tick. The
+  // first time the loop runs it populates total_equity / realized_pl;
+  // before that, fall back to the seed bankroll so the preview still
+  // shows reasonable numbers.
+  const liveEquity = (info?.total_equity)
+    ?? ((info?.bankroll ?? 10000) + (info?.realized_pl ?? 0));
 
   const [mode, setMode] = useState_v(null);
   const [tiers, setTiers] = useState_v(null);
@@ -2523,7 +2529,7 @@ function BetSizingPanel({ info, onSetConfig }) {
     setTiers((tiers ?? liveTiers).map((t, j) => j === i ? { ...t, ...patch } : t));
   };
   const addTier = () => {
-    const next = [...(tiers ?? liveTiers), { min_edge_cents: 0, size_usd: 100 }];
+    const next = [...(tiers ?? liveTiers), { min_edge_cents: 0, pct_of_balance: 0.01 }];
     setTiers(next);
   };
   const removeTier = (i) => {
@@ -2531,10 +2537,10 @@ function BetSizingPanel({ info, onSetConfig }) {
   };
   const reset = () => {
     setTiers([
-      { min_edge_cents: 12, size_usd: 1000 },
-      { min_edge_cents: 8,  size_usd: 750 },
-      { min_edge_cents: 5,  size_usd: 500 },
-      { min_edge_cents: 3,  size_usd: 250 },
+      { min_edge_cents: 12, pct_of_balance: 0.10 },
+      { min_edge_cents: 8,  pct_of_balance: 0.075 },
+      { min_edge_cents: 5,  pct_of_balance: 0.05 },
+      { min_edge_cents: 3,  pct_of_balance: 0.025 },
     ]);
   };
 
@@ -2546,10 +2552,17 @@ function BetSizingPanel({ info, onSetConfig }) {
       const sortedTiers = [...curTiers].sort((a, b) => +b.min_edge_cents - +a.min_edge_cents);
       const patch = {
         bet_sizing_mode: curMode,
-        size_tiers: sortedTiers.map(t => ({
-          min_edge_cents: +t.min_edge_cents,
-          size_usd: +t.size_usd,
-        })),
+        size_tiers: sortedTiers.map(t => {
+          const row = { min_edge_cents: +t.min_edge_cents };
+          // Prefer percent-of-balance; only emit size_usd for legacy
+          // overrides where the user explicitly typed a dollar amount.
+          if (t.pct_of_balance != null && t.pct_of_balance !== '') {
+            row.pct_of_balance = +t.pct_of_balance;
+          } else if (t.size_usd != null && t.size_usd !== '') {
+            row.size_usd = +t.size_usd;
+          }
+          return row;
+        }),
       };
       if (curMin !== liveMin) patch.min_usd = +curMin;
       if (curMax !== liveMax) patch.max_usd = +curMax;
@@ -2591,13 +2604,14 @@ function BetSizingPanel({ info, onSetConfig }) {
         {curMode === 'tiers' && (
           <div>
             <div className="label" style={{ marginBottom: 6 }}>
-              Confidence tiers — first matching tier (highest min-edge ≤ candidate edge) wins
+              Confidence tiers — stake = <span className="mono">% of account equity</span>, scales with balance
             </div>
             <table className="tbl" style={{ marginBottom: 8 }}>
               <thead>
                 <tr>
                   <th>Min edge (¢)</th>
-                  <th>Stake ($)</th>
+                  <th>% of balance</th>
+                  <th>Preview at {fmtUSD(liveEquity)}</th>
                   <th></th>
                 </tr>
               </thead>
@@ -2605,31 +2619,47 @@ function BetSizingPanel({ info, onSetConfig }) {
                 {[...curTiers]
                   .map((t, i) => ({ ...t, _i: i }))
                   .sort((a, b) => +b.min_edge_cents - +a.min_edge_cents)
-                  .map(t => (
-                    <tr key={t._i}>
-                      <td>
-                        <input
-                          type="number"
-                          min={0} max={100} step={0.5}
-                          value={t.min_edge_cents}
-                          onChange={e => updateTier(t._i, { min_edge_cents: e.target.value })}
-                          style={{ width: 80, background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="number"
-                          min={0} step={50}
-                          value={t.size_usd}
-                          onChange={e => updateTier(t._i, { size_usd: e.target.value })}
-                          style={{ width: 100, background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
-                        />
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <button className="btn-sm" onClick={() => removeTier(t._i)}>remove</button>
-                      </td>
-                    </tr>
-                  ))}
+                  .map(t => {
+                    const pct = t.pct_of_balance != null && t.pct_of_balance !== '' ? +t.pct_of_balance : null;
+                    const fixed = t.size_usd != null && t.size_usd !== '' ? +t.size_usd : null;
+                    const preview = pct != null ? Math.round(pct * liveEquity) : (fixed ?? 0);
+                    return (
+                      <tr key={t._i}>
+                        <td>
+                          <input
+                            type="number"
+                            min={0} max={100} step={0.5}
+                            value={t.min_edge_cents}
+                            onChange={e => updateTier(t._i, { min_edge_cents: e.target.value })}
+                            style={{ width: 80, background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
+                          />
+                        </td>
+                        <td>
+                          <input
+                            type="number"
+                            min={0} max={100} step={0.5}
+                            value={pct != null ? +(pct * 100).toFixed(2) : ''}
+                            placeholder={fixed != null ? `(${fmtUSD(fixed)})` : ''}
+                            onChange={e => {
+                              const v = e.target.value;
+                              updateTier(t._i, {
+                                pct_of_balance: v === '' ? null : +v / 100,
+                                size_usd: null,
+                              });
+                            }}
+                            style={{ width: 90, background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
+                          />
+                          <span style={{ marginLeft: 4, color: 'var(--fg-3)', fontSize: 11 }}>%</span>
+                        </td>
+                        <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                          {fmtUSD(preview)}
+                        </td>
+                        <td style={{ textAlign: 'right' }}>
+                          <button className="btn-sm" onClick={() => removeTier(t._i)}>remove</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
             <div style={{ display: 'flex', gap: 6 }}>
@@ -2637,7 +2667,7 @@ function BetSizingPanel({ info, onSetConfig }) {
               <button className="btn-sm" onClick={reset}>reset defaults</button>
             </div>
             <div style={{ fontSize: 11, color: 'var(--fg-3)', marginTop: 8, lineHeight: 1.5 }}>
-              Edges below every threshold fall through to Kelly sizing (still capped by max stake). Tiers are sorted highest-first on save.
+              Stake = (% of balance) × current account equity. As your balance grows, every tier's bet size grows with it. Edges below every threshold fall through to Kelly sizing. Final stake is always clamped to deployable cash and the min/max stake below.
             </div>
           </div>
         )}
