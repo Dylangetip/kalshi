@@ -149,6 +149,11 @@ _ml_incremental_backfill_task: Optional[asyncio.Task] = None
 # ML retraining loop. Default daily so the model keeps absorbing newly-
 # settled days as the historical_actuals table grows.
 ML_RETRAIN_INTERVAL_SECONDS = int(os.getenv("BETS_ML_RETRAIN_INTERVAL", "86400"))
+# Wait this many seconds after process startup before the first retrain
+# fires. The training itself runs in a thread (asyncio.to_thread) so it
+# doesn't block HTTP, but we still defer the first sweep so the server
+# is responsive immediately after boot.
+ML_RETRAIN_INITIAL_DELAY_SECONDS = int(os.getenv("BETS_ML_RETRAIN_INITIAL_DELAY", "60"))
 ML_RETRAIN_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_RETRAIN_LOOP") == "1"
 
 # Incremental-backfill loop: every ML_BACKFILL_INTERVAL_SECONDS, pull
@@ -551,6 +556,10 @@ async def _ml_retrain_loop() -> None:
     configurations on that data."""
     last_paired_count = db.count_paired_total()
     while True:
+        # Defer the first sweep so uvicorn lifespan startup can finish
+        # before we monopolize CPU. Subsequent iterations sleep at the
+        # bottom of the loop on the configured interval.
+        await asyncio.sleep(ML_RETRAIN_INITIAL_DELAY_SECONDS)
         # Data-driven trigger: also fire if at least 50 new paired rows
         # have arrived since the last retrain. Logged with `trigger`
         # field in the start event so the activity feed shows why.
@@ -564,7 +573,9 @@ async def _ml_retrain_loop() -> None:
                 f"retrain started — trigger={trigger}, n_paired={cur_paired:,}",
             )
             prev = db.latest_ml_run()
-            run = ml_train.train(algorithm="auto")
+            # Training is sync and CPU-bound (sklearn). Run it in a thread
+            # so the event loop stays free for HTTP traffic.
+            run = await asyncio.to_thread(ml_train.train, algorithm="auto")
             if run.get("error"):
                 print(f"[ml-retrain] auto skipped: {run['error']}")
                 db.log_ml_event(
@@ -638,7 +649,7 @@ async def _ml_retrain_loop() -> None:
                 # Drift check on the freshly-trained model — alerts when
                 # last week's MAE is materially worse than the trailing 4w.
                 try:
-                    drift = ml_diagnostics.drift_check()
+                    drift = await asyncio.to_thread(ml_diagnostics.drift_check)
                     if drift.get("drifting"):
                         db.log_ml_event(
                             "drift_alert",
@@ -654,7 +665,9 @@ async def _ml_retrain_loop() -> None:
             print(f"[ml-retrain] error: {exc}")
             db.log_ml_event("retrain_done", {"error": str(exc)},
                             f"retrain error: {exc}")
-        await asyncio.sleep(ML_RETRAIN_INTERVAL_SECONDS)
+        # Subsequent cadence — wait a full interval before the next
+        # sweep. (First-iteration delay is at the top of the loop.)
+        await asyncio.sleep(max(0, ML_RETRAIN_INTERVAL_SECONDS - ML_RETRAIN_INITIAL_DELAY_SECONDS))
 
 
 async def _ml_incremental_backfill_loop() -> None:
