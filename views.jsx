@@ -659,7 +659,7 @@ function SignalsView({ signals, state }) {
 }
 
 // ====== P&L ======
-function PnLView({ history, positions, closedPositions = [], states = [], liveHistory = false, stats = null }) {
+function PnLView({ history, positions, closedPositions = [], states = [], liveHistory = false, stats = null, autoInfo = null }) {
   const stateByCity = React.useMemo(() => {
     const m = {};
     for (const s of states || []) if (s?.city?.code) m[s.city.code] = s;
@@ -687,8 +687,12 @@ function PnLView({ history, positions, closedPositions = [], states = [], liveHi
           // headline number is total equity (starting cash + realized P/L)
           // — your true net worth in the system. Open stakes are still
           // "yours" (just locked until settlement), so they're shown in the
-          // subtitle along with deployable cash.
-          const baseline = 10000;
+          // subtitle along with deployable cash. Reads the bankroll seed
+          // from /api/auto-trade/info so the UI stays consistent with what
+          // the auto-trader actually uses for sizing math.
+          const baseline = (autoInfo && typeof autoInfo.bankroll === 'number')
+            ? autoInfo.bankroll
+            : 10000;
           const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
           const openStakes = (stats && typeof stats.openStakes === 'number') ? stats.openStakes : 0;
           const totalEquity = baseline + realized;        // settled net worth

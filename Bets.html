@@ -308,7 +308,7 @@ function App() {
           {tab === 'dashboard' && <DashboardView state={focus} history={effectiveHistory} />}
           {tab === 'terminal' && <TerminalView state={focus} onPlaceBet={placeBet} betLog={betLog} />}
           {tab === 'signals' && <SignalsView signals={signals} state={focus} />}
-          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} closedPositions={closedPositions} states={states} liveHistory={liveHistory != null} stats={liveStats} />}
+          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} closedPositions={closedPositions} states={states} liveHistory={liveHistory != null} stats={liveStats} autoInfo={autoInfo} />}
           {tab === 'auto' && (
             <AutoTradeView
               info={autoInfo}
