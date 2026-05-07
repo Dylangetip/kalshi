@@ -344,6 +344,12 @@ function App() {
                 if (r) setMlInfo(await MOCK.fetchMlInfo());
                 return r;
               }}
+              onModelConfig={async () => {
+                // Re-fetch mlInfo so the "Active prediction model" panel
+                // reflects the swap immediately after Apply.
+                const fresh = await MOCK.fetchMlInfo();
+                if (fresh) setMlInfo(fresh);
+              }}
             />
           )}
         </div>

@@ -1463,34 +1463,53 @@ function MlTrainingPanel({ mlInfo, onMlBackfill, onMlTrain }) {
 
 // ── Model source picker — choose which prediction drives the auto-trader
 // edge calculations and the bracket-probability ladder.
-function ModelSourcePanel({ mlInfo }) {
+function ModelSourcePanel({ mlInfo, onModelConfig }) {
   const [busy, setBusy] = useState_v(false);
   const [src, setSrc] = useState_v(null);
   const [alpha, setAlpha] = useState_v(null);
-  const liveSrc = mlInfo?.modelmax_source || 'auto';
-  const liveAlpha = mlInfo?.blend_alpha ?? 0.7;
+  // Optimistic override: after Apply succeeds we hold the new value here
+  // until the next /api/ml/info poll catches up, so the UI doesn't flash
+  // back to the previous active source for ~60s.
+  const [appliedSrc, setAppliedSrc] = useState_v(null);
+  const [appliedAlpha, setAppliedAlpha] = useState_v(null);
+  const liveSrc = appliedSrc ?? mlInfo?.modelmax_source ?? 'auto';
+  const liveAlpha = appliedAlpha ?? mlInfo?.blend_alpha ?? 0.7;
   const curSrc = src ?? liveSrc;
   const curAlpha = alpha ?? liveAlpha;
   const dirty = curSrc !== liveSrc || curAlpha !== liveAlpha;
 
+  // Once mlInfo catches up to our optimistic override, drop the override
+  // so future server-side changes (e.g. from another tab) flow through.
+  React.useEffect(() => {
+    if (appliedSrc != null && mlInfo?.modelmax_source === appliedSrc) setAppliedSrc(null);
+    if (appliedAlpha != null && mlInfo?.blend_alpha === appliedAlpha) setAppliedAlpha(null);
+  }, [mlInfo, appliedSrc, appliedAlpha]);
+
   const apply = async () => {
     setBusy(true);
     try {
-      await fetch((window.__BETS_API__ || '') + '/api/model/config', {
+      const r = await fetch((window.__BETS_API__ || '') + '/api/model/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ modelmax_source: curSrc, blend_alpha: curAlpha }),
       });
+      const body = r.ok ? await r.json().catch(() => null) : null;
+      setAppliedSrc(body?.modelmax_source ?? curSrc);
+      setAppliedAlpha(body?.blend_alpha ?? curAlpha);
       setSrc(null); setAlpha(null);
+      // Trigger a parent refresh so other panels (ml info, accuracy) reflect
+      // the swap and so the optimistic override clears as soon as possible.
+      if (onModelConfig) onModelConfig();
     } finally { setBusy(false); }
   };
 
   const sources = [
-    { key: 'auto',     label: 'Auto',     desc: 'Use the blend if the ML model is trained, otherwise fall back to the ensemble. Safest default.' },
-    { key: 'ml',       label: 'ML only',  desc: 'Pure trained scikit-learn model. Best raw accuracy on holdout (~0.95°F MAE) but doesn\'t see live MOS data.' },
+    { key: 'auto',     label: 'Auto',     desc: 'Use the blend if ML is trained, else fall back to the ensemble. Safest default.' },
+    { key: 'ml',       label: 'ML only',  desc: 'Pure trained scikit-learn model. Best raw accuracy on holdout but doesn\'t see live MOS data.' },
     { key: 'blend',    label: 'Blend',    desc: 'α · ML + (1−α) · Ensemble. Captures both the trained model and the live MOS signal.' },
     { key: 'ensemble', label: 'Ensemble', desc: 'Naive weighted average of MOS / NWS / ECMWF / Open-Meteo. Disables ML entirely.' },
   ];
+  const curSource = sources.find(s => s.key === curSrc) || sources[0];
 
   return (
     <div className="panel">
@@ -1505,26 +1524,29 @@ function ModelSourcePanel({ mlInfo }) {
           </button>
         </span>
       </div>
-      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10 }}>
-        {sources.map(s => (
-          <label key={s.key} style={{
-            display: 'flex', gap: 10, padding: 10, border: '1px solid var(--border)', borderRadius: 4,
-            background: curSrc === s.key ? 'var(--bg-2)' : 'transparent', cursor: 'pointer',
-          }}>
-            <input
-              type="radio"
-              name="modelmax_source"
-              value={s.key}
-              checked={curSrc === s.key}
-              onChange={() => setSrc(s.key)}
-              style={{ marginTop: 2 }}
-            />
-            <div>
-              <div className="label" style={{ marginBottom: 2 }}>{s.label}</div>
-              <div style={{ fontSize: 11, color: 'var(--fg-3)', lineHeight: 1.4 }}>{s.desc}</div>
-            </div>
-          </label>
-        ))}
+      <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span className="label" style={{ minWidth: 70 }}>Source</span>
+          <select
+            value={curSrc}
+            onChange={e => setSrc(e.target.value)}
+            style={{
+              background: 'var(--bg-2)', color: 'var(--fg-1)',
+              border: '1px solid var(--border)', borderRadius: 4,
+              padding: '4px 8px', fontSize: 13, minWidth: 160,
+            }}
+          >
+            {sources.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+          {curSrc !== liveSrc && (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--accent)' }}>
+              unsaved — Apply to switch
+            </span>
+          )}
+        </label>
+        <div style={{ fontSize: 11, color: 'var(--fg-3)', lineHeight: 1.4, paddingLeft: 80 }}>
+          {curSource.desc}
+        </div>
       </div>
       {(curSrc === 'blend' || curSrc === 'auto') && (
         <div style={{ padding: '0 14px 14px' }}>
@@ -1541,7 +1563,7 @@ function ModelSourcePanel({ mlInfo }) {
             style={{ width: '100%' }}
           />
           <div style={{ fontSize: 11, color: 'var(--fg-3)', marginTop: 4 }}>
-            Higher α = more weight on the trained ML model. Lower α = more weight on the live ensemble (which has access to MOS data the ML didn\'t train on). 0.7 is a sensible default.
+            Higher α = more weight on the trained ML model. Lower α = more weight on the live ensemble. 0.7 is a sensible default.
           </div>
         </div>
       )}
@@ -1969,7 +1991,7 @@ function MlDataFreshnessBadge({ mlInfo, events }) {
 }
 
 
-function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill, onMlTrain }) {
+function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill, onMlTrain, onModelConfig }) {
   return (
     <div className="pnl-layout">
       <MlDataFreshnessBadge mlInfo={mlInfo} events={events} />
@@ -1978,7 +2000,7 @@ function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill
 
       <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
 
-      <ModelSourcePanel mlInfo={mlInfo} />
+      <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
 
       <MlModelDiffPanel modelDiff={modelDiff} />
 
