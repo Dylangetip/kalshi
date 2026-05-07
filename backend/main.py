@@ -108,11 +108,16 @@ _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
     "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5")),
     "bankroll": float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")),
-    # Default max-per-bet = 5% of bankroll (¼-Kelly cap). Recomputed
-    # automatically when bankroll changes via /api/auto-trade/config
-    # unless the user explicitly sets max_usd in the same request.
-    "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD",
-                               str(float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")) * 0.05))),
+    # Hard caps on a single bet. Two modes — set either or both:
+    #   max_pct_of_balance: fluid cap as a fraction of total equity. The
+    #     auto-trader recomputes the dollar value each tick, so it tracks
+    #     the live account balance. Default 12% (just above the highest
+    #     tier so tiers can play out).
+    #   max_usd: absolute dollar ceiling. Used as a safety belt on top of
+    #     the percent cap — whichever is SMALLER binds. Set to a very
+    #     large number to effectively disable.
+    "max_pct_of_balance": float(os.getenv("BETS_AUTO_TRADE_MAX_PCT", "0.12")),
+    "max_usd": float(os.getenv("BETS_AUTO_TRADE_MAX_USD", "10000")),
     "min_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_USD", "50")),
     # Hard cap on bets per (city, target_date) to stop neighbor-bracket
     # spam (e.g., NYC ≤77, NYC ≥77, NYC 77-78, NYC 76-77 all on the same
@@ -803,6 +808,7 @@ class AutoTradeConfigIn(BaseModel):
     min_edge_cents: Optional[int] = Field(None, ge=0, le=100)
     bankroll: Optional[float] = Field(None, gt=0)
     max_usd: Optional[float] = Field(None, gt=0)
+    max_pct_of_balance: Optional[float] = Field(None, ge=0, le=1)
     min_usd: Optional[float] = Field(None, ge=0)
     interval_seconds: Optional[int] = Field(None, ge=10, le=86400)
     max_bets_per_city_per_day: Optional[int] = Field(None, ge=1, le=20)
@@ -825,7 +831,8 @@ def auto_trade_config(c: AutoTradeConfigIn):
     loop tick (no restart needed). When bankroll is changed without an
     explicit max_usd in the same request, max_usd is auto-recomputed
     as 5% of bankroll (¼-Kelly cap)."""
-    for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd",
+    for k in ("enabled", "min_edge_cents", "bankroll", "max_usd",
+              "max_pct_of_balance", "min_usd",
               "interval_seconds", "max_bets_per_city_per_day",
               "min_model_pct", "min_kelly", "skip_entry_below_cents",
               "bet_sizing_mode"):
@@ -1190,8 +1197,15 @@ def _size_for_bet(
     The result is always clamped to [min_usd, min(max_usd, available_cash)].
     """
     min_usd = float(cfg.get("min_usd") or 0)
-    max_usd = float(cfg.get("max_usd") or available_cash)
-    cap = max(0.0, min(max_usd, available_cash))
+    # Effective max = min(absolute $ cap, percent-of-equity cap, available
+    # cash). The percent cap auto-scales with balance; the absolute cap is
+    # a safety belt; available cash is the unconditional ceiling (we can't
+    # bet money that's already in flight).
+    abs_max = float(cfg.get("max_usd") or available_cash)
+    pct_cap = cfg.get("max_pct_of_balance")
+    pct_max = float(pct_cap) * (float(total_equity) if total_equity is not None else available_cash) \
+              if pct_cap is not None else abs_max
+    cap = max(0.0, min(abs_max, pct_max, available_cash))
     # Default total_equity to available_cash if the caller didn't supply
     # the headline-equity number — keeps unit tests / older callers working.
     equity = float(total_equity) if total_equity is not None else float(available_cash)

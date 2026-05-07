@@ -2500,7 +2500,8 @@ function BetSizingPanel({ info, onSetConfig }) {
   const liveMode = info?.bet_sizing_mode || 'tiers';
   const liveTiers = info?.size_tiers || [];
   const liveMin = info?.min_usd ?? 50;
-  const liveMax = info?.max_usd ?? 500;
+  const liveMax = info?.max_usd ?? 10000;
+  const liveMaxPct = info?.max_pct_of_balance ?? 0.12;
   // Total account equity from the most recent auto-trader tick. The
   // first time the loop runs it populates total_equity / realized_pl;
   // before that, fall back to the seed bankroll so the preview still
@@ -2512,17 +2513,20 @@ function BetSizingPanel({ info, onSetConfig }) {
   const [tiers, setTiers] = useState_v(null);
   const [minUsd, setMinUsd] = useState_v(null);
   const [maxUsd, setMaxUsd] = useState_v(null);
+  const [maxPct, setMaxPct] = useState_v(null);
   const [busy, setBusy] = useState_v(false);
 
   const curMode = mode ?? liveMode;
   const curTiers = tiers ?? liveTiers;
   const curMin = minUsd ?? liveMin;
   const curMax = maxUsd ?? liveMax;
+  const curMaxPct = maxPct ?? liveMaxPct;
   const dirty = (
     curMode !== liveMode ||
     JSON.stringify(curTiers) !== JSON.stringify(liveTiers) ||
     curMin !== liveMin ||
-    curMax !== liveMax
+    curMax !== liveMax ||
+    curMaxPct !== liveMaxPct
   );
 
   const updateTier = (i, patch) => {
@@ -2566,8 +2570,9 @@ function BetSizingPanel({ info, onSetConfig }) {
       };
       if (curMin !== liveMin) patch.min_usd = +curMin;
       if (curMax !== liveMax) patch.max_usd = +curMax;
+      if (curMaxPct !== liveMaxPct) patch.max_pct_of_balance = +curMaxPct;
       await onSetConfig(patch);
-      setMode(null); setTiers(null); setMinUsd(null); setMaxUsd(null);
+      setMode(null); setTiers(null); setMinUsd(null); setMaxUsd(null); setMaxPct(null);
     } finally { setBusy(false); }
   };
 
@@ -2678,7 +2683,7 @@ function BetSizingPanel({ info, onSetConfig }) {
           </div>
         )}
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14 }}>
           <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <span className="label">Min stake ($)</span>
             <input
@@ -2691,15 +2696,28 @@ function BetSizingPanel({ info, onSetConfig }) {
             <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>Below this, the bet is skipped entirely.</span>
           </label>
           <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span className="label">Max stake ($)</span>
+            <span className="label">Max stake (% of balance)</span>
             <input
               type="number"
-              min={0} step={50}
+              min={0} max={100} step={0.5}
+              value={+(curMaxPct * 100).toFixed(2)}
+              onChange={e => setMaxPct(+e.target.value / 100)}
+              style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '4px 8px' }}
+            />
+            <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+              Fluid cap. At {fmtUSD(liveEquity)} → {fmtUSD(Math.round(curMaxPct * liveEquity))}.
+            </span>
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span className="label">Max stake ($) — hard cap</span>
+            <input
+              type="number"
+              min={0} step={500}
               value={curMax}
               onChange={e => setMaxUsd(+e.target.value)}
               style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '4px 8px' }}
             />
-            <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>Hard cap regardless of tier or Kelly suggestion.</span>
+            <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>Absolute ceiling — whichever cap is smaller binds.</span>
           </label>
         </div>
       </div>
@@ -2733,6 +2751,8 @@ function AutoTradeQuickPanel({ info, onSetConfig }) {
       </div>
       <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 10, fontSize: 12 }}>
         <div><span className="label">Status</span><div className={enabled ? 'pos' : 'neg'}>{enabled ? 'enabled' : 'disabled'}</div></div>
+        <div><span className="label">Account balance</span><div className="mono pos">{info?.total_equity != null ? fmtUSD(info.total_equity) : '—'}</div></div>
+        <div><span className="label">Deployable cash</span><div className="mono">{info?.available_cash != null ? fmtUSD(info.available_cash) : '—'}</div></div>
         <div><span className="label">Min edge</span><div className="mono">{info?.min_edge_cents ?? '—'}¢</div></div>
         <div><span className="label">Min model %</span><div className="mono">{info?.min_model_pct != null ? (info.min_model_pct * 100).toFixed(0) + '%' : '—'}</div></div>
         <div><span className="label">Min Kelly</span><div className="mono">{info?.min_kelly != null ? (info.min_kelly * 100).toFixed(2) + '%' : '—'}</div></div>
