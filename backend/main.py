@@ -1033,6 +1033,11 @@ class PlaceBetIn(BaseModel):
     # `size` is auto-computed. Frontend has this from /api/state's
     # brackets[*].edge so we don't have to round-trip to look it up.
     edge_cents: Optional[float] = Field(None, ge=-100, le=100)
+    # Manual override of the peak-in-bracket guard. When True, the server
+    # places the bet even if the model's predicted peak falls outside the
+    # bracket's payout region. UI surfaces a warning + confirm; setting
+    # this here is the API equivalent of clicking "place anyway".
+    allow_misaligned: bool = False
 
 
 def _close_at_for_bet(b: Dict) -> Optional[str]:
@@ -1092,6 +1097,52 @@ def _bet_in_bracket(bet: Dict, actual_max: float) -> bool:
     eff_lo = float("-inf") if lower_tail else bet["bracket_lo"]
     eff_hi = float("inf") if upper_tail else bet["bracket_hi"]
     return eff_lo <= actual_max <= eff_hi
+
+
+def _peak_fits_bracket(
+    label: Optional[str],
+    bracket_lo: Optional[float],
+    bracket_hi: Optional[float],
+    side: str,
+    peak: Optional[float],
+) -> bool:
+    """For a YES bet, does the predicted peak fall inside the region the
+    bracket actually pays out on?
+
+      Range bracket (X-Y°F):  pays YES when lo ≤ actual ≤ hi  → peak ∈ [lo, hi]
+      Lower tail   (≤X°F):    pays YES when actual ≤ hi       → peak ≤ hi
+      Upper tail   (≥X°F):    pays YES when actual ≥ lo       → peak ≥ lo
+
+    The earlier version exempted ALL tail brackets, which let `≤62°F`
+    YES through when the model predicted 67°F (the model expected to
+    LOSE that bet). For NO bets the logic inverts — manual /api/bets
+    handles those; the auto-trader only places YES.
+
+    Returns True if there's not enough info to judge (peak or bounds None).
+    """
+    if peak is None:
+        return True
+    label = (label or "")
+    lower_tail = label.startswith("≤")
+    upper_tail = label.startswith("≥")
+    is_yes = (side or "YES").upper() == "YES"
+    # NO bets: invert. NO on ≤X pays when actual > X → peak > X (i.e., NOT in [lo,hi]).
+    if not is_yes:
+        if lower_tail and bracket_hi is not None:
+            return peak > bracket_hi
+        if upper_tail and bracket_lo is not None:
+            return peak < bracket_lo
+        if bracket_lo is not None and bracket_hi is not None:
+            return not (bracket_lo <= peak <= bracket_hi)
+        return True
+    # YES path
+    if lower_tail and bracket_hi is not None:
+        return peak <= bracket_hi
+    if upper_tail and bracket_lo is not None:
+        return peak >= bracket_lo
+    if bracket_lo is not None and bracket_hi is not None:
+        return bracket_lo <= peak <= bracket_hi
+    return True
 
 
 def _bet_live_status(
@@ -1235,6 +1286,28 @@ def place_bet(b: PlaceBetIn):
     city_code = b.city.upper()
     city = next((c for c in CITIES if c["code"] == city_code), None)
     target_date = _city_target_date(city) if city else None
+    # Bracket-alignment guard: same logic the auto-trader applies. Returns
+    # 400 if the predicted peak doesn't fall in the bracket's payout
+    # region, unless the caller explicitly opts in with allow_misaligned.
+    # Reads model_max from the most recent persisted snapshot for the
+    # city (sync — no async loop needed). Falls open if no snapshot yet.
+    if _auto_trade_state.get("require_peak_in_bracket", True) and not b.allow_misaligned:
+        try:
+            snap = db.latest_snapshot(city_code)
+            peak = snap.get("model_max") if snap else None
+            if peak is not None and not _peak_fits_bracket(
+                b.bracket_label, b.bracket_lo, b.bracket_hi, b.side, float(peak),
+            ):
+                raise HTTPException(
+                    400,
+                    f"bracket misaligned with model — predicted peak {float(peak):.1f}°F "
+                    f"falls outside the {b.bracket_label} {b.side} payout region. "
+                    "Pass allow_misaligned=true to override.",
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[place-bet] alignment check skipped: {exc}")
     # Resolve final stake. When `size` is omitted, route through the same
     # tier-sizing path the auto-trader uses so manual placements scale
     # with the live account too — fixes the "manual bets default to
@@ -1529,16 +1602,17 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
             if bracket.get("label") in existing_labels:
                 continue
             label = bracket.get("label", "") or ""
-            is_tail = label.startswith("≤") or label.startswith("≥")
             blo, bhi = bracket.get("lo"), bracket.get("hi")
-            # Bracket-alignment gate: for non-tail (range) brackets, refuse
-            # to bet if the predicted peak lies outside [lo, hi]. The
-            # picker's "highest edge wins" rule otherwise loves narrow
-            # brackets the market correctly prices as unlikely.
-            if require_peak and not is_tail and active_max is not None:
-                if blo is not None and bhi is not None:
-                    if not (blo <= active_max <= bhi):
-                        continue
+            # Bracket-alignment gate: refuse to bet on a bracket whose
+            # payout region doesn't contain the predicted peak. Auto-trader
+            # only places YES — _peak_fits_bracket handles range brackets
+            # AND the directional check on tails (≤X needs peak ≤ X, ≥X
+            # needs peak ≥ X). Earlier version exempted all tails, which
+            # is wrong: a ≤62°F YES with a 67°F prediction is structurally
+            # a losing bet (model expects to lose).
+            if require_peak and active_max is not None:
+                if not _peak_fits_bracket(label, blo, bhi, "YES", active_max):
+                    continue
             # Overlap gate: refuse to layer a candidate over a position we
             # already hold for this (city, target_date). Same-day adjacent
             # brackets are mutually exclusive — extra exposure, no upside.

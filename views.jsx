@@ -2,22 +2,42 @@
 
 const { useState: useState_v, useEffect: useEffect_v, useMemo: useMemo_v, useRef: useRef_v } = React;
 
+// Does the predicted peak fall in the bracket's payout region?
+// Range bracket (X-Y°F): pays YES when lo ≤ actual ≤ hi → peak ∈ [lo, hi]
+// Lower tail (≤X°F):     pays YES when actual ≤ hi      → peak ≤ hi
+// Upper tail (≥X°F):     pays YES when actual ≥ lo      → peak ≥ lo
+// Mirrors backend _peak_fits_bracket so frontend warning + auto-trader
+// gate + manual API check can never disagree.
+function peakFitsBracket(label, lo, hi, side, peak) {
+  if (peak == null) return true;
+  const lbl = label || '';
+  const lowerTail = lbl.startsWith('≤');
+  const upperTail = lbl.startsWith('≥');
+  const isYes = (side || 'YES').toUpperCase() === 'YES';
+  if (!isYes) {
+    if (lowerTail && hi != null) return peak > hi;
+    if (upperTail && lo != null) return peak < lo;
+    if (lo != null && hi != null) return !(lo <= peak && peak <= hi);
+    return true;
+  }
+  if (lowerTail && hi != null) return peak <= hi;
+  if (upperTail && lo != null) return peak >= lo;
+  if (lo != null && hi != null) return lo <= peak && peak <= hi;
+  return true;
+}
+
 // Shared pre-placement guard. Returns true if the bet should proceed.
-// Triggers a browser confirm() when a non-tail bracket doesn't contain
-// the model's predicted peak — historically 0/8 win rate on those.
-function confirmBracketAlignment(state, bracket) {
+// Triggers a browser confirm() when peak is outside the bracket's payout
+// region — historically 0/8 win rate on misaligned brackets.
+function confirmBracketAlignment(state, bracket, side = 'YES') {
   if (!state || !bracket) return true;
-  const lbl = bracket.label || '';
-  if (lbl.startsWith('≤') || lbl.startsWith('≥')) return true;     // tail brackets exempt
   const peak = state.activeMax ?? state.modelMax;
-  const lo = bracket.lo, hi = bracket.hi;
-  if (peak == null || lo == null || hi == null) return true;
-  if (lo <= peak && peak <= hi) return true;
+  if (peakFitsBracket(bracket.label, bracket.lo, bracket.hi, side, peak)) return true;
   const cityCode = state.city?.code || state.city || '';
   const ok = window.confirm(
-    `Heads up — model predicts ${(+peak).toFixed(1)}°F for ${cityCode}, but bracket ${lbl} ` +
-    `doesn't include that temperature. Historical 0/8 win rate on narrow brackets ` +
-    `outside the peak. Place anyway?`
+    `Heads up — model predicts ${(+peak).toFixed(1)}°F for ${cityCode}, but the ${side} ` +
+    `${bracket.label} bracket pays out on a different temperature region. ` +
+    `Historical 0/8 win rate on these. Place anyway?`
   );
   return !!ok;
 }
