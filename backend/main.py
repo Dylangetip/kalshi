@@ -877,6 +877,20 @@ def _bet_row_to_log(b: Dict) -> Dict:
     }
 
 
+def _bet_in_bracket(bet: Dict, actual_max: float) -> bool:
+    """Single source of truth for "did the bet's bracket capture this max?"
+    Honors the lower-tail / upper-tail label semantics so that ≤87°F
+    means (-∞, 87] (not the 20° storage window of bracket_lo/bracket_hi)
+    and ≥88°F means [88, +∞). Used by both live-status and settlement
+    so the UI can never disagree with what actually settles."""
+    label = bet.get("bracket_label", "") or ""
+    lower_tail = label.startswith("≤")
+    upper_tail = label.startswith("≥")
+    eff_lo = float("-inf") if lower_tail else bet["bracket_lo"]
+    eff_hi = float("inf") if upper_tail else bet["bracket_hi"]
+    return eff_lo <= actual_max <= eff_hi
+
+
 def _bet_live_status(
     bet: Dict,
     max_so_far: Optional[float],
@@ -906,13 +920,12 @@ def _bet_live_status(
         return {"status": "pending", "degreesFromBracket": None}
 
     label = bet.get("bracket_label", "") or ""
-    lo, hi = bet["bracket_lo"], bet["bracket_hi"]
     upper_tail = label.startswith("≥")
     lower_tail = label.startswith("≤")
-    eff_lo = float("-inf") if lower_tail else lo
-    eff_hi = float("inf") if upper_tail else hi
+    eff_lo = float("-inf") if lower_tail else bet["bracket_lo"]
+    eff_hi = float("inf") if upper_tail else bet["bracket_hi"]
     yes_side = bet["side"] == "YES"
-    in_bracket_now = eff_lo <= max_so_far <= eff_hi
+    in_bracket_now = _bet_in_bracket(bet, max_so_far)
     deg_below = round(eff_lo - max_so_far, 1) if (max_so_far < eff_lo and eff_lo != float("-inf")) else 0.0
     deg_above = round(max_so_far - eff_hi, 1) if (max_so_far > eff_hi and eff_hi != float("inf")) else 0.0
     deg = 0.0 if in_bracket_now else (deg_above if deg_above else -deg_below)
@@ -1067,7 +1080,7 @@ async def _settle_open_bets(client: httpx.AsyncClient) -> List[Dict]:
         for bet in bets:
             if bet["target_date"] != cli_covers:
                 continue  # CLI is for a different day than this bet
-            in_bracket = bet["bracket_lo"] <= actual_max <= bet["bracket_hi"]
+            in_bracket = _bet_in_bracket(bet, actual_max)
             pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
             db.settle_bet(bet["id"], pl, actual_max)
             # Data-quality cross-check: NWS Climate Report's actual_max
@@ -1261,7 +1274,7 @@ def recompute_settled_pl():
         if b.get("status") != "settled" or b.get("settled_max_f") is None:
             skipped += 1
             continue
-        in_bracket = b["bracket_lo"] <= b["settled_max_f"] <= b["bracket_hi"]
+        in_bracket = _bet_in_bracket(b, b["settled_max_f"])
         new_pl = settle_pl(b["side"], b["entry_cents"], b["size"], in_bracket)
         if abs(new_pl - (b.get("settled_pl") or 0)) > 0.01:
             db.settle_bet(b["id"], new_pl, b["settled_max_f"])
