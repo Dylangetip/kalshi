@@ -247,6 +247,7 @@ function App() {
     { id: 'auto', label: 'Auto-Trade', badge: autoInfo?.enabled ? '●' : null },
     { id: 'ml', label: 'ML Model', badge: mlInfo?.latest_run?.trained ? '✓' : null },
     { id: 'db', label: 'DB' },
+    { id: 'settings', label: 'Settings' },
   ];
 
   return (
@@ -354,6 +355,22 @@ function App() {
             />
           )}
           {tab === 'db' && <DbView />}
+          {tab === 'settings' && (
+            <SettingsView
+              autoInfo={autoInfo}
+              mlInfo={mlInfo}
+              setTab={setTab}
+              onSetConfig={async (patch) => {
+                const updated = await MOCK.setAutoTradeConfig(patch);
+                if (updated) setAutoInfo(updated);
+                return updated;
+              }}
+              onModelConfig={async () => {
+                const fresh = await MOCK.fetchMlInfo();
+                if (fresh) setMlInfo(fresh);
+              }}
+            />
+          )}
         </div>
       </div>
 

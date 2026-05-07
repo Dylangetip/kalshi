@@ -131,6 +131,23 @@ _auto_trade_state: Dict = {
     "min_model_pct": float(os.getenv("BETS_AUTO_TRADE_MIN_MODEL_PCT", "0.12")),
     "min_kelly": float(os.getenv("BETS_AUTO_TRADE_MIN_KELLY", "0.005")),
     "skip_entry_below_cents": int(os.getenv("BETS_AUTO_TRADE_SKIP_BELOW", "5")),
+    # Bet-sizing strategy:
+    #   "kelly" (default) — size = round(kelly_fraction * available_cash),
+    #            clamped to [min_usd, max_usd]. Smooth and theoretically
+    #            optimal for repeated independent bets, but harder to reason
+    #            about because the dollar amount changes by edge ¢ AND price.
+    #   "tiers" — bucket the edge into discrete confidence tiers, each with
+    #            a fixed dollar size. Easier to predict — a 5¢ edge always
+    #            stakes the same amount. Tiers are evaluated highest-edge
+    #            first and the first match wins. Edges below all thresholds
+    #            fall through to the kelly path (still capped by max_usd).
+    "bet_sizing_mode": os.getenv("BETS_AUTO_TRADE_SIZING", "tiers"),
+    "size_tiers": [
+        {"min_edge_cents": 12, "size_usd": 1000},
+        {"min_edge_cents": 8,  "size_usd": 750},
+        {"min_edge_cents": 5,  "size_usd": 500},
+        {"min_edge_cents": 3,  "size_usd": 250},
+    ],
     # Interval is now part of mutable state — loop reads it each
     # iteration so /api/auto-trade/config can change cadence at runtime.
     "interval_seconds": int(os.getenv("BETS_AUTO_TRADE_INTERVAL", "600")),
@@ -773,6 +790,11 @@ async def _shutdown() -> None:
             globals()[name] = None
 
 
+class SizeTierIn(BaseModel):
+    min_edge_cents: float = Field(..., ge=0, le=100)
+    size_usd: float = Field(..., ge=0)
+
+
 class AutoTradeConfigIn(BaseModel):
     enabled: Optional[bool] = None
     min_edge_cents: Optional[int] = Field(None, ge=0, le=100)
@@ -784,6 +806,8 @@ class AutoTradeConfigIn(BaseModel):
     min_model_pct: Optional[float] = Field(None, ge=0, le=1)
     min_kelly: Optional[float] = Field(None, ge=0, le=1)
     skip_entry_below_cents: Optional[int] = Field(None, ge=0, le=100)
+    bet_sizing_mode: Optional[str] = Field(None, pattern="^(kelly|tiers)$")
+    size_tiers: Optional[List[SizeTierIn]] = None
 
 
 @app.get("/api/auto-trade/info")
@@ -800,10 +824,18 @@ def auto_trade_config(c: AutoTradeConfigIn):
     as 5% of bankroll (¼-Kelly cap)."""
     for k in ("enabled", "min_edge_cents", "bankroll", "max_usd", "min_usd",
               "interval_seconds", "max_bets_per_city_per_day",
-              "min_model_pct", "min_kelly", "skip_entry_below_cents"):
+              "min_model_pct", "min_kelly", "skip_entry_below_cents",
+              "bet_sizing_mode"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
+    if c.size_tiers is not None:
+        # Persist as plain dicts (Pydantic models would JSON-roundtrip but
+        # the rest of the code reads with dict.get).
+        _auto_trade_state["size_tiers"] = [
+            {"min_edge_cents": t.min_edge_cents, "size_usd": t.size_usd}
+            for t in c.size_tiers
+        ]
     if c.bankroll is not None and c.max_usd is None:
         _auto_trade_state["max_usd"] = round(_auto_trade_state["bankroll"] * 0.05, 2)
     return {**_auto_trade_state}
@@ -1128,6 +1160,42 @@ async def _settlement_loop() -> None:
         await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
 
 
+def _size_for_bet(cfg: Dict, edge_cents: float, kelly: float, available_cash: float) -> int:
+    """Pick the dollar stake for a bet. Returns 0 if cfg blocks placement
+    (below min_usd, above caps, etc.). Honors cfg['bet_sizing_mode']:
+
+      - 'tiers': scan size_tiers (highest min_edge_cents first), the first
+                 tier whose threshold is satisfied sets the stake. Falls
+                 through to kelly if nothing matches (small edge).
+      - 'kelly' (or anything else): kelly_fraction × available_cash.
+
+    The result is always clamped to [min_usd, min(max_usd, available_cash)].
+    """
+    min_usd = float(cfg.get("min_usd") or 0)
+    max_usd = float(cfg.get("max_usd") or available_cash)
+    cap = max(0.0, min(max_usd, available_cash))
+    raw = 0.0
+    mode = (cfg.get("bet_sizing_mode") or "kelly").lower()
+    if mode == "tiers":
+        tiers = sorted(
+            [t for t in (cfg.get("size_tiers") or []) if t.get("size_usd") is not None],
+            key=lambda t: -float(t.get("min_edge_cents") or 0),
+        )
+        for tier in tiers:
+            if edge_cents >= float(tier.get("min_edge_cents") or 0):
+                raw = float(tier.get("size_usd") or 0)
+                break
+        # No tier matched (edge too small) — fall through to kelly so we
+        # still scale gracefully near the threshold.
+        if raw <= 0:
+            raw = kelly * available_cash
+    else:
+        raw = kelly * available_cash
+    raw = max(min_usd, raw)
+    sized = int(min(cap, raw))
+    return sized if sized >= min_usd else 0
+
+
 async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     """One iteration of the auto-trader. Considers every bracket on every
     city's ladder (not just the top-recommended one) — so once we've bet
@@ -1198,8 +1266,7 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
         edge_cents, city, state, bracket, target = candidates[0]
         # Kelly off the LIVE bankroll (available cash), not the static config
         kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
-        size = max(cfg["min_usd"], round(kelly * available_cash))
-        size = int(min(cfg["max_usd"], available_cash, size))
+        size = _size_for_bet(cfg, edge_cents, kelly, available_cash)
         if size >= cfg["min_usd"]:
             try:
                 row = db.insert_bet(

@@ -683,24 +683,24 @@ function PnLView({ history, positions, closedPositions = [], states = [], liveHi
     <div className="pnl-layout">
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
         {(() => {
-          // Bank-account model: starting cash + realized P/L − stakes locked
-          // up in open bets = the actual cash you can deploy right now.
-          // Stake leaves the account at placement, full payout returns on
-          // a win, lost stake stays gone on a loss. Open stakes are still
-          // YOUR money but not deployable until the bet resolves.
+          // Account-balance model: behaves like a real bank account. The
+          // headline number is total equity (starting cash + realized P/L)
+          // — your true net worth in the system. Open stakes are still
+          // "yours" (just locked until settlement), so they're shown in the
+          // subtitle along with deployable cash.
           const baseline = 10000;
           const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
           const openStakes = (stats && typeof stats.openStakes === 'number') ? stats.openStakes : 0;
-          const cash = baseline + realized - openStakes;
-          const totalEquity = baseline + realized;  // cash + open stakes
+          const totalEquity = baseline + realized;        // settled net worth
+          const cash = totalEquity - openStakes;          // deployable right now
           const ret = (totalEquity - baseline) / baseline;
           const cls = ret > 0 ? 'pos' : (ret < 0 ? 'neg' : '');
           return (
             <div className="signal-card">
-              <div className="label">Bankroll</div>
-              <div className={`big-num ${cls || ''}`}>{fmtUSD(cash)}</div>
+              <div className="label">Account balance</div>
+              <div className={`big-num ${cls || ''}`}>{fmtUSD(totalEquity)}</div>
               <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
-                cash · ${Math.round(openStakes).toLocaleString()} in open bets · {fmtSign(realized, 0)} settled
+                {fmtUSD(cash)} cash · ${Math.round(openStakes).toLocaleString()} open · {fmtSign(realized, 0)} settled
               </div>
             </div>
           );
@@ -2484,6 +2484,259 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
   );
 }
 
+// ====== SETTINGS ======
+//
+// Centralizes runtime config that used to live scattered across the
+// Auto-Trade and ML Model tabs:
+//   - Bet sizing (NEW: confidence tiers + manual override)
+//   - Active prediction model (mirrors the ML Model panel)
+//   - Auto-trader guardrails (min edge, max stake, cadence, etc.)
+//
+// Each section persists via the same /api/auto-trade/config or
+// /api/model/config endpoints those other tabs already use, so changes
+// here propagate everywhere automatically.
+
+function BetSizingPanel({ info, onSetConfig }) {
+  const liveMode = info?.bet_sizing_mode || 'tiers';
+  const liveTiers = info?.size_tiers || [];
+  const liveMin = info?.min_usd ?? 50;
+  const liveMax = info?.max_usd ?? 500;
+
+  const [mode, setMode] = useState_v(null);
+  const [tiers, setTiers] = useState_v(null);
+  const [minUsd, setMinUsd] = useState_v(null);
+  const [maxUsd, setMaxUsd] = useState_v(null);
+  const [busy, setBusy] = useState_v(false);
+
+  const curMode = mode ?? liveMode;
+  const curTiers = tiers ?? liveTiers;
+  const curMin = minUsd ?? liveMin;
+  const curMax = maxUsd ?? liveMax;
+  const dirty = (
+    curMode !== liveMode ||
+    JSON.stringify(curTiers) !== JSON.stringify(liveTiers) ||
+    curMin !== liveMin ||
+    curMax !== liveMax
+  );
+
+  const updateTier = (i, patch) => {
+    setTiers((tiers ?? liveTiers).map((t, j) => j === i ? { ...t, ...patch } : t));
+  };
+  const addTier = () => {
+    const next = [...(tiers ?? liveTiers), { min_edge_cents: 0, size_usd: 100 }];
+    setTiers(next);
+  };
+  const removeTier = (i) => {
+    setTiers((tiers ?? liveTiers).filter((_, j) => j !== i));
+  };
+  const reset = () => {
+    setTiers([
+      { min_edge_cents: 12, size_usd: 1000 },
+      { min_edge_cents: 8,  size_usd: 750 },
+      { min_edge_cents: 5,  size_usd: 500 },
+      { min_edge_cents: 3,  size_usd: 250 },
+    ]);
+  };
+
+  const apply = async () => {
+    setBusy(true);
+    try {
+      // Sort tiers descending so the API stores them in the order the
+      // backend evaluates them (highest-edge first wins).
+      const sortedTiers = [...curTiers].sort((a, b) => +b.min_edge_cents - +a.min_edge_cents);
+      const patch = {
+        bet_sizing_mode: curMode,
+        size_tiers: sortedTiers.map(t => ({
+          min_edge_cents: +t.min_edge_cents,
+          size_usd: +t.size_usd,
+        })),
+      };
+      if (curMin !== liveMin) patch.min_usd = +curMin;
+      if (curMax !== liveMax) patch.max_usd = +curMax;
+      await onSetConfig(patch);
+      setMode(null); setTiers(null); setMinUsd(null); setMaxUsd(null);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Bet sizing</span>
+        <span className="panel-title-actions" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+            mode: {liveMode}
+          </span>
+          <button className="btn primary sm" disabled={busy || !dirty} onClick={apply}>
+            {busy ? 'applying…' : 'Apply'}
+          </button>
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span className="label" style={{ minWidth: 90 }}>Sizing mode</span>
+          <select
+            value={curMode}
+            onChange={e => setMode(e.target.value)}
+            style={{
+              background: 'var(--bg-2)', color: 'var(--fg-1)',
+              border: '1px solid var(--border)', borderRadius: 4,
+              padding: '4px 8px', fontSize: 13, minWidth: 180,
+            }}
+          >
+            <option value="tiers">Confidence tiers (fixed $ per edge)</option>
+            <option value="kelly">Kelly (fraction of bankroll)</option>
+          </select>
+        </label>
+
+        {curMode === 'tiers' && (
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>
+              Confidence tiers — first matching tier (highest min-edge ≤ candidate edge) wins
+            </div>
+            <table className="tbl" style={{ marginBottom: 8 }}>
+              <thead>
+                <tr>
+                  <th>Min edge (¢)</th>
+                  <th>Stake ($)</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...curTiers]
+                  .map((t, i) => ({ ...t, _i: i }))
+                  .sort((a, b) => +b.min_edge_cents - +a.min_edge_cents)
+                  .map(t => (
+                    <tr key={t._i}>
+                      <td>
+                        <input
+                          type="number"
+                          min={0} max={100} step={0.5}
+                          value={t.min_edge_cents}
+                          onChange={e => updateTier(t._i, { min_edge_cents: e.target.value })}
+                          style={{ width: 80, background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min={0} step={50}
+                          value={t.size_usd}
+                          onChange={e => updateTier(t._i, { size_usd: e.target.value })}
+                          style={{ width: 100, background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
+                        />
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button className="btn-sm" onClick={() => removeTier(t._i)}>remove</button>
+                      </td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button className="btn-sm" onClick={addTier}>+ add tier</button>
+              <button className="btn-sm" onClick={reset}>reset defaults</button>
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--fg-3)', marginTop: 8, lineHeight: 1.5 }}>
+              Edges below every threshold fall through to Kelly sizing (still capped by max stake). Tiers are sorted highest-first on save.
+            </div>
+          </div>
+        )}
+
+        {curMode === 'kelly' && (
+          <div style={{ fontSize: 11, color: 'var(--fg-3)', lineHeight: 1.5 }}>
+            Stake = kelly_fraction × deployable cash, clamped to [min, max]. Smooth and theoretically optimal but the dollar amount changes with every tick.
+          </div>
+        )}
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span className="label">Min stake ($)</span>
+            <input
+              type="number"
+              min={0} step={10}
+              value={curMin}
+              onChange={e => setMinUsd(+e.target.value)}
+              style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '4px 8px' }}
+            />
+            <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>Below this, the bet is skipped entirely.</span>
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span className="label">Max stake ($)</span>
+            <input
+              type="number"
+              min={0} step={50}
+              value={curMax}
+              onChange={e => setMaxUsd(+e.target.value)}
+              style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '4px 8px' }}
+            />
+            <span style={{ fontSize: 11, color: 'var(--fg-3)' }}>Hard cap regardless of tier or Kelly suggestion.</span>
+          </label>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function AutoTradeQuickPanel({ info, onSetConfig }) {
+  const enabled = !!info?.enabled;
+  const [busy, setBusy] = useState_v(false);
+  const toggle = async () => {
+    setBusy(true);
+    try { await onSetConfig({ enabled: !enabled }); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Auto-trader</span>
+        <span className="panel-title-actions">
+          <button
+            className={`btn primary sm`}
+            disabled={busy}
+            onClick={toggle}
+            style={{ background: enabled ? 'var(--neg)' : undefined }}
+          >
+            {busy ? '…' : (enabled ? 'Disable' : 'Enable')}
+          </button>
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 10, fontSize: 12 }}>
+        <div><span className="label">Status</span><div className={enabled ? 'pos' : 'neg'}>{enabled ? 'enabled' : 'disabled'}</div></div>
+        <div><span className="label">Min edge</span><div className="mono">{info?.min_edge_cents ?? '—'}¢</div></div>
+        <div><span className="label">Min model %</span><div className="mono">{info?.min_model_pct != null ? (info.min_model_pct * 100).toFixed(0) + '%' : '—'}</div></div>
+        <div><span className="label">Min Kelly</span><div className="mono">{info?.min_kelly != null ? (info.min_kelly * 100).toFixed(2) + '%' : '—'}</div></div>
+        <div><span className="label">Cadence</span><div className="mono">every {Math.round((info?.interval_seconds || 600) / 60)}m</div></div>
+        <div><span className="label">Bets / city / day</span><div className="mono">{info?.max_bets_per_city_per_day ?? '—'}</div></div>
+      </div>
+      <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-3)' }}>
+        Per-trader detail (recent fills, run history) lives on the Auto-Trade tab. This card is for at-a-glance status + quick on/off.
+      </div>
+    </div>
+  );
+}
+
+
+function SettingsView({ autoInfo, mlInfo, onSetConfig, onModelConfig, setTab }) {
+  return (
+    <div className="pnl-layout">
+      <BetSizingPanel info={autoInfo} onSetConfig={onSetConfig} />
+      <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
+      <AutoTradeQuickPanel info={autoInfo} onSetConfig={onSetConfig} />
+
+      <div className="panel">
+        <div className="panel-header"><span>Jump to</span></div>
+        <div style={{ padding: 14, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn-sm" onClick={() => setTab && setTab('auto')}>Auto-Trade dashboard →</button>
+          <button className="btn-sm" onClick={() => setTab && setTab('ml')}>ML Model dashboard →</button>
+          <button className="btn-sm" onClick={() => setTab && setTab('db')}>SQL console →</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 // ====== DB / SQL CONSOLE ======
 // Read-only SQLite console for ad-hoc data inspection. Backend rejects
 // anything that isn't a single SELECT/WITH and runs against a ?mode=ro
@@ -2665,4 +2918,4 @@ function DbView() {
   );
 }
 
-Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView, MlView, DbView });
+Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView, MlView, DbView, SettingsView });
