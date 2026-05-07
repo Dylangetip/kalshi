@@ -319,6 +319,34 @@ async function fetchClosedPositions() {
   }
 }
 
+async function fetchBias() {
+  try {
+    const r = await fetch(API_BASE + '/api/bias', { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+async function setBiasConfig(patch) {
+  try {
+    const r = await fetch(API_BASE + '/api/bias/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+async function refreshBias() {
+  try {
+    const r = await fetch(API_BASE + '/api/bias/refresh', { method: 'POST' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
 async function fetchSqlSchema() {
   try {
     const r = await fetch(API_BASE + '/api/admin/sql/schema', { cache: 'no-store' });
@@ -484,6 +512,7 @@ window.MOCK = {
   seedRand, gauss, makeBrackets, buildCityState,
   fetchLiveState, fetchBets, fetchPositions, fetchClosedPositions, fetchEdgeHistory, fetchEquity, fetchStats, fetchAccuracy,
   fetchSqlSchema, runSql,
+  fetchBias, setBiasConfig, refreshBias,
   fetchAutoTradeInfo, setAutoTradeConfig, triggerAutoTradeNow,
   fetchMlInfo, triggerMlBackfill, triggerMlTrain, fetchMlDiagnostics, fetchMlEvents, fetchMlModelDiff,
   persistBet, API_BASE,

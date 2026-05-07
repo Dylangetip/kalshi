@@ -2767,10 +2767,119 @@ function AutoTradeQuickPanel({ info, onSetConfig }) {
 }
 
 
+function BiasPanel() {
+  const [data, setData] = useState_v(null);
+  const [busy, setBusy] = useState_v(false);
+
+  const load = async () => { const d = await MOCK.fetchBias(); setData(d); };
+  React.useEffect(() => { load(); }, []);
+
+  const toggle = async () => {
+    setBusy(true);
+    try {
+      await MOCK.setBiasConfig({ enabled: !(data?.config?.enabled) });
+      await load();
+    } finally { setBusy(false); }
+  };
+
+  const refresh = async () => {
+    setBusy(true);
+    try {
+      await MOCK.refreshBias();
+      await load();
+    } finally { setBusy(false); }
+  };
+
+  const enabled = !!data?.config?.enabled;
+  const rows = (data?.rows) || [];
+  // Group by city → {short, mid, long}
+  const byCity = {};
+  for (const r of rows) {
+    if (!byCity[r.city]) byCity[r.city] = {};
+    byCity[r.city][r.horizon] = r;
+  }
+  const cities = Object.keys(byCity).sort();
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Forecast bias correction</span>
+        <span className="panel-title-actions" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {data && (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+              {rows.length} (city, horizon) pairs · cache age {data.cache_age_seconds}s / {data.cache_ttl_seconds}s
+            </span>
+          )}
+          <button className="btn-sm" disabled={busy} onClick={refresh}>recompute</button>
+          <button
+            className={`btn primary sm`}
+            disabled={busy}
+            onClick={toggle}
+            style={{ background: enabled ? 'var(--neg)' : undefined }}
+          >
+            {busy ? '…' : (enabled ? 'Disable' : 'Enable')}
+          </button>
+        </span>
+      </div>
+      <div style={{ padding: 14, fontSize: 12 }}>
+        <div style={{ marginBottom: 10, color: 'var(--fg-2)' }}>
+          Per-(city, horizon) running residual of the raw ensemble vs the NWS published actual,
+          weighted with a {data?.config?.half_life_days ?? 30}-day half-life over a {data?.config?.lookback_days ?? 180}-day window.
+          A positive value means the raw model has been UNDER-forecasting that city — we add it back at forecast time.
+          Capped at ±{data?.config?.max_correction ?? 5}°F. Status: <b className={enabled ? 'pos' : 'neg'}>{enabled ? 'enabled' : 'disabled'}</b>.
+        </div>
+        {rows.length === 0 ? (
+          <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+            No bias data yet — needs at least one row in historical_predictions × historical_actuals.
+            If you've been running for a while, click <i>recompute</i>.
+          </div>
+        ) : (
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>City</th>
+                <th className="num-r">Short (≤24h)</th>
+                <th className="num-r">Mid (24–72h)</th>
+                <th className="num-r">Long (&gt;72h)</th>
+                <th className="num-r">N (eff)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {cities.map(city => {
+                const s = byCity[city].short;
+                const m = byCity[city].mid;
+                const l = byCity[city].long;
+                const fmt = (e) => {
+                  if (!e) return <span style={{ color: 'var(--fg-3)' }}>—</span>;
+                  const v = e.mean_residual;
+                  const cls = v > 0.3 ? 'pos' : (v < -0.3 ? 'neg' : '');
+                  return <span className={cls + ' mono'}>{v >= 0 ? '+' : ''}{v.toFixed(2)}°F</span>;
+                };
+                const nEff = ((s?.n_eff || 0) + (m?.n_eff || 0) + (l?.n_eff || 0)).toFixed(0);
+                return (
+                  <tr key={city}>
+                    <td className="city-cell">{city}</td>
+                    <td className="num-r">{fmt(s)}</td>
+                    <td className="num-r">{fmt(m)}</td>
+                    <td className="num-r">{fmt(l)}</td>
+                    <td className="num-r mono" style={{ color: 'var(--fg-3)' }}>{nEff}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 function SettingsView({ autoInfo, mlInfo, onSetConfig, onModelConfig, setTab }) {
   return (
     <div className="pnl-layout">
       <BetSizingPanel info={autoInfo} onSetConfig={onSetConfig} />
+      <BiasPanel />
       <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
       <AutoTradeQuickPanel info={autoInfo} onSetConfig={onSetConfig} />
 

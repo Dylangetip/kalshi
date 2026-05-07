@@ -198,10 +198,73 @@ SQL_CONSOLE_ROW_CAP = int(os.getenv("BETS_SQL_CONSOLE_ROW_CAP", "1000"))
 _model_state: Dict = {
     "modelmax_source": os.getenv("BETS_MODELMAX_SOURCE", "auto").lower(),
     "blend_alpha": float(os.getenv("BETS_BLEND_ALPHA", "0.7")),
+    # Per-city bias correction (decaying-weight residuals from
+    # historical_predictions × historical_actuals). Disable by setting
+    # bias_correction=false. Tunable via /api/bias/config.
+    "bias_correction": os.getenv("BETS_BIAS_CORRECTION", "1") != "0",
+    "bias_half_life_days": float(os.getenv("BETS_BIAS_HALF_LIFE_DAYS", "30")),
+    "bias_lookback_days": int(os.getenv("BETS_BIAS_LOOKBACK_DAYS", "180")),
+    "bias_max_correction": float(os.getenv("BETS_BIAS_MAX_CORRECTION", "5.0")),
 }
 
 # Backfill progress shared dict (read by /api/ml/backfill/status).
 _ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
+
+# In-memory cache for the per-city bias map. Rebuilt from the DB on a TTL
+# (default 1h) so HTTP requests aren't paying the cost of a 180-day join
+# every state build. Invalidate via /api/bias/refresh after a settlement.
+_bias_cache: Dict = {"map": None, "computed_at": 0.0}
+_BIAS_CACHE_TTL_SECONDS = int(os.getenv("BETS_BIAS_CACHE_TTL", "3600"))
+
+
+def _get_bias_map() -> Dict:
+    """Return the (city, horizon-bucket) → mean_residual map, recomputing
+    from the DB if the cache is stale or empty. Read-mostly: every state
+    build calls this; the underlying SQL only runs once per TTL window."""
+    now = time.time()
+    cached_map = _bias_cache.get("map")
+    cached_at = _bias_cache.get("computed_at") or 0
+    if cached_map is not None and (now - cached_at) < _BIAS_CACHE_TTL_SECONDS:
+        return cached_map
+    try:
+        bias = db.compute_city_bias(
+            half_life_days=float(_model_state.get("bias_half_life_days") or 30),
+            lookback_days=int(_model_state.get("bias_lookback_days") or 180),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bias] compute failed: {exc}")
+        bias = cached_map or {}
+    _bias_cache["map"] = bias
+    _bias_cache["computed_at"] = now
+    return bias
+
+
+def _bias_correction_for(city_code: str, target_date: Optional[str]) -> float:
+    """Look up the additive correction (in °F) to apply to the raw model_max
+    for this city + forecast horizon. Returns 0.0 if disabled, no data, or
+    correction is clamped to zero."""
+    cfg = _model_state
+    if not cfg.get("bias_correction", True):
+        return 0.0
+    if not city_code:
+        return 0.0
+    # Horizon bucket: derive from days-until-target. If we can't parse the
+    # date, default to "short" (most conservative — least far-out forecast).
+    bucket = "short"
+    if target_date:
+        try:
+            tgt = datetime.fromisoformat(target_date).date()
+            days_out = (tgt - datetime.utcnow().date()).days
+            hours = days_out * 24
+            bucket = "short" if hours <= 24 else ("mid" if hours <= 72 else "long")
+        except (ValueError, TypeError):
+            pass
+    bmap = _get_bias_map() or {}
+    entry = bmap.get((city_code, bucket))
+    if entry is None:
+        return 0.0
+    cap = float(cfg.get("bias_max_correction") or 5.0)
+    return max(-cap, min(cap, float(entry.get("mean_residual") or 0.0)))
 from .model import (
     best_bracket,
     bracket_prob,
@@ -308,13 +371,19 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     data_date_local = today_str
 
     # Doc §2.1: MOS is the highest-value source; weight it accordingly.
-    model_max = ensemble_model_max([
+    raw_model_max = ensemble_model_max([
         (gfs_mos_f, 0.40),
         (nam_mos_f, 0.20),
         (nws_max_f, 0.15),
         (om_max_f, 0.15),
         (ecmwf_max_f, 0.10),
     ])
+    # Apply per-city, per-horizon bias correction if enabled. The raw
+    # ensemble systematically under-forecasts most cities by 0.5-1°F (see
+    # /api/bias for the running residuals); shifting the headline by that
+    # amount turns narrow brackets from systematic losers into honest 50/50s.
+    bias_shift = _bias_correction_for(city.get("code"), target_iso) if raw_model_max is not None else 0.0
+    model_max = raw_model_max + bias_shift if raw_model_max is not None else None
     if model_max is None:
         return None
 
@@ -446,6 +515,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "afdAboveNormal": afd.get("above_normal", False),
         "settlementBracket": best,
         "modelMax": round(model_max, 1),
+        "rawModelMax": round(raw_model_max, 1) if raw_model_max is not None else None,
+        "biasShift": round(bias_shift, 2),
         "mlMax": ml_max,
         "mlP10": (ml_quantiles or {}).get("p10"),
         "mlP50": (ml_quantiles or {}).get("p50"),
@@ -1665,6 +1736,70 @@ def ml_diagnostics_endpoint():
 class ModelConfigIn(BaseModel):
     modelmax_source: Optional[str] = Field(None, pattern="^(auto|ml|blend|ensemble)$")
     blend_alpha: Optional[float] = Field(None, ge=0, le=1)
+
+
+class BiasConfigIn(BaseModel):
+    enabled: Optional[bool] = None
+    half_life_days: Optional[float] = Field(None, gt=0, le=365)
+    lookback_days: Optional[int] = Field(None, gt=0, le=3650)
+    max_correction: Optional[float] = Field(None, ge=0, le=20)
+
+
+@app.get("/api/bias")
+def bias_inspect():
+    """Per-(city, horizon-bucket) forecast bias. Positive mean_residual =
+    raw model has been UNDER-forecasting that city → we ADD it back to
+    correct. Computed with exponential decay (recent days weighted more)."""
+    bmap = _get_bias_map() or {}
+    rows = [
+        {"city": city, "horizon": bucket, **stats}
+        for (city, bucket), stats in bmap.items()
+    ]
+    rows.sort(key=lambda r: (r["city"], r["horizon"]))
+    return {
+        "rows": rows,
+        "config": {
+            "enabled":         _model_state.get("bias_correction", True),
+            "half_life_days":  _model_state.get("bias_half_life_days"),
+            "lookback_days":   _model_state.get("bias_lookback_days"),
+            "max_correction":  _model_state.get("bias_max_correction"),
+        },
+        "cache_age_seconds": int(time.time() - (_bias_cache.get("computed_at") or 0)),
+        "cache_ttl_seconds": _BIAS_CACHE_TTL_SECONDS,
+    }
+
+
+@app.post("/api/bias/refresh")
+def bias_refresh():
+    """Invalidate the bias cache. Next request that needs a forecast will
+    recompute from the historical_predictions × historical_actuals join."""
+    _bias_cache["map"] = None
+    _bias_cache["computed_at"] = 0.0
+    bmap = _get_bias_map() or {}
+    _state_cache.clear()  # regenerate state with new corrections too
+    return {"refreshed": True, "rows": len(bmap)}
+
+
+@app.post("/api/bias/config")
+def bias_config(c: BiasConfigIn):
+    """Toggle bias correction on/off and tune the decay/lookback/cap."""
+    if c.enabled is not None:
+        _model_state["bias_correction"] = c.enabled
+    if c.half_life_days is not None:
+        _model_state["bias_half_life_days"] = c.half_life_days
+        _bias_cache["map"] = None
+    if c.lookback_days is not None:
+        _model_state["bias_lookback_days"] = c.lookback_days
+        _bias_cache["map"] = None
+    if c.max_correction is not None:
+        _model_state["bias_max_correction"] = c.max_correction
+    _state_cache.clear()
+    return {
+        "enabled":         _model_state.get("bias_correction"),
+        "half_life_days":  _model_state.get("bias_half_life_days"),
+        "lookback_days":   _model_state.get("bias_lookback_days"),
+        "max_correction":  _model_state.get("bias_max_correction"),
+    }
 
 
 @app.post("/api/model/config")

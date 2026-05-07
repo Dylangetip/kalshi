@@ -18,6 +18,7 @@ import threading
 import time
 import time as _time  # alias for legacy in-function imports below
 from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 DB_PATH = Path(__file__).parent / "bets.db"
@@ -1141,3 +1142,76 @@ def latest_snapshot(city: str) -> Optional[Dict]:
         (city.upper(),),
     ).fetchone()
     return dict(row) if row else None
+
+
+def compute_city_bias(half_life_days: float = 30.0, lookback_days: int = 180) -> Dict:
+    """Per-(city, horizon-bucket) bias of the ensemble forecast vs the
+    NWS-published actual. Positive value → model has been UNDER-forecasting
+    (actuals are warmer than predictions) → caller adds the value to the
+    raw model_max to correct.
+
+    Uses an exponentially-decaying weight on each historical day so recent
+    misses dominate older ones. Half-life default is 30 days, so a residual
+    from 30 days ago carries half the weight of today's.
+
+    Horizon buckets:
+      "short" — same-day / next-morning forecast (≤24h to target)
+      "mid"   — 24–72h forecast (1–3 days ahead)
+      "long"  — >72h forecast
+
+    Returns:
+      {
+        (city, bucket): {
+          "mean_residual": float,   # actual − model, +F
+          "n_eff": float,           # sum of weights (effective sample size)
+          "n_raw": int,             # raw count of joined rows
+        },
+        ...
+      }
+    """
+    import math
+    c = _conn_or_init()
+    today = datetime.utcnow().date().isoformat()
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).date().isoformat()
+    rows = c.execute(
+        """
+        SELECT hp.city,
+               hp.target_date,
+               hp.forecast_horizon_hours AS horizon,
+               hp.ensemble_max,
+               ha.actual_max_f,
+               julianday(?) - julianday(hp.target_date) AS days_old
+        FROM historical_predictions hp
+        JOIN historical_actuals     ha
+          ON ha.city = hp.city AND ha.target_date = hp.target_date
+        WHERE hp.ensemble_max IS NOT NULL
+          AND ha.actual_max_f IS NOT NULL
+          AND hp.target_date >= ?
+        """,
+        (today, cutoff),
+    ).fetchall()
+    tau = float(half_life_days) / math.log(2.0) if half_life_days > 0 else 1e9
+    agg: Dict = {}
+    for r in rows:
+        city = r["city"]
+        h = r["horizon"] or 0
+        bucket = "short" if h <= 24 else ("mid" if h <= 72 else "long")
+        days_old = max(0.0, float(r["days_old"] or 0))
+        w = math.exp(-days_old / tau) if tau > 0 else 1.0
+        residual = float(r["actual_max_f"]) - float(r["ensemble_max"])
+        key = (city, bucket)
+        cur = agg.get(key) or {"sum_w": 0.0, "sum_wr": 0.0, "n_raw": 0}
+        cur["sum_w"]  += w
+        cur["sum_wr"] += w * residual
+        cur["n_raw"] += 1
+        agg[key] = cur
+    out: Dict = {}
+    for key, v in agg.items():
+        if v["sum_w"] <= 0:
+            continue
+        out[key] = {
+            "mean_residual": round(v["sum_wr"] / v["sum_w"], 3),
+            "n_eff": round(v["sum_w"], 2),
+            "n_raw": v["n_raw"],
+        }
+    return out
