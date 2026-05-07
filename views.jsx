@@ -2,6 +2,26 @@
 
 const { useState: useState_v, useEffect: useEffect_v, useMemo: useMemo_v, useRef: useRef_v } = React;
 
+// Shared pre-placement guard. Returns true if the bet should proceed.
+// Triggers a browser confirm() when a non-tail bracket doesn't contain
+// the model's predicted peak — historically 0/8 win rate on those.
+function confirmBracketAlignment(state, bracket) {
+  if (!state || !bracket) return true;
+  const lbl = bracket.label || '';
+  if (lbl.startsWith('≤') || lbl.startsWith('≥')) return true;     // tail brackets exempt
+  const peak = state.activeMax ?? state.modelMax;
+  const lo = bracket.lo, hi = bracket.hi;
+  if (peak == null || lo == null || hi == null) return true;
+  if (lo <= peak && peak <= hi) return true;
+  const cityCode = state.city?.code || state.city || '';
+  const ok = window.confirm(
+    `Heads up — model predicts ${(+peak).toFixed(1)}°F for ${cityCode}, but bracket ${lbl} ` +
+    `doesn't include that temperature. Historical 0/8 win rate on narrow brackets ` +
+    `outside the peak. Place anyway?`
+  );
+  return !!ok;
+}
+
 // Plain-English explanation for the current liveStatus, based on the
 // position fields and the city's full state.
 function liveStatusReason(p, cs) {
@@ -148,7 +168,11 @@ function OpportunitiesView({ states, selectedCity, setSelectedCity, onPlaceBet, 
                 </div>
               </div>
               <button className="btn success" style={{ marginLeft: 'auto' }}
-                onClick={() => onPlaceBet(top.city.code, top.settlementBracket, 'YES', 250)}>
+                onClick={() => {
+                  if (confirmBracketAlignment(top, top.settlementBracket)) {
+                    onPlaceBet(top.city.code, top.settlementBracket, 'YES', 250);
+                  }
+                }}>
                 BUY YES · $250
               </button>
             </div>
@@ -246,7 +270,11 @@ function OpportunitiesView({ states, selectedCity, setSelectedCity, onPlaceBet, 
             <dt>Expected ROI</dt><dd className="pos">{fmtSign(focused.bestEdgeCents / focused.settlementBracket.yesPrice * 100, 0)}%</dd>
           </div>
           <button className="btn success" style={{ width: '100%', marginTop: 12 }}
-            onClick={() => onPlaceBet(focused.city.code, focused.settlementBracket, 'YES', Math.round(focused.kellyPct * 4000))}>
+            onClick={() => {
+              if (confirmBracketAlignment(focused, focused.settlementBracket)) {
+                onPlaceBet(focused.city.code, focused.settlementBracket, 'YES', Math.round(focused.kellyPct * 4000));
+              }
+            }}>
             Place bet
           </button>
         </div>
@@ -513,9 +541,42 @@ function TerminalView({ state, onPlaceBet, betLog }) {
           </div>
         </div>
 
+        {(() => {
+          // Bracket-alignment warning: highlight when the user is about to
+          // place a non-tail bracket whose [lo, hi] doesn't contain the
+          // model's predicted peak. Same gate the auto-trader applies —
+          // historical narrow-bracket bets outside the peak are 0/8.
+          const lbl = sel?.label || '';
+          const isTail = lbl.startsWith('≤') || lbl.startsWith('≥');
+          const peak = state.activeMax ?? state.modelMax;
+          const lo = sel?.lo, hi = sel?.hi;
+          const peakOutside = !isTail && peak != null && lo != null && hi != null && !(lo <= peak && peak <= hi);
+          if (!peakOutside) return null;
+          const distance = peak < lo ? +(lo - peak).toFixed(1) : +(peak - hi).toFixed(1);
+          return (
+            <div style={{
+              margin: '0 14px 8px', padding: 10, borderRadius: 4,
+              border: '1px solid var(--neg)',
+              background: 'color-mix(in srgb, var(--neg) 15%, transparent)',
+              fontSize: 11, lineHeight: 1.5,
+            }}>
+              <div style={{ fontWeight: 600, color: 'var(--neg)', marginBottom: 4 }}>
+                ⚠ bracket doesn't match the model
+              </div>
+              Model predicts <span className="mono">{(+peak).toFixed(1)}°F</span> for {state.city.code}, but you're betting{' '}
+              <span className="mono">{lbl}</span> — {distance}°F outside the bracket. Historical
+              0% win rate on narrow brackets outside the peak. Pick a bracket containing{' '}
+              <span className="mono">{(+peak).toFixed(0)}°F</span> or a tail bracket instead.
+            </div>
+          );
+        })()}
         <div className="bet-form">
           <button className="btn success" style={{ fontSize: 13, padding: '10px 14px' }}
-            onClick={() => onPlaceBet(state.city.code, sel, side, size)}>
+            onClick={() => {
+              if (confirmBracketAlignment(state, sel)) {
+                onPlaceBet(state.city.code, sel, side, size);
+              }
+            }}>
             Place {side} · ${size} @ {cost}¢
           </button>
           <div className="mono" style={{ fontSize: 9, color: 'var(--fg-3)', textAlign: 'center' }}>

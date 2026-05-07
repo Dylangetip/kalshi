@@ -136,6 +136,20 @@ _auto_trade_state: Dict = {
     "min_model_pct": float(os.getenv("BETS_AUTO_TRADE_MIN_MODEL_PCT", "0.12")),
     "min_kelly": float(os.getenv("BETS_AUTO_TRADE_MIN_KELLY", "0.005")),
     "skip_entry_below_cents": int(os.getenv("BETS_AUTO_TRADE_SKIP_BELOW", "5")),
+    # Bracket-quality gates discovered from settled history:
+    #   require_peak_in_bracket: refuse a non-tail bracket whose [lo, hi]
+    #     doesn't contain the model's predicted peak. The auto-trader's
+    #     "highest edge" sort otherwise picks 1°-wide brackets that the
+    #     market underprices precisely because they're unlikely — fake
+    #     edge that cost +$3.8k in the first 17 bets. Tail brackets
+    #     (≤X / ≥X) are exempt since their range is open-ended.
+    #   prevent_overlapping_brackets: skip a candidate whose [lo, hi]
+    #     overlaps any already-open bet for the same (city, target_date).
+    #     Same-day adjacent brackets are mutually exclusive — only one
+    #     can settle YES — so layering them just doubles risk for no
+    #     extra upside.
+    "require_peak_in_bracket": os.getenv("BETS_AUTO_TRADE_REQUIRE_PEAK", "1") != "0",
+    "prevent_overlapping_brackets": os.getenv("BETS_AUTO_TRADE_PREVENT_OVERLAP", "1") != "0",
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -888,6 +902,8 @@ class AutoTradeConfigIn(BaseModel):
     skip_entry_below_cents: Optional[int] = Field(None, ge=0, le=100)
     bet_sizing_mode: Optional[str] = Field(None, pattern="^(kelly|tiers)$")
     size_tiers: Optional[List[SizeTierIn]] = None
+    require_peak_in_bracket: Optional[bool] = None
+    prevent_overlapping_brackets: Optional[bool] = None
 
 
 @app.get("/api/auto-trade/info")
@@ -906,7 +922,8 @@ def auto_trade_config(c: AutoTradeConfigIn):
               "max_pct_of_balance", "min_usd",
               "interval_seconds", "max_bets_per_city_per_day",
               "min_model_pct", "min_kelly", "skip_entry_below_cents",
-              "bet_sizing_mode"):
+              "bet_sizing_mode",
+              "require_peak_in_bracket", "prevent_overlapping_brackets"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
@@ -1338,16 +1355,46 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
             continue
         existing = db.list_bets_for_target(city["code"], target)
         existing_labels = {b["bracket_label"] for b in existing}
-        # Hard per-city-per-day cap — skip the whole city once we've
-        # already opened max_per_day bets for this target_date.
+        # Per-city-per-day cap — skip the whole city once we've already
+        # opened max_per_day bets for this target_date.
         if len(existing) >= max_per_day:
             continue
+        # Active prediction the auto-trader is using right now (post bias
+        # correction, blend, etc.). Used by the peak-in-bracket gate.
+        active_max = state.get("activeMax") or state.get("modelMax")
+        require_peak = bool(cfg.get("require_peak_in_bracket", True))
+        prevent_overlap = bool(cfg.get("prevent_overlapping_brackets", True))
         for bracket in state.get("brackets") or []:
             edge_cents = int(round((bracket.get("edge") or 0) * 100))
             if edge_cents < cfg["min_edge_cents"]:
                 continue
             if bracket.get("label") in existing_labels:
                 continue
+            label = bracket.get("label", "") or ""
+            is_tail = label.startswith("≤") or label.startswith("≥")
+            blo, bhi = bracket.get("lo"), bracket.get("hi")
+            # Bracket-alignment gate: for non-tail (range) brackets, refuse
+            # to bet if the predicted peak lies outside [lo, hi]. The
+            # picker's "highest edge wins" rule otherwise loves narrow
+            # brackets the market correctly prices as unlikely.
+            if require_peak and not is_tail and active_max is not None:
+                if blo is not None and bhi is not None:
+                    if not (blo <= active_max <= bhi):
+                        continue
+            # Overlap gate: refuse to layer a candidate over a position we
+            # already hold for this (city, target_date). Same-day adjacent
+            # brackets are mutually exclusive — extra exposure, no upside.
+            if prevent_overlap and blo is not None and bhi is not None:
+                clash = False
+                for ex in existing:
+                    elo, ehi = ex.get("bracket_lo"), ex.get("bracket_hi")
+                    if elo is None or ehi is None:
+                        continue
+                    if blo <= ehi and elo <= bhi:  # closed-interval overlap
+                        clash = True
+                        break
+                if clash:
+                    continue
             # Quality gate — drop garbage long-shots even when they
             # show "edge" because a small probability error compounds
             # into a near-guaranteed loss when entry is tiny.
