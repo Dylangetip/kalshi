@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bets": {
+      "type": "http",
+      "url": "http://localhost:5000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${BETS_MCP_TOKEN}"
+      }
+    }
+  }
+}
