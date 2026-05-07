@@ -659,7 +659,7 @@ function SignalsView({ signals, state }) {
 }
 
 // ====== P&L ======
-function PnLView({ history, positions, states = [], liveHistory = false, stats = null }) {
+function PnLView({ history, positions, closedPositions = [], states = [], liveHistory = false, stats = null }) {
   const stateByCity = React.useMemo(() => {
     const m = {};
     for (const s of states || []) if (s?.city?.code) m[s.city.code] = s;
@@ -898,97 +898,153 @@ function PnLView({ history, positions, states = [], liveHistory = false, stats =
         </div>
       </div>
 
-      {(() => {
-        const closed = positions.filter(p => p.liveStatus === 'locked_win' || p.liveStatus === 'locked_loss');
-        const awaiting = positions.filter(p => p.liveStatus === 'awaiting_settlement');
-        if (closed.length === 0 && awaiting.length === 0) return null;
-        const [pageSize, setPageSize] = React.useState(20);
-        const [page, setPage] = React.useState(0);
-        const [expandedId, setExpandedId] = React.useState(null);
-        const [tab, setTab] = React.useState('locked');
-        const rows = tab === 'locked' ? closed : awaiting;
-        const totalPages = Math.ceil(rows.length / pageSize);
-        const slice = rows.slice(page * pageSize, (page + 1) * pageSize);
-        const closedNet = closed.reduce((s, p) =>
-          s + (p.liveStatus === 'locked_win' ? (p.ifWin || 0) : (p.ifLose || 0)), 0);
-        return (
-          <div className="panel">
-            <div className="panel-header">
-              <span>Closed positions</span>
-              <span className="panel-title-actions" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <button className="btn-sm" onClick={() => { setTab('locked'); setPage(0); }}
-                  style={{ fontWeight: tab === 'locked' ? 600 : 400 }}>
-                  Locked ({closed.length})
-                </button>
-                <button className="btn-sm" onClick={() => { setTab('awaiting'); setPage(0); }}
-                  style={{ fontWeight: tab === 'awaiting' ? 600 : 400 }}>
-                  Awaiting settlement ({awaiting.length})
-                </button>
-                {tab === 'locked' && (
-                  <span className={closedNet >= 0 ? 'pos mono' : 'neg mono'} style={{ fontSize: 11 }}>
-                    net {closedNet >= 0 ? '+' : ''}${Math.round(closedNet).toLocaleString()}
-                  </span>
-                )}
-                <select
-                  value={pageSize}
-                  onChange={e => { setPageSize(+e.target.value); setPage(0); }}
-                  style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 4px', fontSize: 11 }}
-                >
-                  {[20, 40, 60, 80, 100].map(n => <option key={n} value={n}>{n} / page</option>)}
-                </select>
+      <ClosedPositionsPanel
+        positions={positions}
+        closedPositions={closedPositions}
+        stateByCity={stateByCity}
+      />
+    </div>
+  );
+}
+
+function ClosedPositionsPanel({ positions, closedPositions, stateByCity }) {
+  const [pageSize, setPageSize] = React.useState(20);
+  const [page, setPage] = React.useState(0);
+  const [expandedId, setExpandedId] = React.useState(null);
+  const [tab, setTab] = React.useState('locked');
+  const [sortKey, setSortKey] = React.useState('recent');
+
+  // Locked-still-open: positions whose outcome is decided but the daily
+  // settlement job hasn't moved them to status='settled' yet.
+  const lockedLive = positions.filter(
+    p => p.liveStatus === 'locked_win' || p.liveStatus === 'locked_loss'
+  );
+  // De-dupe: if a settled row and a locked-live row share an id, prefer the
+  // settled one (post-settlement is the canonical record).
+  const settledIds = new Set(closedPositions.map(p => p.id));
+  const closed = [
+    ...closedPositions,
+    ...lockedLive.filter(p => !settledIds.has(p.id)),
+  ];
+  const awaiting = positions.filter(p => p.liveStatus === 'awaiting_settlement');
+
+  const outcomeOf = p => p.liveStatus === 'locked_win' ? (p.ifWin || 0) : (p.ifLose || 0);
+  const dateKey = p => {
+    if (p.settledAt) return p.settledAt * 1000;
+    if (p.placedAt) return p.placedAt;
+    if (p.targetDate) return new Date(p.targetDate).getTime();
+    return 0;
+  };
+
+  const sorted = React.useMemo(() => {
+    const arr = [...(tab === 'locked' ? closed : awaiting)];
+    if (sortKey === 'recent')   arr.sort((a, b) => dateKey(b) - dateKey(a));
+    if (sortKey === 'oldest')   arr.sort((a, b) => dateKey(a) - dateKey(b));
+    if (sortKey === 'biggest')  arr.sort((a, b) => outcomeOf(b) - outcomeOf(a));
+    if (sortKey === 'worst')    arr.sort((a, b) => outcomeOf(a) - outcomeOf(b));
+    if (sortKey === 'stake')    arr.sort((a, b) => (b.size || 0) - (a.size || 0));
+    if (sortKey === 'city')     arr.sort((a, b) => (a.city || '').localeCompare(b.city || ''));
+    return arr;
+  }, [tab, closed, awaiting, sortKey]);
+
+  if (closed.length === 0 && awaiting.length === 0) return null;
+
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const slice = sorted.slice(page * pageSize, (page + 1) * pageSize);
+  const closedNet = closed.reduce((s, p) => s + outcomeOf(p), 0);
+  const wins = closed.filter(p => p.liveStatus === 'locked_win').length;
+  const losses = closed.length - wins;
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Closed positions</span>
+        <span className="panel-title-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn-sm" onClick={() => { setTab('locked'); setPage(0); }}
+            style={{ fontWeight: tab === 'locked' ? 600 : 400 }}>
+            Closed ({closed.length})
+          </button>
+          <button className="btn-sm" onClick={() => { setTab('awaiting'); setPage(0); }}
+            style={{ fontWeight: tab === 'awaiting' ? 600 : 400 }}>
+            Awaiting settlement ({awaiting.length})
+          </button>
+          {tab === 'locked' && closed.length > 0 && (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+              {wins}W / {losses}L ·{' '}
+              <span className={closedNet >= 0 ? 'pos' : 'neg'}>
+                {closedNet >= 0 ? '+' : ''}${Math.round(closedNet).toLocaleString()}
               </span>
-            </div>
-            <table className="tbl">
-              <thead>
-                <tr>
-                  <th></th>
-                  <th>City</th><th>Bracket</th><th>Date</th><th>Live</th><th>Side</th>
-                  <th className="num-r">Stake</th><th className="num-r">Entry</th>
-                  <th className="num-r">Outcome P/L</th>
+            </span>
+          )}
+          <select
+            value={sortKey}
+            onChange={e => { setSortKey(e.target.value); setPage(0); }}
+            style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 4px', fontSize: 11 }}
+          >
+            <option value="recent">Most recent</option>
+            <option value="oldest">Oldest first</option>
+            <option value="biggest">Biggest win</option>
+            <option value="worst">Biggest loss</option>
+            <option value="stake">Largest stake</option>
+            <option value="city">City (A–Z)</option>
+          </select>
+          <select
+            value={pageSize}
+            onChange={e => { setPageSize(+e.target.value); setPage(0); }}
+            style={{ background: 'var(--bg-2)', color: 'var(--fg-1)', border: '1px solid var(--border)', borderRadius: 4, padding: '1px 4px', fontSize: 11 }}
+          >
+            {[20, 40, 60, 80, 100].map(n => <option key={n} value={n}>{n} / page</option>)}
+          </select>
+        </span>
+      </div>
+      <table className="tbl">
+        <thead>
+          <tr>
+            <th></th>
+            <th>City</th><th>Bracket</th><th>Date</th><th>Live</th><th>Side</th>
+            <th className="num-r">Stake</th><th className="num-r">Entry</th>
+            <th className="num-r">Outcome P/L</th>
+          </tr>
+        </thead>
+        <tbody>
+          {slice.map(p => {
+            const isOpen = expandedId === p.id;
+            const win = p.liveStatus === 'locked_win';
+            const isLocked = win || p.liveStatus === 'locked_loss';
+            const outcome = isLocked ? (win ? p.ifWin : p.ifLose) : null;
+            return (
+              <React.Fragment key={p.id}>
+                <tr style={{ cursor: 'pointer' }} onClick={() => setExpandedId(isOpen ? null : p.id)}>
+                  <td style={{ width: 18, textAlign: 'center', color: 'var(--fg-3)' }}>{isOpen ? '▾' : '▸'}</td>
+                  <td className="city-cell">{p.city}</td>
+                  <td>{p.bracket}</td>
+                  <td className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>{p.targetDate || '—'}</td>
+                  <td><LiveStatusCell position={p} /></td>
+                  <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
+                  <td className="num-r">${p.size}</td>
+                  <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
+                  <td className={`num-r ${outcome != null ? (outcome > 0 ? 'pos' : 'neg') : ''}`}>
+                    {outcome != null ? (outcome > 0 ? '+$' : '-$') + Math.abs(Math.round(outcome)).toLocaleString() : '—'}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {slice.map(p => {
-                  const isOpen = expandedId === p.id;
-                  const win = p.liveStatus === 'locked_win';
-                  const isLocked = win || p.liveStatus === 'locked_loss';
-                  const outcome = isLocked ? (win ? p.ifWin : p.ifLose) : null;
-                  return (
-                    <React.Fragment key={p.id}>
-                      <tr style={{ cursor: 'pointer' }} onClick={() => setExpandedId(isOpen ? null : p.id)}>
-                        <td style={{ width: 18, textAlign: 'center', color: 'var(--fg-3)' }}>{isOpen ? '▾' : '▸'}</td>
-                        <td className="city-cell">{p.city}</td>
-                        <td>{p.bracket}</td>
-                        <td className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>{p.targetDate || '—'}</td>
-                        <td><LiveStatusCell position={p} /></td>
-                        <td className={p.side === 'YES' ? 'pos' : 'neg'}>{p.side}</td>
-                        <td className="num-r">${p.size}</td>
-                        <td className="num-r">{(p.entry * 100).toFixed(0)}¢</td>
-                        <td className={`num-r ${outcome != null ? (outcome > 0 ? 'pos' : 'neg') : ''}`}>
-                          {outcome != null ? (outcome > 0 ? '+$' : '-$') + Math.abs(Math.round(outcome)).toLocaleString() : '—'}
-                        </td>
-                      </tr>
-                      {isOpen && <PositionDrilldown position={p} cityState={stateByCity[p.city]} colSpan={9} />}
-                    </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-            {totalPages > 1 && (
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--fg-2)' }}>
-                <span>Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, rows.length)} of {rows.length}</span>
-                <span style={{ display: 'flex', gap: 4 }}>
-                  <button className="btn-sm" onClick={() => setPage(0)} disabled={page === 0}>«</button>
-                  <button className="btn-sm" onClick={() => setPage(p => p - 1)} disabled={page === 0}>‹</button>
-                  <span style={{ padding: '0 6px', lineHeight: '22px' }}>pg {page + 1} / {totalPages}</span>
-                  <button className="btn-sm" onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1}>›</button>
-                  <button className="btn-sm" onClick={() => setPage(totalPages - 1)} disabled={page >= totalPages - 1}>»</button>
-                </span>
-              </div>
-            )}
-          </div>
-        );
-      })()}
+                {isOpen && <PositionDrilldown position={p} cityState={stateByCity[p.city]} colSpan={9} />}
+              </React.Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+      {totalPages > 1 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--fg-2)' }}>
+          <span>Showing {page * pageSize + 1}–{Math.min((page + 1) * pageSize, sorted.length)} of {sorted.length}</span>
+          <span style={{ display: 'flex', gap: 4 }}>
+            <button className="btn-sm" onClick={() => setPage(0)} disabled={page === 0}>«</button>
+            <button className="btn-sm" onClick={() => setPage(p => p - 1)} disabled={page === 0}>‹</button>
+            <span style={{ padding: '0 6px', lineHeight: '22px' }}>pg {page + 1} / {totalPages}</span>
+            <button className="btn-sm" onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1}>›</button>
+            <button className="btn-sm" onClick={() => setPage(totalPages - 1)} disabled={page >= totalPages - 1}>»</button>
+          </span>
+        </div>
+      )}
     </div>
   );
 }

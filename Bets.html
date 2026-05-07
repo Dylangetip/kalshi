@@ -62,6 +62,7 @@ function App() {
   const [betLog, setBetLog] = useState([]);
   const [history] = useState(() => MOCK.buildHistory());
   const [positions, setPositions] = useState(() => MOCK.buildOpenPositions());
+  const [closedPositions, setClosedPositions] = useState([]); // /api/closed-positions — all-time settled bets
   const [signals, setSignals] = useState(() => MOCK.buildSignals(MOCK.CITIES.find(c => c.code === 'NYC'), 1));
   const [now, setNow] = useState(new Date());
   const [tickFlash, setTickFlash] = useState({});
@@ -159,10 +160,11 @@ function App() {
   useEffect(() => {
     if (dataSource !== 'live') return;
     let cancelled = false;
-    Promise.all([MOCK.fetchBets(), MOCK.fetchPositions()]).then(([bets, pos]) => {
+    Promise.all([MOCK.fetchBets(), MOCK.fetchPositions(), MOCK.fetchClosedPositions()]).then(([bets, pos, closed]) => {
       if (cancelled) return;
       if (bets) setBetLog(bets);
       if (pos) setPositions(pos);
+      if (closed) setClosedPositions(closed);
     });
     return () => { cancelled = true; };
   }, [dataSource]);
@@ -172,12 +174,12 @@ function App() {
   // ticker edge value. Empty / single-point histories render nothing.
   useEffect(() => {
     if (dataSource !== 'live') {
-      setEdgeHistory({}); setLiveHistory(null); setLiveStats(null);
+      setEdgeHistory({}); setLiveHistory(null); setLiveStats(null); setClosedPositions([]);
       return;
     }
     let cancelled = false;
     const refresh = async () => {
-      const [edges, equity, stats, auto, acc, ml, diag, events, mdiff] = await Promise.all([
+      const [edges, equity, stats, auto, acc, ml, diag, events, mdiff, closed] = await Promise.all([
         Promise.all(MOCK.CITIES.map(c => MOCK.fetchEdgeHistory(c.code, 4))),
         MOCK.fetchEquity(72),
         MOCK.fetchStats(),
@@ -187,6 +189,7 @@ function App() {
         MOCK.fetchMlDiagnostics(),
         MOCK.fetchMlEvents(100),
         MOCK.fetchMlModelDiff(),
+        MOCK.fetchClosedPositions(),
       ]);
       if (cancelled) return;
       const map = {};
@@ -202,6 +205,7 @@ function App() {
       setMlDiagnostics(diag);
       setMlEvents(events);
       setMlModelDiff(mdiff);
+      if (closed) setClosedPositions(closed);
     };
     refresh();
     const t = setInterval(refresh, 60_000);
@@ -302,7 +306,7 @@ function App() {
           {tab === 'dashboard' && <DashboardView state={focus} history={effectiveHistory} />}
           {tab === 'terminal' && <TerminalView state={focus} onPlaceBet={placeBet} betLog={betLog} />}
           {tab === 'signals' && <SignalsView signals={signals} state={focus} />}
-          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} states={states} liveHistory={liveHistory != null} stats={liveStats} />}
+          {tab === 'pnl' && <PnLView history={effectiveHistory} positions={positions} closedPositions={closedPositions} states={states} liveHistory={liveHistory != null} stats={liveStats} />}
           {tab === 'auto' && (
             <AutoTradeView
               info={autoInfo}

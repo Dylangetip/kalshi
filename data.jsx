@@ -309,6 +309,16 @@ async function fetchPositions() {
   }
 }
 
+async function fetchClosedPositions() {
+  try {
+    const r = await fetch(API_BASE + '/api/closed-positions', { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 async function fetchStats() {
   try {
     const r = await fetch(`${API_BASE}/api/stats`, { cache: 'no-store' });
@@ -447,7 +457,7 @@ window.MOCK = {
   CITIES, SIGNAL_CATALOG,
   initialState, buildSignals, buildHistory, buildOpenPositions,
   seedRand, gauss, makeBrackets, buildCityState,
-  fetchLiveState, fetchBets, fetchPositions, fetchEdgeHistory, fetchEquity, fetchStats, fetchAccuracy,
+  fetchLiveState, fetchBets, fetchPositions, fetchClosedPositions, fetchEdgeHistory, fetchEquity, fetchStats, fetchAccuracy,
   fetchAutoTradeInfo, setAutoTradeConfig, triggerAutoTradeNow,
   fetchMlInfo, triggerMlBackfill, triggerMlTrain, fetchMlDiagnostics, fetchMlEvents, fetchMlModelDiff,
   persistBet, API_BASE,

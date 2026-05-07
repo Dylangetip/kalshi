@@ -306,6 +306,16 @@ def list_open_bets() -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def list_settled_bets() -> List[Dict]:
+    """All-time settled bets, newest settlement first."""
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT * FROM bets WHERE status='settled' "
+        "ORDER BY COALESCE(settled_at, placed_at/1000) DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def reset() -> None:
     """Test helper: wipe the bets table."""
     c = _conn_or_init()

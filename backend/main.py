@@ -1670,6 +1670,45 @@ def get_snapshots(code: str, hours: float = 24.0, limit: int = 500):
     ]
 
 
+def _settled_bet_to_position(b: Dict) -> Dict:
+    """Project a settled bet row into the same shape /api/positions returns
+    so the P&L "Closed positions" panel can render it without branching."""
+    entry = b["entry_cents"] / 100
+    size = b["size"]
+    settled_pl = b.get("settled_pl") or 0
+    win = settled_pl > 0
+    return {
+        "id": f"P{b['id']}",
+        "city": b["city"],
+        "bracket": b["bracket_label"],
+        "bracketLo": b.get("bracket_lo"),
+        "bracketHi": b.get("bracket_hi"),
+        "side": b["side"],
+        "size": size,
+        "entry": round(entry, 3),
+        "current": 1.0 if win else 0.0,
+        "ifWin": settled_pl if win else round((1 - entry) * (size / entry), 2) if b["side"] == "YES" else round(entry * (size / (1 - entry)), 2),
+        "ifLose": settled_pl if not win else -size,
+        "liveStatus": "locked_win" if win else "locked_loss",
+        "maxSoFarF": b.get("settled_max_f"),
+        "degreesFromBracket": 0.0,
+        "targetDate": b.get("target_date"),
+        "marketClosed": True,
+        "settled": True,
+        "settledAt": b.get("settled_at"),
+        "settledPl": settled_pl,
+        "placedAt": b.get("placed_at"),
+    }
+
+
+@app.get("/api/closed-positions")
+def get_closed_positions():
+    """All-time settled bets, projected into position shape so the P&L
+    'Closed positions' panel can render the full history (not just bets that
+    happen to still be open today)."""
+    return [_settled_bet_to_position(b) for b in db.list_settled_bets()]
+
+
 @app.get("/api/positions")
 async def get_positions():
     """Open positions marked to market against the latest cached state."""
