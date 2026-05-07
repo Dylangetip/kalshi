@@ -12,3 +12,4 @@ backend/bets.db-shm
 *.pem
 *.key
 backend/ml/models/*.pkl
+.mcp-token
