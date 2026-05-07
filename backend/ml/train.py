@@ -54,6 +54,13 @@ FEATURE_COLUMNS_NUMERIC: List[str] = [
     # (heatwaves, fronts, regime shifts).
     "roll7_mean_max_f",
     "seasonal_avg_max_f",
+    # Forecast horizon — strongest predictor of model uncertainty. A 72h
+    # forecast has materially higher variance than a 12h one, and the
+    # right strategy is "predict closer to climatology" the further out
+    # you go. Bucketed version (horizon_bucket) below lets non-linear
+    # learners capture the regime change cleanly.
+    "forecast_horizon_hours",
+    "horizon_bucket",
 ]
 FEATURE_COLUMNS_CATEGORICAL: List[str] = ["city"]
 TARGET_COLUMN = "actual_max_f"
@@ -193,6 +200,17 @@ def _engineer_features(df):
     # ── Forecast vs rolling local climate ──
     if "ensemble_max" in out.columns and "roll7_mean_max_f" in out.columns:
         out["ens_minus_roll7"] = out["ensemble_max"] - out["roll7_mean_max_f"]
+    # ── Forecast horizon bucket ──
+    # 0: ≤18h (same-day / overnight); 1: ≤30h (next-morning); 2: ≤48h
+    # (1-2 day lead); 3: >48h (multi-day). Lets non-linear learners
+    # capture the regime change cleanly without inferring from raw hours.
+    if "forecast_horizon_hours" in out.columns:
+        h = out["forecast_horizon_hours"].fillna(0).astype(float)
+        out["horizon_bucket"] = (
+            (h > 18).astype(int)
+            + (h > 30).astype(int)
+            + (h > 48).astype(int)
+        ).astype(float)
     return out
 
 
@@ -552,6 +570,43 @@ def permutation_audit(model, X_test, y_test, feature_cols, n_repeats: int = 3):
     return {"all": rows, "weak": weak}
 
 
+def _record_per_city_metrics(run_id: int, model, test_df, X_test, y_test) -> int:
+    """For each city in the test split, compute test MAE and bias
+    (mean(predicted − actual)) and persist to ml_city_metrics. Skips
+    silently if the model can't predict the test matrix or the test_df
+    has no 'city' column. Returns the number of rows written."""
+    try:
+        import pandas as pd  # type: ignore
+        preds = model.predict(X_test)
+        if "city" not in test_df.columns:
+            return 0
+        df = pd.DataFrame({
+            "city": test_df["city"].values,
+            "y": y_test.values if hasattr(y_test, "values") else y_test,
+            "yhat": preds,
+        })
+        df["err"] = df["yhat"] - df["y"]
+        rows = []
+        for city, sub in df.groupby("city"):
+            n = int(len(sub))
+            if n == 0:
+                continue
+            mae = float(sub["err"].abs().mean())
+            bias = float(sub["err"].mean())
+            rows.append({
+                "city": str(city),
+                "test_mae": round(mae, 3),
+                "bias": round(bias, 3),
+                "n_samples": n,
+            })
+        if not rows:
+            return 0
+        return db.insert_ml_city_metrics(run_id, rows)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[per-city-metrics] skipped: {exc}")
+        return 0
+
+
 def _make_fit_fn(algo: str):
     """Returns fit_fn(train_df, test_df) → MAE, used by walk_forward_mae
     so we can do the full feature-pipeline for each fold without
@@ -560,6 +615,12 @@ def _make_fit_fn(algo: str):
     # doesn't know about — proxy walk-forward to the best base learner
     # (gbm-best) since stack ≈ gbm in MAE.
     if algo.startswith("stack"):
+        algo = "gbm-best"
+    elif algo == "per-city":
+        # Per-city training fits N independent models per fold and
+        # walk-forward'ing each is prohibitively expensive. Proxy to
+        # gbm-best (a single global fit) so the headline number is at
+        # least directionally informative.
         algo = "gbm-best"
     elif algo.startswith("gbm["):
         # Specific gbm config from the gbm-best grid; rerun the grid each fold.
@@ -722,13 +783,18 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
 
         if algorithm == "stack":
             fit = _train_stack(X_train, y_train, X_test, y_test)
-            return _persist(fit, feature_cols, len(train_df), len(test_df), holdout_mae_ensemble)
+            wf = walk_forward_mae(df, _make_fit_fn("stack"))
+            run = _persist(fit, feature_cols, len(train_df), len(test_df),
+                           holdout_mae_ensemble, walk_forward_mae_v=wf)
+            _record_per_city_metrics(run["id"], fit["model"], test_df, X_test, y_test)
+            return run
 
         if algorithm == "per-city":
             payload = _train_per_city(df)
             if payload is None:
                 return {"error": "no city had enough rows (≥50) for per-city training"}
             algo = "per-city"
+            wf = walk_forward_mae(df, _make_fit_fn("per-city"))
             run = db.insert_ml_run(
                 algorithm=algo,
                 n_train=payload["n_train"], n_test=payload["n_test"],
@@ -737,6 +803,7 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
                 holdout_mae_ensemble=round(holdout_mae_ensemble, 3) if holdout_mae_ensemble is not None else None,
                 feature_columns=["per-city: see payload"],
                 model_path=str(MODELS_DIR / f"per-city-{int(time.time())}.pkl"),
+                walk_forward_mae=wf,
             )
             import joblib  # type: ignore
             joblib.dump({
@@ -848,6 +915,7 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
                                         holdout_mae_ensemble,
                                         walk_forward_mae_v=wf_mae,
                                         extra_payload=extra or None)
+                    _record_per_city_metrics(best_run["id"], c["model"], test_df, X_test, y_test)
                 else:
                     db.insert_ml_run(
                         algorithm=c["algorithm"],
@@ -869,8 +937,10 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
         algo_key = algorithm if algorithm in ("linear", "rf", "gbm", "gbm-best") else "linear"
         fit = _fit_one(algo_key, X_train, y_train, X_test, y_test)
         wf_mae = walk_forward_mae(df, _make_fit_fn(algo_key))
-        return _persist(fit, feature_cols, len(train_df), len(test_df),
-                        holdout_mae_ensemble, walk_forward_mae_v=wf_mae)
+        run = _persist(fit, feature_cols, len(train_df), len(test_df),
+                       holdout_mae_ensemble, walk_forward_mae_v=wf_mae)
+        _record_per_city_metrics(run["id"], fit["model"], test_df, X_test, y_test)
+        return run
     except Exception as exc:
         import traceback
         return {

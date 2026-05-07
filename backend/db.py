@@ -169,6 +169,20 @@ CREATE TABLE IF NOT EXISTS ml_events (
 );
 CREATE INDEX IF NOT EXISTS idx_mlevents_ts ON ml_events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_mlevents_kind ON ml_events(kind, ts DESC);
+
+-- Per-(run, city) test residual breakdown so we can spot which cities
+-- the model is dragging on. Populated after every train() that has a
+-- usable test split. bias = mean(predicted - actual) for the city.
+CREATE TABLE IF NOT EXISTS ml_city_metrics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES ml_runs(id),
+    city        TEXT    NOT NULL,
+    test_mae    REAL,
+    bias        REAL,
+    n_samples   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mlcm_run  ON ml_city_metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_mlcm_city ON ml_city_metrics(city);
 """
 
 _lock = threading.Lock()
@@ -223,6 +237,13 @@ def init() -> None:
                 _conn.execute("ALTER TABLE ml_runs ADD COLUMN hyperparams TEXT")
             if "walk_forward_mae" not in mlrun_cols:
                 _conn.execute("ALTER TABLE ml_runs ADD COLUMN walk_forward_mae REAL")
+            # Fingerprint = stable hash of (algorithm + n_train + features +
+            # hyperparams). Lets us skip a retrain when nothing changed.
+            if "fingerprint" not in mlrun_cols:
+                _conn.execute("ALTER TABLE ml_runs ADD COLUMN fingerprint TEXT")
+                _conn.execute("CREATE INDEX IF NOT EXISTS idx_mlruns_fp ON ml_runs(fingerprint)")
+            if "skipped" not in mlrun_cols:
+                _conn.execute("ALTER TABLE ml_runs ADD COLUMN skipped INTEGER DEFAULT 0")
             _conn.commit()
 
 
@@ -803,6 +824,66 @@ def get_seasonal_avg(city: str, target_date: str) -> Optional[float]:
     return None
 
 
+def compute_ml_run_fingerprint(
+    algorithm: str,
+    n_train: int,
+    feature_columns: List[str],
+    hyperparams: Optional[Dict] = None,
+) -> str:
+    """Stable hash that identifies a "would produce the same model" config.
+    Skipping a retrain when the fingerprint matches an already-recorded row
+    keeps ml_runs from filling up with identical no-op rows."""
+    import hashlib
+    payload = json.dumps({
+        "algorithm": algorithm,
+        "n_train": int(n_train or 0),
+        "features": sorted([f for f in (feature_columns or []) if f]),
+        "hp": hyperparams or {},
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def find_ml_run_by_fingerprint(fingerprint: str) -> Optional[Dict]:
+    """Return the most-recent ml_runs row matching a fingerprint, or None.
+    Used by the retrain loop to short-circuit when nothing has changed."""
+    if not fingerprint:
+        return None
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT * FROM ml_runs WHERE fingerprint = ? "
+        "AND COALESCE(skipped, 0) = 0 "
+        "ORDER BY trained_at DESC, id DESC LIMIT 1",
+        (fingerprint,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def log_ml_run_skipped(
+    algorithm: str,
+    n_train: int,
+    fingerprint: str,
+    matched_run_id: int,
+) -> Dict:
+    """Insert a stub row marking that we skipped a retrain because the
+    fingerprint already exists. Lets the activity feed show 'skipped'
+    cleanly without polluting the metric history."""
+    c = _conn_or_init()
+    with _lock:
+        cur = c.execute(
+            """INSERT INTO ml_runs (
+                trained_at, algorithm, n_train, n_test,
+                feature_columns, model_path,
+                fingerprint, skipped, role
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (int(_time.time()), algorithm, n_train, 0,
+             json.dumps([]), f"(skipped, see run {matched_run_id})",
+             fingerprint, 1, "archived"),
+        )
+        c.commit()
+        row = c.execute("SELECT * FROM ml_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
 def insert_ml_run(
     algorithm: str,
     n_train: int,
@@ -815,7 +896,12 @@ def insert_ml_run(
     walk_forward_mae: Optional[float] = None,
     hyperparams: Optional[Dict] = None,
     role: str = "champion",
+    fingerprint: Optional[str] = None,
 ) -> Dict:
+    if fingerprint is None:
+        fingerprint = compute_ml_run_fingerprint(
+            algorithm, n_train, feature_columns, hyperparams,
+        )
     c = _conn_or_init()
     with _lock:
         cur = c.execute(
@@ -823,18 +909,49 @@ def insert_ml_run(
                 trained_at, algorithm, n_train, n_test,
                 train_mae, test_mae, holdout_mae_ensemble,
                 feature_columns, model_path,
-                walk_forward_mae, hyperparams, role
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                walk_forward_mae, hyperparams, role, fingerprint
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (int(_time.time()), algorithm, n_train, n_test,
              train_mae, test_mae, holdout_mae_ensemble,
              json.dumps(feature_columns), model_path,
              walk_forward_mae,
              json.dumps(hyperparams) if hyperparams else None,
-             role),
+             role, fingerprint),
         )
         c.commit()
         row = c.execute("SELECT * FROM ml_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
+
+
+def insert_ml_city_metrics(run_id: int, rows: List[Dict]) -> int:
+    """Bulk-insert per-(city) test residuals for a training run.
+    rows: [{city, test_mae, bias, n_samples}, ...]"""
+    if not rows:
+        return 0
+    c = _conn_or_init()
+    with _lock:
+        c.executemany(
+            "INSERT INTO ml_city_metrics (run_id, city, test_mae, bias, n_samples) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(run_id, r["city"], r.get("test_mae"), r.get("bias"), r.get("n_samples", 0))
+             for r in rows],
+        )
+        c.commit()
+    return len(rows)
+
+
+def list_ml_city_metrics(run_id: Optional[int] = None, limit: int = 100) -> List[Dict]:
+    c = _conn_or_init()
+    if run_id is None:
+        rows = c.execute(
+            "SELECT * FROM ml_city_metrics ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT * FROM ml_city_metrics WHERE run_id = ? ORDER BY city",
+            (run_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def list_runs_by_role(role: str, limit: int = 10) -> List[Dict]:

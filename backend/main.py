@@ -681,12 +681,40 @@ async def _ml_retrain_loop() -> None:
         new_rows = cur_paired - last_paired_count
         trigger = "data_threshold" if new_rows >= 50 else "scheduled"
         try:
+            prev = db.latest_ml_run()
+            # Pre-train dedup gate. If the previous run trained on exactly
+            # the same n_paired AND already has both test_mae and
+            # walk_forward_mae populated, nothing has changed since — skip
+            # the entire sweep instead of burning CPU on a duplicate.
+            # Triggered runs (data_threshold) already imply n_paired grew,
+            # so this only blocks the daily scheduled tick on a quiet day.
+            if (prev
+                and prev.get("n_train") == cur_paired
+                and prev.get("test_mae") is not None
+                and prev.get("walk_forward_mae") is not None
+                and not prev.get("skipped")):
+                db.log_ml_event(
+                    "retrain_done",
+                    {"skipped": True, "n_paired": cur_paired,
+                     "matched_run_id": prev["id"], "reason": "no new data"},
+                    f"retrain skipped — no new pairs since run {prev['id']} "
+                    f"(n_paired={cur_paired:,})",
+                )
+                # Mark a stub row so the activity feed reflects the tick.
+                fp = db.compute_ml_run_fingerprint(
+                    prev["algorithm"], cur_paired, [], None,
+                )
+                db.log_ml_run_skipped(
+                    prev["algorithm"], cur_paired, fp, prev["id"],
+                )
+                last_paired_count = cur_paired
+                await asyncio.sleep(max(0, ML_RETRAIN_INTERVAL_SECONDS - ML_RETRAIN_INITIAL_DELAY_SECONDS))
+                continue
             db.log_ml_event(
                 "retrain_start",
                 {"trigger": trigger, "n_paired": cur_paired, "new_since_last": new_rows},
                 f"retrain started — trigger={trigger}, n_paired={cur_paired:,}",
             )
-            prev = db.latest_ml_run()
             # Training is sync and CPU-bound (sklearn). Run it in a thread
             # so the event loop stays free for HTTP traffic.
             run = await asyncio.to_thread(ml_train.train, algorithm="auto")
@@ -709,18 +737,28 @@ async def _ml_retrain_loop() -> None:
                     f"retrain done — kept {run.get('algorithm')} "
                     f"(test_mae={run.get('test_mae')})",
                 )
-                if prev and prev.get("test_mae") and run.get("test_mae"):
-                    delta = run["test_mae"] - prev["test_mae"]
-                    pct = (delta / prev["test_mae"]) * 100 if prev["test_mae"] else 0.0
+                # Champion selection prefers walk_forward_mae (the honest
+                # time-series eval). Falls back to test_mae if WF wasn't
+                # computed for either run, but a model with no WF metric
+                # is ineligible to take champion from a model that has one.
+                prev_wf = (prev or {}).get("walk_forward_mae")
+                run_wf  = run.get("walk_forward_mae")
+                metric_used = "walk_forward_mae" if (prev_wf is not None and run_wf is not None) else "test_mae"
+                prev_v = prev_wf if metric_used == "walk_forward_mae" else (prev or {}).get("test_mae")
+                run_v  = run_wf  if metric_used == "walk_forward_mae" else run.get("test_mae")
+                if prev and prev_v and run_v:
+                    delta = run_v - prev_v
+                    pct = (delta / prev_v) * 100 if prev_v else 0.0
                     arrow = "↘" if delta < 0 else "↗"
                     db.log_ml_event(
                         "model_swap",
                         {"from": prev.get("algorithm"), "to": run.get("algorithm"),
-                         "from_test_mae": prev.get("test_mae"),
-                         "to_test_mae": run.get("test_mae"),
+                         "metric_used": metric_used,
+                         f"from_{metric_used}": prev_v,
+                         f"to_{metric_used}":   run_v,
                          "delta": round(delta, 4), "pct": round(pct, 2)},
-                        f"model swap — test_mae {prev['test_mae']:.3f} {arrow} "
-                        f"{run['test_mae']:.3f} ({pct:+.1f}%)",
+                        f"model swap — {metric_used} {prev_v:.3f} {arrow} "
+                        f"{run_v:.3f} ({pct:+.1f}%)",
                     )
                     # ── Champion/challenger gate ──
                     # Auto-promote new model if it beats champion by ≥5%.
@@ -962,8 +1000,17 @@ class PlaceBetIn(BaseModel):
     bracket_lo: int
     bracket_hi: int
     side: str = Field(pattern="^(YES|NO)$")
-    size: int = Field(gt=0)
+    # `size` is now optional — when omitted (None) the server computes it
+    # from the auto-trader's tier table using `edge_cents` and live equity,
+    # so manual bets get the same fluid sizing the loop uses. Pass an
+    # explicit positive value to override (legacy "I want exactly $X"
+    # behavior; useful for ad-hoc sandbox bets).
+    size: Optional[int] = Field(None, gt=0)
     entry_cents: int = Field(ge=0, le=100)
+    # Optional: edge in cents (modelPct − kalshiPct) for tier lookup when
+    # `size` is auto-computed. Frontend has this from /api/state's
+    # brackets[*].edge so we don't have to round-trip to look it up.
+    edge_cents: Optional[float] = Field(None, ge=-100, le=100)
 
 
 def _close_at_for_bet(b: Dict) -> Optional[str]:
@@ -1166,13 +1213,39 @@ def place_bet(b: PlaceBetIn):
     city_code = b.city.upper()
     city = next((c for c in CITIES if c["code"] == city_code), None)
     target_date = _city_target_date(city) if city else None
+    # Resolve final stake. When `size` is omitted, route through the same
+    # tier-sizing path the auto-trader uses so manual placements scale
+    # with the live account too — fixes the "manual bets default to
+    # $50 regardless of edge" pattern surfaced in the bet-by-bet review.
+    cfg = _auto_trade_state
+    size = b.size
+    if size is None:
+        stats = db.stats_summary()
+        starting_cash = float(cfg.get("bankroll") or 10000)
+        total_equity = starting_cash + stats["realizedPl"]
+        available_cash = total_equity - stats["openStakes"]
+        # Edge fallback: if frontend didn't pass it, treat as 0 — Kelly
+        # fraction will be tiny and tier lookup will fall through to the
+        # min_usd floor. Better to under-size than to silently $0-out.
+        edge_cents = float(b.edge_cents or 0.0)
+        edge_frac = edge_cents / 100.0
+        # kalshi_pct ≈ entry_cents / 100. Use that for the kelly arg.
+        kalshi_pct = (b.entry_cents or 50) / 100.0
+        kelly = kelly_fraction(edge_frac, kalshi_pct)
+        size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
+        if size <= 0:
+            raise HTTPException(
+                400,
+                "auto-sized to $0 — available cash too low or edge below tier thresholds. "
+                "Pass an explicit `size` to override.",
+            )
     row = db.insert_bet(
         city=city_code,
         bracket_label=b.bracket_label,
         bracket_lo=b.bracket_lo,
         bracket_hi=b.bracket_hi,
         side=b.side,
-        size=b.size,
+        size=int(size),
         entry_cents=b.entry_cents,
         target_date=target_date,
     )
@@ -1513,6 +1586,40 @@ def recompute_settled_pl():
 @app.get("/api/stats")
 def get_stats():
     return db.stats_summary()
+
+
+@app.post("/api/ml/runs/dedupe")
+def ml_runs_dedupe():
+    """Bulk-archive duplicate ml_runs rows. Keeps the most recent row
+    for each unique (algorithm, n_train, ROUND(test_mae, 4)) tuple as
+    'champion' and demotes everything else to 'archived'. Idempotent —
+    safe to call repeatedly; subsequent calls have no further effect."""
+    c = db._conn_or_init()
+    with db._lock:
+        cur = c.execute(
+            """
+            UPDATE ml_runs SET role='archived'
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM ml_runs
+                WHERE COALESCE(skipped, 0) = 0
+                GROUP BY algorithm, n_train, ROUND(COALESCE(test_mae, -1), 4)
+            )
+            AND role = 'champion'
+            AND COALESCE(skipped, 0) = 0
+            """
+        )
+        archived = cur.rowcount
+        # Also count remaining champions per algorithm so the response
+        # makes the shape of the cleanup obvious.
+        survivors = c.execute(
+            "SELECT algorithm, COUNT(*) AS n FROM ml_runs "
+            "WHERE role='champion' GROUP BY algorithm"
+        ).fetchall()
+        c.commit()
+    return {
+        "archived": archived,
+        "champions_remaining": {r["algorithm"]: r["n"] for r in survivors},
+    }
 
 
 # ── Read-only SQL console ───────────────────────────────────────────────────
