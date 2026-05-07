@@ -67,13 +67,18 @@ EOF
     exit 1
 fi
 
+if [ -n "${BETS_MCP_TOKEN:-}" ]; then
+    AUTH_DISP="bearer (configured)"
+else
+    AUTH_DISP="DISABLED via BETS_MCP_ALLOW_NO_AUTH=1"
+fi
 echo
 echo "  ┌──────────────────────────────────────────────────────┐"
 echo "  │  Bets MCP server                                     │"
 echo "  │                                                      │"
 echo "  │  url:    http://${HOST}:${PORT}/mcp"
 echo "  │  proxy:  ${API_BASE}"
-echo "  │  auth:   ${BETS_MCP_TOKEN:+bearer (configured)}${BETS_MCP_TOKEN:-DISABLED via BETS_MCP_ALLOW_NO_AUTH=1}"
+echo "  │  auth:   ${AUTH_DISP}"
 echo "  │                                                      │"
 echo "  │  press Ctrl+C to stop                                │"
 echo "  └──────────────────────────────────────────────────────┘"
