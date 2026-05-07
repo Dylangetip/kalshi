@@ -914,19 +914,21 @@ function ClosedPositionsPanel({ positions, closedPositions, stateByCity }) {
   const [tab, setTab] = React.useState('locked');
   const [sortKey, setSortKey] = React.useState('recent');
 
+  const positionsArr = Array.isArray(positions) ? positions : [];
+  const closedArr = Array.isArray(closedPositions) ? closedPositions : [];
   // Locked-still-open: positions whose outcome is decided but the daily
   // settlement job hasn't moved them to status='settled' yet.
-  const lockedLive = positions.filter(
+  const lockedLive = positionsArr.filter(
     p => p.liveStatus === 'locked_win' || p.liveStatus === 'locked_loss'
   );
   // De-dupe: if a settled row and a locked-live row share an id, prefer the
   // settled one (post-settlement is the canonical record).
-  const settledIds = new Set(closedPositions.map(p => p.id));
+  const settledIds = new Set(closedArr.map(p => p.id));
   const closed = [
-    ...closedPositions,
+    ...closedArr,
     ...lockedLive.filter(p => !settledIds.has(p.id)),
   ];
-  const awaiting = positions.filter(p => p.liveStatus === 'awaiting_settlement');
+  const awaiting = positionsArr.filter(p => p.liveStatus === 'awaiting_settlement');
 
   const outcomeOf = p => p.liveStatus === 'locked_win' ? (p.ifWin || 0) : (p.ifLose || 0);
   const dateKey = p => {
