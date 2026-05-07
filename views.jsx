@@ -2484,4 +2484,185 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
   );
 }
 
-Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView, MlView });
+// ====== DB / SQL CONSOLE ======
+// Read-only SQLite console for ad-hoc data inspection. Backend rejects
+// anything that isn't a single SELECT/WITH and runs against a ?mode=ro
+// connection, so even a craftily-encoded write attempt can't mutate.
+
+const DB_PRESET_QUERIES = [
+  {
+    label: 'bets by status',
+    sql: "SELECT status, COUNT(*) AS n, ROUND(SUM(size), 0) AS total_stake\nFROM bets\nGROUP BY status",
+  },
+  {
+    label: 'recent settled bets',
+    sql: "SELECT id, city, bracket_label, bracket_lo, bracket_hi, side, size,\n       entry_cents, settled_pl, settled_max_f, target_date,\n       datetime(settled_at, 'unixepoch') AS settled\nFROM bets\nWHERE status='settled'\nORDER BY settled_at DESC\nLIMIT 50",
+  },
+  {
+    label: 'closed by city · win rate',
+    sql: "SELECT city,\n       COUNT(*) AS n,\n       SUM(CASE WHEN settled_pl > 0 THEN 1 ELSE 0 END) AS wins,\n       SUM(CASE WHEN settled_pl <= 0 THEN 1 ELSE 0 END) AS losses,\n       ROUND(AVG(CASE WHEN settled_pl > 0 THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_pct,\n       ROUND(SUM(settled_pl), 2) AS net_pl\nFROM bets\nWHERE status='settled'\nGROUP BY city\nORDER BY net_pl DESC",
+  },
+  {
+    label: 'open exposure by city',
+    sql: "SELECT city, COUNT(*) AS n, SUM(size) AS exposure\nFROM bets\nWHERE status='open'\nGROUP BY city\nORDER BY exposure DESC",
+  },
+  {
+    label: 'suspect ≤X wins (max_f below bracket_lo)',
+    sql: "SELECT id, city, bracket_label, bracket_lo, bracket_hi,\n       side, settled_pl, settled_max_f, target_date\nFROM bets\nWHERE status='settled'\n  AND settled_pl > 0\n  AND (settled_max_f < bracket_lo OR settled_max_f > bracket_hi)\nORDER BY settled_at DESC",
+  },
+  {
+    label: 'ml runs (recent)',
+    sql: "SELECT id, ts, algorithm, role, n_train, n_test,\n       ROUND(test_mae, 3) AS test_mae,\n       ROUND(walk_forward_mae, 3) AS wf_mae\nFROM ml_runs\nORDER BY ts DESC\nLIMIT 30",
+  },
+];
+
+function DbView() {
+  const [query, setQuery] = useState_v(DB_PRESET_QUERIES[0].sql);
+  const [result, setResult] = useState_v(null);
+  const [busy, setBusy] = useState_v(false);
+  const [schema, setSchema] = useState_v(null);
+  const [showSchema, setShowSchema] = useState_v(true);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    MOCK.fetchSqlSchema().then(s => { if (!cancelled) setSchema(s); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const r = await MOCK.runSql(query);
+      setResult(r);
+    } finally { setBusy(false); }
+  };
+
+  const onKey = e => {
+    // Ctrl/Cmd+Enter runs the query — much faster than reaching for the button.
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      run();
+    }
+  };
+
+  return (
+    <div className="pnl-layout">
+      <div className="panel">
+        <div className="panel-header">
+          <span>SQL console <span style={{ color: 'var(--fg-3)', fontSize: 11, marginLeft: 8 }}>read-only · single SELECT · {schema?.row_cap || 1000} row cap</span></span>
+          <span className="panel-title-actions" style={{ display: 'flex', gap: 6 }}>
+            <button className="btn-sm" onClick={() => setShowSchema(s => !s)}>
+              {showSchema ? 'hide schema' : 'show schema'}
+            </button>
+            <button className="btn primary sm" disabled={busy || !query.trim()} onClick={run}>
+              {busy ? 'running…' : 'Run (Ctrl+Enter)'}
+            </button>
+          </span>
+        </div>
+        <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {DB_PRESET_QUERIES.map(p => (
+              <button
+                key={p.label}
+                className="btn-sm"
+                onClick={() => { setQuery(p.sql); }}
+                title={p.sql}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <textarea
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={onKey}
+            spellCheck={false}
+            style={{
+              minHeight: 140, fontFamily: 'ui-monospace, Menlo, monospace',
+              fontSize: 12, lineHeight: 1.5, padding: 10,
+              background: 'var(--bg-2)', color: 'var(--fg-1)',
+              border: '1px solid var(--border)', borderRadius: 4,
+              resize: 'vertical', whiteSpace: 'pre',
+            }}
+          />
+          {result?.error && (
+            <div className="neg" style={{ fontSize: 12, fontFamily: 'ui-monospace, Menlo, monospace' }}>
+              error: {result.error}
+            </div>
+          )}
+          {result && !result.error && (
+            <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+              {result.row_count.toLocaleString()} rows in {result.query_ms}ms
+              {result.truncated && <span className="neg"> · truncated at {result.row_cap}</span>}
+            </div>
+          )}
+        </div>
+        {result && !result.error && result.rows && (
+          <div style={{ overflowX: 'auto', borderTop: '1px solid var(--border)' }}>
+            <table className="tbl">
+              <thead>
+                <tr>
+                  {result.columns.map(c => <th key={c}>{c}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {result.rows.map((row, i) => (
+                  <tr key={i}>
+                    {row.map((v, j) => (
+                      <td key={j} className="mono" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
+                        {v === null ? <span style={{ color: 'var(--fg-3)' }}>NULL</span>
+                         : typeof v === 'number' ? v.toLocaleString()
+                         : String(v)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {showSchema && schema && schema.tables && (
+        <div className="panel">
+          <div className="panel-header">
+            <span>Schema</span>
+            <span className="panel-title-actions">
+              <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>{schema.tables.length} tables</span>
+            </span>
+          </div>
+          <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
+            {schema.tables.map(t => (
+              <div key={t.name} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+                  <button
+                    className="btn-sm"
+                    onClick={() => setQuery(`SELECT * FROM ${t.name} LIMIT 50`)}
+                    title="load a SELECT * for this table"
+                    style={{ fontWeight: 600 }}
+                  >
+                    {t.name}
+                  </button>
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                    {t.row_count.toLocaleString()} rows
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, fontFamily: 'ui-monospace, Menlo, monospace', lineHeight: 1.6 }}>
+                  {t.columns.map(c => (
+                    <div key={c.name} style={{ display: 'flex', gap: 6, color: c.pk ? 'var(--accent)' : 'var(--fg-2)' }}>
+                      <span style={{ minWidth: 18, color: 'var(--accent)' }}>{c.pk ? 'PK' : ''}</span>
+                      <span style={{ flex: 1 }}>{c.name}</span>
+                      <span style={{ color: 'var(--fg-3)' }}>{c.type || ''}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+Object.assign(window, { OpportunitiesView, DashboardView, TerminalView, SignalsView, PnLView, AutoTradeView, MlView, DbView });

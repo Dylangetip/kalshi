@@ -246,6 +246,7 @@ function App() {
     { id: 'pnl', label: 'P&L' },
     { id: 'auto', label: 'Auto-Trade', badge: autoInfo?.enabled ? '●' : null },
     { id: 'ml', label: 'ML Model', badge: mlInfo?.latest_run?.trained ? '✓' : null },
+    { id: 'db', label: 'DB' },
   ];
 
   return (
@@ -352,6 +353,7 @@ function App() {
               }}
             />
           )}
+          {tab === 'db' && <DbView />}
         </div>
       </div>
 

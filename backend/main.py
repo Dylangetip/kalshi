@@ -18,6 +18,7 @@ mock data.
 
 import asyncio
 import os
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -162,6 +163,12 @@ ML_RETRAIN_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_RETRAIN_LOOP") == "1"
 # INSERT OR REPLACE in the upsert helpers.
 ML_BACKFILL_INTERVAL_SECONDS = int(os.getenv("BETS_ML_BACKFILL_INTERVAL", "86400"))
 ML_BACKFILL_LOOP_DISABLED = os.getenv("BETS_DISABLE_ML_BACKFILL_LOOP") == "1"
+
+# Read-only SQL console. Disabled by default outside localhost dev — set
+# BETS_DISABLE_SQL_CONSOLE=1 to turn it off entirely. Enforces SELECT-only,
+# single-statement, hard row cap.
+SQL_CONSOLE_DISABLED = os.getenv("BETS_DISABLE_SQL_CONSOLE") == "1"
+SQL_CONSOLE_ROW_CAP = int(os.getenv("BETS_SQL_CONSOLE_ROW_CAP", "1000"))
 
 # Blend weight for blended_max = α · ml_max + (1−α) · model_max.
 # Runtime-mutable model controls (UI can change without restart).
@@ -1265,6 +1272,136 @@ def recompute_settled_pl():
 @app.get("/api/stats")
 def get_stats():
     return db.stats_summary()
+
+
+# ── Read-only SQL console ───────────────────────────────────────────────────
+
+class SqlQueryIn(BaseModel):
+    query: str = Field(..., min_length=1, max_length=10_000)
+
+
+def _strip_sql_comments(q: str) -> str:
+    """Drop -- line comments and /* ... */ block comments before validating."""
+    out = []
+    i = 0
+    n = len(q)
+    in_block = False
+    while i < n:
+        if in_block:
+            if q[i:i+2] == "*/":
+                in_block = False
+                i += 2
+            else:
+                i += 1
+            continue
+        if q[i:i+2] == "--":
+            j = q.find("\n", i)
+            if j == -1:
+                break
+            i = j + 1
+            continue
+        if q[i:i+2] == "/*":
+            in_block = True
+            i += 2
+            continue
+        out.append(q[i])
+        i += 1
+    return "".join(out)
+
+
+_SQL_FORBIDDEN_TOKENS = (
+    "insert ", "update ", "delete ", "drop ", "alter ", "create ",
+    "replace ", "attach ", "detach ", "vacuum", "pragma ",
+)
+
+
+@app.post("/api/admin/sql")
+def admin_sql(payload: SqlQueryIn):
+    """Execute a read-only SELECT against the bets database. Returns
+    {columns, rows, row_count, truncated, query_ms, query}.
+
+    Hard rules: must start with SELECT or WITH, single statement only,
+    no destructive verbs anywhere in the body, and a fixed row cap so a
+    runaway cross-join doesn't OOM the server."""
+    if SQL_CONSOLE_DISABLED:
+        raise HTTPException(403, "sql console disabled (BETS_DISABLE_SQL_CONSOLE=1)")
+
+    raw = payload.query.strip().rstrip(";").strip()
+    if not raw:
+        raise HTTPException(400, "empty query")
+
+    cleaned = _strip_sql_comments(raw).strip()
+    cleaned_lower = cleaned.lower()
+
+    # Single-statement: no semicolons left after stripping comments + trailing
+    # semicolons. (sqlite would only execute the first one anyway via execute,
+    # but rejecting upfront keeps error messages honest.)
+    if ";" in cleaned:
+        raise HTTPException(400, "only a single statement is allowed")
+    if not (cleaned_lower.startswith("select") or cleaned_lower.startswith("with")):
+        raise HTTPException(400, "only SELECT (or WITH ... SELECT) queries are allowed")
+    for tok in _SQL_FORBIDDEN_TOKENS:
+        if tok in cleaned_lower:
+            raise HTTPException(400, f"keyword not allowed in read-only console: {tok.strip()}")
+
+    # Open a fresh read-only connection so even a loophole can't write.
+    uri = f"file:{db.DB_PATH}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        t0 = time.time()
+        try:
+            cur = conn.execute(raw)
+        except sqlite3.Error as exc:
+            raise HTTPException(400, f"sql error: {exc}")
+        cap = SQL_CONSOLE_ROW_CAP
+        rows_raw = cur.fetchmany(cap + 1)
+        truncated = len(rows_raw) > cap
+        rows_raw = rows_raw[:cap]
+        columns = [d[0] for d in (cur.description or [])]
+        rows = [[r[c] for c in columns] for r in rows_raw]
+        elapsed_ms = int((time.time() - t0) * 1000)
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": truncated,
+            "query_ms": elapsed_ms,
+            "query": raw,
+            "row_cap": cap,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/sql/schema")
+def admin_sql_schema():
+    """List tables + their columns so the SQL console can show a quick
+    schema reference without the user having to query sqlite_master."""
+    if SQL_CONSOLE_DISABLED:
+        raise HTTPException(403, "sql console disabled")
+    uri = f"file:{db.DB_PATH}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = [
+            r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        out = []
+        for t in tables:
+            cols = conn.execute(f"PRAGMA table_info({t})").fetchall()
+            count = conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            out.append({
+                "name": t,
+                "row_count": count,
+                "columns": [{"name": c["name"], "type": c["type"], "notnull": bool(c["notnull"]), "pk": bool(c["pk"])} for c in cols],
+            })
+        return {"tables": out, "row_cap": SQL_CONSOLE_ROW_CAP}
+    finally:
+        conn.close()
 
 
 @app.get("/api/accuracy")
