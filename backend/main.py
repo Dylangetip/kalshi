@@ -150,6 +150,10 @@ _auto_trade_state: Dict = {
     #     extra upside.
     "require_peak_in_bracket": os.getenv("BETS_AUTO_TRADE_REQUIRE_PEAK", "1") != "0",
     "prevent_overlapping_brackets": os.getenv("BETS_AUTO_TRADE_PREVENT_OVERLAP", "1") != "0",
+    # Stop-loss floor — the auto-trader refuses to place a bet that would
+    # bring `available_cash - size` below this number. Acts as a circuit
+    # breaker so a runaway sweep can't drain the account to zero.
+    "min_balance_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_BALANCE", "100")),
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -889,6 +893,15 @@ async def _ml_incremental_backfill_loop() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
+    # Validate auto-trader config up front. Doesn't HALT startup (we still
+    # want HTTP / UI / MCP up so the user can see + fix things), but logs
+    # loud so the issue isn't silent. Each tick re-validates and skips
+    # while the issue persists.
+    cfg_errors = _validate_auto_trade_cfg(_auto_trade_state)
+    if cfg_errors:
+        msg = "; ".join(cfg_errors)
+        print(f"[auto-trader] WARNING: config invalid at startup: {msg}")
+        print("[auto-trader] auto-trader ticks will skip until this is fixed via /api/auto-trade/config")
     global _snapshot_task, _settlement_task, _auto_trader_task, _ml_retrain_task, _ml_incremental_backfill_task
     if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
@@ -942,6 +955,7 @@ class AutoTradeConfigIn(BaseModel):
     size_tiers: Optional[List[SizeTierIn]] = None
     require_peak_in_bracket: Optional[bool] = None
     prevent_overlapping_brackets: Optional[bool] = None
+    min_balance_usd: Optional[float] = Field(None, ge=0)
 
 
 @app.get("/api/auto-trade/info")
@@ -957,7 +971,7 @@ def auto_trade_config(c: AutoTradeConfigIn):
     explicit max_usd in the same request, max_usd is auto-recomputed
     as 5% of bankroll (¼-Kelly cap)."""
     for k in ("enabled", "min_edge_cents", "bankroll", "max_usd",
-              "max_pct_of_balance", "min_usd",
+              "max_pct_of_balance", "min_usd", "min_balance_usd",
               "interval_seconds", "max_bets_per_city_per_day",
               "min_model_pct", "min_kelly", "skip_entry_below_cents",
               "bet_sizing_mode",
@@ -976,8 +990,16 @@ def auto_trade_config(c: AutoTradeConfigIn):
             if t.size_usd is not None:       row["size_usd"]       = t.size_usd
             out.append(row)
         _auto_trade_state["size_tiers"] = out
-    if c.bankroll is not None and c.max_usd is None:
-        _auto_trade_state["max_usd"] = round(_auto_trade_state["bankroll"] * 0.05, 2)
+    # max_usd is intentionally NOT recomputed when bankroll changes —
+    # it's a HARD ceiling, not a percentage. Setting bankroll=$1000 used
+    # to silently drop max_usd from $10,000 → $50, which collided with
+    # min_usd=$50 and clamped every bet to exactly the minimum. The
+    # percent-of-balance scaling lives in max_pct_of_balance and the
+    # tier table — both fluid by design. max_usd is the absolute belt.
+    errors = _validate_auto_trade_cfg(_auto_trade_state)
+    if errors:
+        # Don't accept config that would jam the trader.
+        raise HTTPException(400, "; ".join(errors))
     return {**_auto_trade_state}
 
 
@@ -1335,6 +1357,47 @@ async def _settlement_loop() -> None:
         await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
 
 
+def _validate_auto_trade_cfg(cfg: Dict) -> List[str]:
+    """Sanity-check the auto-trader config so a bad knob can't silently
+    misbehave. Returns a list of human-readable error strings; empty list
+    means OK. Called at startup AND before every tick.
+
+    Invariants:
+      - min_usd > 0
+      - min_usd < max_usd  (otherwise sizing is clamped to a single value)
+      - min_balance_usd < bankroll  (otherwise the floor blocks the seed)
+      - max_pct_of_balance ∈ [0, 1]
+    """
+    errors: List[str] = []
+    min_usd = float(cfg.get("min_usd") or 0)
+    max_usd = float(cfg.get("max_usd") or 0)
+    bankroll = float(cfg.get("bankroll") or 0)
+    min_balance = float(cfg.get("min_balance_usd") or 0)
+    max_pct = cfg.get("max_pct_of_balance")
+    if min_usd <= 0:
+        errors.append(f"min_usd ({min_usd}) must be > 0")
+    if max_usd <= 0:
+        errors.append(f"max_usd ({max_usd}) must be > 0")
+    if min_usd > 0 and max_usd > 0 and min_usd >= max_usd:
+        errors.append(
+            f"min_usd ({min_usd}) must be < max_usd ({max_usd}) — they currently "
+            f"clamp every bet to a single value"
+        )
+    if bankroll > 0 and min_balance >= bankroll:
+        errors.append(
+            f"min_balance_usd ({min_balance}) must be < bankroll ({bankroll}) — "
+            f"the stop-loss floor is at or above the starting cash"
+        )
+    if max_pct is not None:
+        try:
+            mp = float(max_pct)
+            if mp < 0 or mp > 1:
+                errors.append(f"max_pct_of_balance ({mp}) must be in [0, 1]")
+        except (TypeError, ValueError):
+            errors.append(f"max_pct_of_balance ({max_pct!r}) must be numeric")
+    return errors
+
+
 def _size_for_bet(
     cfg: Dict,
     edge_cents: float,
@@ -1407,6 +1470,28 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     ¼-Kelly YES bet on it. Idempotent across ticks AND restarts via
     list_bets_for_target."""
     cfg = _auto_trade_state
+    # Pre-tick config validation. If something's wrong (min_usd >= max_usd,
+    # min_balance >= bankroll, etc.) halt the tick rather than silently
+    # placing degenerate bets.
+    cfg_errors = _validate_auto_trade_cfg(cfg)
+    if cfg_errors:
+        msg = "; ".join(cfg_errors)
+        print(f"[auto-trader] config invalid — skipping tick: {msg}")
+        try:
+            db.log_ml_event(
+                "data_quality",
+                {"scope": "auto-trader", "errors": cfg_errors},
+                f"auto-trader config invalid: {msg}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        cfg["last_run_ts"] = int(time.time())
+        cfg["last_run_placed"] = 0
+        cfg["last_run_considered"] = 0
+        cfg["last_run_error"] = msg
+        cfg["total_runs"] += 1
+        return []
+    cfg.pop("last_run_error", None)
     max_per_day = int(cfg.get("max_bets_per_city_per_day") or 2)
     candidates: List[tuple] = []  # (edge_cents, city, state, bracket, target)
 
@@ -1495,13 +1580,29 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     cfg["open_stakes"] = stats["openStakes"]
 
     placed: List[Dict] = []
+    min_balance = float(cfg.get("min_balance_usd") or 0)
+    floor_skips = 0   # # of candidates we passed up because they'd breach the floor
     if candidates and available_cash >= cfg["min_usd"]:
         candidates.sort(key=lambda c: -c[0])
-        edge_cents, city, state, bracket, target = candidates[0]
-        # Kelly off the LIVE bankroll (available cash), not the static config
-        kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
-        size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
-        if size >= cfg["min_usd"]:
+        # Walk candidates highest-edge first; place the first one whose
+        # size fits the stop-loss floor. The previous "pick top, place or
+        # nothing" rule meant a single oversized candidate would silently
+        # block a smaller-but-still-good fallback.
+        for cand_idx, cand in enumerate(candidates):
+            edge_cents, city, state, bracket, target = cand
+            kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
+            size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
+            if size < cfg["min_usd"]:
+                continue
+            # Stop-loss floor — refuse a bet that would drop deployable
+            # cash below min_balance_usd. Try the next-best candidate
+            # (which may need a smaller stake by tier) instead of bailing.
+            if available_cash - size < min_balance:
+                floor_skips += 1
+                print(f"[auto-trader] floor-skip {city['code']} {bracket['label']} "
+                      f"size=${size} would leave cash=${available_cash - size:.2f} "
+                      f"< min_balance=${min_balance}")
+                continue
             try:
                 row = db.insert_bet(
                     city=city["code"],
@@ -1525,14 +1626,31 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                     "considered": len(candidates),
                 })
                 print(f"[auto-trader] picked {city['code']} {bracket['label']} "
-                      f"(+{edge_cents}¢ edge, beat {len(candidates)-1} others) — "
+                      f"(+{edge_cents}¢ edge, beat {cand_idx} above) — "
                       f"size=${size} entry={row['entry_cents']}¢")
+                break  # one bet per tick, by design
             except Exception as exc:  # noqa: BLE001
                 print(f"[auto-trader] insert error: {exc}")
+                continue
+        # If we walked the entire list and EVERY candidate would have
+        # breached the floor, surface that loud — usually means the
+        # account is over-exposed and the trader is correctly idle.
+        if not placed and floor_skips > 0 and floor_skips == len(candidates):
+            try:
+                db.log_ml_event(
+                    "data_quality",
+                    {"scope": "auto-trader", "available_cash": round(available_cash, 2),
+                     "min_balance_usd": min_balance, "floor_skips": floor_skips},
+                    f"auto-trader paused — every candidate ({floor_skips}) would "
+                    f"breach min_balance_usd=${min_balance:.0f} (cash=${available_cash:.2f})",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     cfg["last_run_ts"] = int(time.time())
     cfg["last_run_placed"] = len(placed)
     cfg["last_run_considered"] = len(candidates)
+    cfg["last_run_floor_skips"] = floor_skips
     cfg["total_runs"] += 1
     cfg["total_placed"] += len(placed)
     return placed
