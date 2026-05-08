@@ -17,6 +17,7 @@ mock data.
 """
 
 import asyncio
+import json
 import os
 import sqlite3
 import time
@@ -154,6 +155,16 @@ _auto_trade_state: Dict = {
     # bring `available_cash - size` below this number. Acts as a circuit
     # breaker so a runaway sweep can't drain the account to zero.
     "min_balance_usd": float(os.getenv("BETS_AUTO_TRADE_MIN_BALANCE", "100")),
+    # Virtual paper-trading mode. When on, ALL sizing decisions read
+    # from `virtual_current_balance` instead of (bankroll + realized_pl).
+    # Each placement deducts the stake; each winning settlement credits
+    # the gross payout (stake + profit). Lets you A/B test the gates,
+    # tier table, etc. against a stable seed without touching the live
+    # Kalshi account math. Persists to backend/auto_trade_state.json so
+    # it survives restarts.
+    "virtual_mode": os.getenv("BETS_VIRTUAL_MODE", "0") == "1",
+    "virtual_starting_balance": float(os.getenv("BETS_VIRTUAL_START", "1000")),
+    "virtual_current_balance": float(os.getenv("BETS_VIRTUAL_START", "1000")),
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -893,6 +904,10 @@ async def _ml_incremental_backfill_loop() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
+    # Restore the persisted auto-trade config (virtual balance, tier
+    # tweaks, etc.) before the loops kick off so the first tick uses the
+    # last known good state rather than env defaults.
+    _load_auto_trade_state()
     # Validate auto-trader config up front. Doesn't HALT startup (we still
     # want HTTP / UI / MCP up so the user can see + fix things), but logs
     # loud so the issue isn't silent. Each tick re-validates and skips
@@ -956,6 +971,9 @@ class AutoTradeConfigIn(BaseModel):
     require_peak_in_bracket: Optional[bool] = None
     prevent_overlapping_brackets: Optional[bool] = None
     min_balance_usd: Optional[float] = Field(None, ge=0)
+    virtual_mode: Optional[bool] = None
+    virtual_starting_balance: Optional[float] = Field(None, ge=0)
+    virtual_current_balance: Optional[float] = Field(None, ge=0)
 
 
 @app.get("/api/auto-trade/info")
@@ -975,7 +993,9 @@ def auto_trade_config(c: AutoTradeConfigIn):
               "interval_seconds", "max_bets_per_city_per_day",
               "min_model_pct", "min_kelly", "skip_entry_below_cents",
               "bet_sizing_mode",
-              "require_peak_in_bracket", "prevent_overlapping_brackets"):
+              "require_peak_in_bracket", "prevent_overlapping_brackets",
+              "virtual_mode", "virtual_starting_balance",
+              "virtual_current_balance"):
         v = getattr(c, k)
         if v is not None:
             _auto_trade_state[k] = v
@@ -1000,7 +1020,31 @@ def auto_trade_config(c: AutoTradeConfigIn):
     if errors:
         # Don't accept config that would jam the trader.
         raise HTTPException(400, "; ".join(errors))
+    _persist_auto_trade_state()
     return {**_auto_trade_state}
+
+
+@app.post("/api/auto-trade/virtual/reset")
+def virtual_reset():
+    """Reset virtual_current_balance back to virtual_starting_balance.
+    Doesn't touch real bets, settled history, or any other config knobs
+    — purely a simulator restart. Persists to disk so the reset survives
+    a server restart."""
+    if not _auto_trade_state.get("virtual_mode"):
+        raise HTTPException(
+            400,
+            "virtual_mode is off — toggle it on first via /api/auto-trade/config "
+            "before resetting the simulated balance",
+        )
+    start = float(_auto_trade_state.get("virtual_starting_balance") or 0)
+    _auto_trade_state["virtual_current_balance"] = round(start, 2)
+    _auto_trade_state.pop("last_run_error", None)
+    _persist_auto_trade_state()
+    return {
+        "virtual_starting_balance": start,
+        "virtual_current_balance": _auto_trade_state["virtual_current_balance"],
+        "reset": True,
+    }
 
 
 @app.post("/api/auto-trade/now")
@@ -1344,6 +1388,13 @@ def place_bet(b: PlaceBetIn):
         entry_cents=b.entry_cents,
         target_date=target_date,
     )
+    # Mirror the auto-trader's virtual-mode debit for manual placements
+    # so the simulated bankroll tracks ALL bets, not just the auto ones.
+    if _auto_trade_state.get("virtual_mode"):
+        _auto_trade_state["virtual_current_balance"] = round(
+            float(_auto_trade_state.get("virtual_current_balance") or 0) - int(size), 2,
+        )
+        _persist_auto_trade_state()
     return _bet_row_to_log(row)
 
 
@@ -1385,6 +1436,19 @@ async def _settle_open_bets(client: httpx.AsyncClient) -> List[Dict]:
             in_bracket = _bet_in_bracket(bet, actual_max)
             pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
             db.settle_bet(bet["id"], pl, actual_max)
+            # Virtual mode: stake was already debited at placement, so
+            # only winners get money back — credit the GROSS payout
+            # (stake + profit). Loss = no-op, stake stays gone.
+            if _auto_trade_state.get("virtual_mode") and pl > 0:
+                stake = float(bet["size"])
+                gross_payout = stake + float(pl)
+                _auto_trade_state["virtual_current_balance"] = round(
+                    float(_auto_trade_state.get("virtual_current_balance") or 0) + gross_payout, 2,
+                )
+                _persist_auto_trade_state()
+                print(f"[auto-trader] [virtual] settled WIN bet#{bet['id']} "
+                      f"+${gross_payout:.2f} → balance="
+                      f"${_auto_trade_state['virtual_current_balance']:.2f}")
             # Data-quality cross-check: NWS Climate Report's actual_max
             # should match the IEM ASOS hourly archive value we
             # backfilled into historical_actuals. If they disagree by
@@ -1428,6 +1492,67 @@ async def _settlement_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[bets] settlement loop error: {exc}")
         await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
+
+
+# Where the persisted auto-trade state lives — only the bits that need
+# to survive restarts (virtual balance + the user-tunable knobs the
+# config endpoint touches). Counters (last_run_*, total_*) are session-
+# scoped on purpose.
+_AUTO_TRADE_STATE_FILE = Path(__file__).parent / "auto_trade_state.json"
+_AUTO_TRADE_PERSIST_KEYS = (
+    "enabled", "min_edge_cents", "bankroll", "max_usd", "max_pct_of_balance",
+    "min_usd", "max_bets_per_city_per_day", "min_model_pct", "min_kelly",
+    "skip_entry_below_cents", "interval_seconds",
+    "require_peak_in_bracket", "prevent_overlapping_brackets",
+    "min_balance_usd", "bet_sizing_mode", "size_tiers",
+    "virtual_mode", "virtual_starting_balance", "virtual_current_balance",
+)
+
+
+def _persist_auto_trade_state() -> None:
+    """Write the user-tunable subset of _auto_trade_state to disk.
+    Called after every config change AND after every virtual-balance
+    update so a kill -9 doesn't lose the simulated bankroll."""
+    try:
+        snapshot = {k: _auto_trade_state.get(k) for k in _AUTO_TRADE_PERSIST_KEYS}
+        tmp = _AUTO_TRADE_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2))
+        tmp.replace(_AUTO_TRADE_STATE_FILE)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[auto-trader] persist failed: {exc}")
+
+
+def _load_auto_trade_state() -> None:
+    """Read the persisted state on startup. Missing file or unreadable
+    JSON falls back to env defaults (no-op). Called from _startup."""
+    if not _AUTO_TRADE_STATE_FILE.exists():
+        return
+    try:
+        loaded = json.loads(_AUTO_TRADE_STATE_FILE.read_text())
+        for k in _AUTO_TRADE_PERSIST_KEYS:
+            if k in loaded and loaded[k] is not None:
+                _auto_trade_state[k] = loaded[k]
+        print(f"[auto-trader] loaded persisted state from {_AUTO_TRADE_STATE_FILE.name}: "
+              f"virtual_mode={_auto_trade_state.get('virtual_mode')} "
+              f"virtual_balance={_auto_trade_state.get('virtual_current_balance')}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[auto-trader] load failed (using defaults): {exc}")
+
+
+def _sizing_balance(cfg: Dict, total_equity: float, available_cash: float) -> tuple:
+    """Pick the (equity, cash) pair the sizer should use.
+
+    Virtual mode → both come from virtual_current_balance. The auto-
+    trader's bank-account model already debits stake at placement and
+    credits payout at settlement, so virtual_current_balance is BOTH
+    "what's in the account" and "what's deployable" simultaneously.
+
+    Real mode → equity = starting cash + realized P/L, cash = equity − open
+    stakes. Old behavior preserved for non-virtual setups."""
+    if cfg.get("virtual_mode"):
+        v = float(cfg.get("virtual_current_balance") or 0)
+        return v, v
+    return total_equity, available_cash
 
 
 def _validate_auto_trade_cfg(cfg: Dict) -> List[str]:
@@ -1646,12 +1771,38 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     # when it wins. We sit out a tick if available cash is below min_usd.
     stats = db.stats_summary()
     starting_cash = float(cfg.get("bankroll") or 10000)
-    total_equity = starting_cash + stats["realizedPl"]            # bank-account "balance"
-    available_cash = total_equity - stats["openStakes"]           # deployable right now
-    cfg["available_cash"] = round(available_cash, 2)
-    cfg["total_equity"] = round(total_equity, 2)
+    real_total_equity = starting_cash + stats["realizedPl"]
+    real_available_cash = real_total_equity - stats["openStakes"]
+    cfg["available_cash"] = round(real_available_cash, 2)
+    cfg["total_equity"] = round(real_total_equity, 2)
     cfg["realized_pl"] = stats["realizedPl"]
     cfg["open_stakes"] = stats["openStakes"]
+    # Pick the balance the sizer should see. Virtual mode swaps in the
+    # simulated bankroll; real mode uses the bank-account math above.
+    total_equity, available_cash = _sizing_balance(cfg, real_total_equity, real_available_cash)
+    if cfg.get("virtual_mode"):
+        # Halt entirely if the simulated bankroll has run out.
+        if available_cash < float(cfg.get("min_balance_usd") or 0):
+            print(f"[auto-trader] virtual bankroll exhausted: "
+                  f"balance=${available_cash:.2f} < min_balance="
+                  f"${float(cfg.get('min_balance_usd') or 0):.2f}")
+            try:
+                db.log_ml_event(
+                    "data_quality",
+                    {"scope": "auto-trader", "virtual_balance": round(available_cash, 2),
+                     "min_balance_usd": float(cfg.get("min_balance_usd") or 0)},
+                    f"virtual bankroll exhausted (${available_cash:.2f}); "
+                    f"reset via /api/auto-trade/virtual/reset",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            cfg["last_run_ts"] = int(time.time())
+            cfg["last_run_placed"] = 0
+            cfg["last_run_considered"] = len(candidates)
+            cfg["last_run_floor_skips"] = 0
+            cfg["last_run_error"] = "virtual_bankroll_exhausted"
+            cfg["total_runs"] += 1
+            return []
 
     placed: List[Dict] = []
     min_balance = float(cfg.get("min_balance_usd") or 0)
@@ -1688,6 +1839,14 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                     entry_cents=int(bracket.get("yesPrice", 0)),
                     target_date=target,
                 )
+                # Virtual mode: debit stake immediately and persist so the
+                # next tick (or a restart) sees the new balance.
+                if cfg.get("virtual_mode"):
+                    cfg["virtual_current_balance"] = round(
+                        float(cfg.get("virtual_current_balance") or 0) - size, 2
+                    )
+                    available_cash -= size  # so subsequent candidates this tick see the lower balance
+                    _persist_auto_trade_state()
                 placed.append({
                     "id": row["id"],
                     "city": city["code"],
@@ -1701,7 +1860,8 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                 })
                 print(f"[auto-trader] picked {city['code']} {bracket['label']} "
                       f"(+{edge_cents}¢ edge, beat {cand_idx} above) — "
-                      f"size=${size} entry={row['entry_cents']}¢")
+                      f"size=${size} entry={row['entry_cents']}¢"
+                      f"{' [virtual]' if cfg.get('virtual_mode') else ''}")
                 break  # one bet per tick, by design
             except Exception as exc:  # noqa: BLE001
                 print(f"[auto-trader] insert error: {exc}")
