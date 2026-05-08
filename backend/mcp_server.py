@@ -378,7 +378,16 @@ def main() -> None:
     app = mcp.http_app(path="/mcp")
     app.add_middleware(BearerAuthMiddleware, token=MCP_TOKEN)
     import uvicorn
-    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
+    # access_log=False suppresses the per-request `INFO 200/404 ...` lines.
+    # mcp-remote (Claude Desktop's bridge) repeatedly probes /performance
+    # and POST / which 404 — useful info but floods the terminal. Real
+    # errors still surface via log_level="info" on the application logger.
+    # Override with BETS_MCP_ACCESS_LOG=1 if you ever want the chatter back.
+    access_log = os.getenv("BETS_MCP_ACCESS_LOG", "0") == "1"
+    uvicorn.run(
+        app, host=MCP_HOST, port=MCP_PORT,
+        log_level="info", access_log=access_log,
+    )
 
 
 if __name__ == "__main__":

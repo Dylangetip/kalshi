@@ -2070,13 +2070,30 @@ def ml_model_diff_endpoint():
     return diff or {"available": False}
 
 
+def _sanitize_floats(o):
+    """Walk a JSON-serializable structure and replace NaN / Inf floats
+    with None so FastAPI's default encoder doesn't 500. Comes up when a
+    feature column has zero variance (corrcoef → 0/0 → NaN) — the math
+    upstream still warns, but the response no longer breaks the UI."""
+    import math as _math
+    if isinstance(o, float):
+        if _math.isnan(o) or _math.isinf(o):
+            return None
+        return o
+    if isinstance(o, dict):
+        return {k: _sanitize_floats(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_sanitize_floats(x) for x in o]
+    return o
+
+
 @app.get("/api/ml/diagnostics")
 def ml_diagnostics_endpoint():
     """Statistical diagnostics for the active ML model: feature
     importance, correlation with target, recent residuals, MAE by
     week, per-city accuracy. Powers the Diagnostics panel on the ML
     tab — same kind of view you'd build in R-studio after fitting."""
-    return ml_diagnostics.diagnostics_summary()
+    return _sanitize_floats(ml_diagnostics.diagnostics_summary())
 
 
 class ModelConfigIn(BaseModel):
