@@ -4,17 +4,25 @@
 #   ./start.sh
 #
 # Idempotent: creates .venv, installs deps, seeds backend/.env from the
-# template if missing, then launches both servers in this terminal:
-#   - FastAPI  on port 8000 (serves /api/* and the UI)         [api]
-#   - MCP      on port 5000 (Claude Desktop / Code tools)      [mcp]
+# template if missing, then launches both servers:
+#   - FastAPI  on port 8000  (serves /api/* and the UI)        [api]
+#   - MCP      on port 5000  (Claude Desktop / Code tools)     [mcp]
 #
-# The MCP server is auto-started when EITHER:
-#   - .mcp-token exists in the project root, OR
-#   - BETS_MCP_TOKEN is exported, OR
-#   - BETS_MCP_ALLOW_NO_AUTH=1 is set (insecure; localhost-only dev)
-# Skip the MCP launch entirely with BETS_DISABLE_MCP=1.
+# MCP lifecycle is DETACHED from the API. Ctrl+C stops only the API;
+# MCP keeps running so Claude Desktop's mcp-remote stays connected
+# across API code reloads. If you re-run start.sh and MCP is already
+# listening on its port, the existing instance is left alone (you'll
+# see "[bets] MCP already running on :5000 — leaving it alone").
 #
-# Ctrl+C stops both processes cleanly.
+# Logs:
+#   - API runs in your terminal foreground
+#   - MCP runs detached, logs to /tmp/bets-mcp.log
+#
+# To force-restart MCP (e.g. after editing backend/mcp_server.py or
+# rotating the token):     pkill -f "backend.mcp_server"   ./start.sh
+# To stop EVERYTHING:                                       ./stop.sh
+#
+# Skip MCP launch entirely with BETS_DISABLE_MCP=1.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -24,6 +32,7 @@ DEPS_MARKER="$VENV/.deps-installed"
 ENV_FILE="backend/.env"
 PORT="${PORT:-8000}"
 MCP_PORT="${BETS_MCP_PORT:-5000}"
+MCP_LOG="/tmp/bets-mcp.log"
 
 # 1. virtualenv
 if [ ! -d "$VENV" ]; then
@@ -62,45 +71,58 @@ elif [ -z "${BETS_MCP_TOKEN:-}" ] && [ "${BETS_MCP_ALLOW_NO_AUTH:-0}" != "1" ]; 
     START_MCP=0
 fi
 
-# 5. Banner
+# 5. MCP launch (detached, idempotent). If something is already
+# listening on the MCP port, leave it alone — restarting would invalidate
+# every active session ID and force Claude Desktop to reconnect.
+MCP_STATUS="running"
+if [ "$START_MCP" = "1" ]; then
+    if ss -ltn 2>/dev/null | grep -q ":${MCP_PORT} "; then
+        echo "[bets] MCP already running on :${MCP_PORT} — leaving it alone"
+        MCP_STATUS="reused"
+    else
+        echo "[bets] launching MCP detached → logs at $MCP_LOG"
+        BETS_MCP_HOST="${BETS_MCP_HOST:-0.0.0.0}" \
+        BETS_MCP_PORT="$MCP_PORT" \
+        BETS_MCP_API_BASE="${BETS_MCP_API_BASE:-http://127.0.0.1:$PORT}" \
+        nohup python -u -m backend.mcp_server > "$MCP_LOG" 2>&1 &
+        disown
+        MCP_STATUS="started"
+        # Brief wait so the banner reflects the actual binding state.
+        for _ in 1 2 3 4 5 6 7 8; do
+            ss -ltn 2>/dev/null | grep -q ":${MCP_PORT} " && break
+            sleep 0.5
+        done
+    fi
+else
+    MCP_STATUS="skipped"
+fi
+
+# 6. Banner
 echo
 echo "  ┌──────────────────────────────────────────────────────┐"
 echo "  │  Bets — Kalshi weather trading terminal              │"
 echo "  │                                                      │"
 echo "  │  open:  http://localhost:$PORT/Bets.html"
 echo "  │  api:   http://localhost:$PORT/api/health"
-if [ "$START_MCP" = "1" ]; then
-echo "  │  mcp:   http://localhost:$MCP_PORT/mcp  (auth required)"
-else
-echo "  │  mcp:   skipped (no token; set BETS_MCP_TOKEN or"
-echo "  │         create .mcp-token; or BETS_DISABLE_MCP=1)"
-fi
+case "$MCP_STATUS" in
+    running|started)
+        echo "  │  mcp:   http://localhost:$MCP_PORT/mcp  (auth required, persistent)"
+        ;;
+    reused)
+        echo "  │  mcp:   http://localhost:$MCP_PORT/mcp  (already up — reused)"
+        ;;
+    skipped)
+        echo "  │  mcp:   skipped (no token; set BETS_MCP_TOKEN or"
+        echo "  │         create .mcp-token; or BETS_DISABLE_MCP=1)"
+        ;;
+esac
 echo "  │                                                      │"
-echo "  │  press Ctrl+C to stop both                           │"
+echo "  │  Ctrl+C stops the API only — MCP keeps running       │"
+echo "  │  ./stop.sh stops everything                          │"
 echo "  └──────────────────────────────────────────────────────┘"
 echo
 
-# 6. Background MCP (with output prefixed [mcp]) if configured.
-MCP_PID=""
-if [ "$START_MCP" = "1" ]; then
-    BETS_MCP_HOST="${BETS_MCP_HOST:-0.0.0.0}" \
-    BETS_MCP_PORT="$MCP_PORT" \
-    BETS_MCP_API_BASE="${BETS_MCP_API_BASE:-http://127.0.0.1:$PORT}" \
-    python -u -m backend.mcp_server 2>&1 | sed -u 's/^/[mcp] /' &
-    MCP_PID=$!
-fi
-
-# Trap Ctrl+C / shell exit so we kill the MCP child when FastAPI stops.
-cleanup() {
-    if [ -n "$MCP_PID" ]; then
-        # Kill the entire pipeline (python + sed) cleanly.
-        kill -TERM "$MCP_PID" 2>/dev/null || true
-        # The sed wrapper's PID = MCP_PID; the python under it is its child.
-        pkill -TERM -P "$MCP_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup INT TERM EXIT
-
-# 7. Foreground FastAPI (this is the process you Ctrl+C). Output prefixed
-# [api] so it's distinguishable from the [mcp] interleaved lines.
-python -u -m uvicorn backend.main:app --reload --port "$PORT" 2>&1 | sed -u 's/^/[api] /'
+# 7. Foreground FastAPI. Output prefixed [api] so it's distinguishable.
+# NO trap on the MCP — it stays detached so Claude Desktop's mcp-remote
+# stays connected across `git pull && ./start.sh` cycles.
+exec python -u -m uvicorn backend.main:app --reload --port "$PORT" 2>&1 | sed -u 's/^/[api] /'
