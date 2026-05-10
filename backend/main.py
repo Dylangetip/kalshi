@@ -243,7 +243,58 @@ _ml_backfill_progress: Dict = {"running": False, "stage": "idle"}
 # (default 1h) so HTTP requests aren't paying the cost of a 180-day join
 # every state build. Invalidate via /api/bias/refresh after a settlement.
 _bias_cache: Dict = {"map": None, "computed_at": 0.0}
+# Same shape, but for the ML model output specifically (joined from
+# feature_snapshots × historical_actuals so we capture residuals at each
+# snapshot's actual lead time, not just the daily ensemble).
+_ml_bias_cache: Dict = {"map": None, "computed_at": 0.0}
 _BIAS_CACHE_TTL_SECONDS = int(os.getenv("BETS_BIAS_CACHE_TTL", "3600"))
+
+
+def _get_ml_bias_map() -> Dict:
+    """ML-specific bias map: per-(city, horizon-bucket) residual of
+    feature_snapshots.ml_max vs historical_actuals.actual_max_f. Cached
+    with the same TTL as the ensemble map. Falls back to empty on error."""
+    now = time.time()
+    cached_map = _ml_bias_cache.get("map")
+    cached_at = _ml_bias_cache.get("computed_at") or 0
+    if cached_map is not None and (now - cached_at) < _BIAS_CACHE_TTL_SECONDS:
+        return cached_map
+    try:
+        bias = db.compute_ml_city_bias(
+            half_life_days=float(_model_state.get("bias_half_life_days") or 30),
+            lookback_days=int(_model_state.get("bias_lookback_days") or 180),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bias] ml compute failed: {exc}")
+        bias = cached_map or {}
+    _ml_bias_cache["map"] = bias
+    _ml_bias_cache["computed_at"] = now
+    return bias
+
+
+def _ml_bias_correction_for(city_code: str, target_date: Optional[str]) -> float:
+    """Lookup the additive correction (°F) for the ML model output for
+    this city + horizon. Same toggles + cap as the ensemble bias path."""
+    cfg = _model_state
+    if not cfg.get("bias_correction", True):
+        return 0.0
+    if not city_code:
+        return 0.0
+    bucket = "short"
+    if target_date:
+        try:
+            tgt = datetime.fromisoformat(target_date).date()
+            days_out = (tgt - datetime.utcnow().date()).days
+            hours = days_out * 24
+            bucket = "short" if hours <= 24 else ("mid" if hours <= 72 else "long")
+        except (ValueError, TypeError):
+            pass
+    bmap = _get_ml_bias_map() or {}
+    entry = bmap.get((city_code, bucket))
+    if entry is None:
+        return 0.0
+    cap = float(cfg.get("bias_max_correction") or 5.0)
+    return max(-cap, min(cap, float(entry.get("mean_residual") or 0.0)))
 
 
 def _get_bias_map() -> Dict:
@@ -443,11 +494,22 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "roll7_mean_max_f": roll7,
         "seasonal_avg_max_f": seasonal_avg,
     }
-    ml_max = ml_predict.predict_max(ml_features, city=city["code"])
-    # Quantile band (p10/p50/p90) for probabilistic bracket-prob
-    # calculations. None until a model with quantile_models has been
-    # trained. Future: bracket_prob will use the empirical CDF directly.
-    ml_quantiles = ml_predict.predict_quantiles(ml_features, city=city["code"])
+    raw_ml_max = ml_predict.predict_max(ml_features, city=city["code"])
+    # Per-city ML bias correction. Computed from feature_snapshots.ml_max
+    # × historical_actuals so the residual reflects the trained model's
+    # actual track record per city, not the ensemble's. Symmetric with
+    # the ensemble bias path; same toggle + cap.
+    ml_bias_shift = _ml_bias_correction_for(city.get("code"), target_iso) if raw_ml_max is not None else 0.0
+    ml_max = raw_ml_max + ml_bias_shift if raw_ml_max is not None else None
+    # Quantile band (p10/p50/p90). Apply the same bias shift so the
+    # interpolated CDF stays centered on the corrected point estimate.
+    ml_quantiles_raw = ml_predict.predict_quantiles(ml_features, city=city["code"])
+    ml_quantiles = None
+    if ml_quantiles_raw:
+        ml_quantiles = {
+            k: (v + ml_bias_shift) if v is not None else None
+            for k, v in ml_quantiles_raw.items()
+        }
     # Conformal prediction interval — distribution-free 90% coverage.
     ml_conformal = ml_predict.conformal_interval(ml_features, city=city["code"])
 
@@ -489,6 +551,18 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     if kalshi.configured() and city.get("kalshi_series"):
         kalshi_brackets = await kalshi.fetch_brackets_for_city(client, city["kalshi_series"])
 
+    # Quantile trio for bracket-prob calibration. Only meaningful when
+    # the ML model is supplying the active prediction (ensemble path
+    # has no per-day uncertainty estimate). Falls through to fixed-σ
+    # Gaussian when missing or when active_source != 'ml'/'blend'.
+    quantile_trio = None
+    if active_source in ("ml", "blend") and ml_quantiles:
+        p10 = ml_quantiles.get("p10")
+        p50 = ml_quantiles.get("p50")
+        p90 = ml_quantiles.get("p90")
+        if p10 is not None and p50 is not None and p90 is not None:
+            quantile_trio = {"p10": p10, "p50": p50, "p90": p90}
+
     if kalshi_brackets:
         ladder = []
         for b in kalshi_brackets:
@@ -496,6 +570,7 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
                 b["lo"], b["hi"], active_max, sigma,
                 lower_tail=b.get("lower_tail", False),
                 upper_tail=b.get("upper_tail", False),
+                quantiles=quantile_trio,
             )
             kalshi_pct = b["yes_cents"] / 100
             ladder.append({
@@ -545,6 +620,8 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
         "settlementBracket": best,
         "modelMax": round(model_max, 1),
         "rawModelMax": round(raw_model_max, 1) if raw_model_max is not None else None,
+        "rawMlMax": round(raw_ml_max, 1) if raw_ml_max is not None else None,
+        "mlBiasShift": round(ml_bias_shift, 2),
         "biasShift": round(bias_shift, 2),
         "mlMax": ml_max,
         "mlP10": (ml_quantiles or {}).get("p10"),
@@ -2330,13 +2407,20 @@ def bias_inspect():
 
 @app.post("/api/bias/refresh")
 def bias_refresh():
-    """Invalidate the bias cache. Next request that needs a forecast will
-    recompute from the historical_predictions × historical_actuals join."""
+    """Invalidate BOTH bias caches (ensemble + ML) and recompute. Next
+    request that needs a forecast picks up the fresh residuals."""
     _bias_cache["map"] = None
     _bias_cache["computed_at"] = 0.0
+    _ml_bias_cache["map"] = None
+    _ml_bias_cache["computed_at"] = 0.0
     bmap = _get_bias_map() or {}
+    ml_bmap = _get_ml_bias_map() or {}
     _state_cache.clear()  # regenerate state with new corrections too
-    return {"refreshed": True, "rows": len(bmap)}
+    return {
+        "refreshed": True,
+        "ensemble_rows": len(bmap),
+        "ml_rows": len(ml_bmap),
+    }
 
 
 @app.post("/api/bias/config")

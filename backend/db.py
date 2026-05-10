@@ -744,6 +744,95 @@ def list_training_data() -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def list_snapshot_training_data() -> List[Dict]:
+    """Snapshot-derived training rows. Each feature_snapshot row joined
+    with the eventual NWS actual for that target_date, surfaced with a
+    real per-row forecast_horizon_hours computed from snapshot ts vs the
+    target date midnight. Multiplies the available training data ~50-200×
+    over historical_predictions alone (one snap per ~5min vs one daily
+    archive row per day) AND injects real horizon variance the daily
+    archive can't provide.
+
+    Output shape mirrors list_training_data() so the trainer can cat the
+    two sources together and use the same featurization. Lag/seasonal
+    fields are reused from the same window functions over actuals.
+    """
+    c = _conn_or_init()
+    rows = c.execute(
+        """
+        WITH joined AS (
+            SELECT fs.city,
+                   fs.target_date,
+                   CAST(MAX(0,
+                       (julianday(fs.target_date) - (fs.ts / 86400.0 + 2440587.5)) * 24.0
+                   ) AS INTEGER) AS forecast_horizon_hours,
+                   -- feature_snapshots doesn't store raw GFS/ICON; use
+                   -- MOS as the GFS proxy (correlated) and NULL for icon
+                   -- so the imputer fills with column mean. The richer
+                   -- snapshot columns (mos, ecmwf, om, upper-air) carry
+                   -- most of the signal anyway.
+                   fs.gfs_mos_max AS gfs_max,
+                   fs.ecmwf_max,
+                   NULL           AS icon_max,
+                   fs.om_max,
+                   fs.gfs_mos_max,
+                   fs.nam_mos_max,
+                   fs.t850_c, fs.t700_c, fs.t500_c, fs.h500_m, fs.rh850_pct,
+                   fs.model_max AS ensemble_max,
+                   a.actual_max_f
+            FROM feature_snapshots fs
+            JOIN historical_actuals a USING (city, target_date)
+            WHERE fs.model_max IS NOT NULL
+        ),
+        with_lag AS (
+            SELECT j.*,
+                   LAG(j.actual_max_f, 1) OVER (
+                       PARTITION BY j.city
+                       ORDER BY j.target_date, j.forecast_horizon_hours
+                   ) AS prev_actual_max_f,
+                   LAG(j.actual_max_f, 3) OVER (
+                       PARTITION BY j.city
+                       ORDER BY j.target_date, j.forecast_horizon_hours
+                   ) AS lag3_actual_max_f,
+                   LAG(j.actual_max_f, 7) OVER (
+                       PARTITION BY j.city
+                       ORDER BY j.target_date, j.forecast_horizon_hours
+                   ) AS lag7_actual_max_f,
+                   AVG(j.actual_max_f) OVER (
+                       PARTITION BY j.city
+                       ORDER BY j.target_date
+                       ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+                   ) AS roll7_mean_max_f,
+                   substr(j.target_date, 6, 2) AS month_str
+            FROM joined j
+        ),
+        climatology AS (
+            SELECT city,
+                   substr(target_date, 6, 2) AS month_str,
+                   AVG(actual_max_f) AS seasonal_avg_max_f
+            FROM historical_actuals
+            GROUP BY city, substr(target_date, 6, 2)
+        )
+        SELECT w.city, w.target_date, w.forecast_horizon_hours,
+               w.gfs_max, w.ecmwf_max, w.icon_max, w.om_max,
+               w.gfs_mos_max, w.nam_mos_max,
+               w.t850_c, w.t700_c, w.t500_c, w.h500_m, w.rh850_pct,
+               w.ensemble_max,
+               w.actual_max_f,
+               w.prev_actual_max_f,
+               w.lag3_actual_max_f,
+               w.lag7_actual_max_f,
+               w.roll7_mean_max_f,
+               c.seasonal_avg_max_f
+        FROM with_lag w
+        LEFT JOIN climatology c
+          ON c.city = w.city AND c.month_str = w.month_str
+        ORDER BY w.target_date ASC, w.forecast_horizon_hours ASC, w.city ASC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_prev_actual(city: str, target_date: str) -> Optional[float]:
     """Yesterday's actual high for `city` (the day before target_date).
     Used at inference time. Checks historical_actuals first, falls back
@@ -1333,6 +1422,73 @@ def compute_city_bias(half_life_days: float = 30.0, lookback_days: int = 180) ->
         days_old = max(0.0, float(r["days_old"] or 0))
         w = math.exp(-days_old / tau) if tau > 0 else 1.0
         residual = float(r["actual_max_f"]) - float(r["ensemble_max"])
+        key = (city, bucket)
+        cur = agg.get(key) or {"sum_w": 0.0, "sum_wr": 0.0, "n_raw": 0}
+        cur["sum_w"]  += w
+        cur["sum_wr"] += w * residual
+        cur["n_raw"] += 1
+        agg[key] = cur
+    out: Dict = {}
+    for key, v in agg.items():
+        if v["sum_w"] <= 0:
+            continue
+        out[key] = {
+            "mean_residual": round(v["sum_wr"] / v["sum_w"], 3),
+            "n_eff": round(v["sum_w"], 2),
+            "n_raw": v["n_raw"],
+        }
+    return out
+
+
+def compute_ml_city_bias(half_life_days: float = 30.0, lookback_days: int = 180) -> Dict:
+    """Per-(city, horizon-bucket) bias of the ML MODEL's predictions vs the
+    NWS-published actual. Mirrors compute_city_bias but pulls predictions
+    from feature_snapshots.ml_max (live ML output captured at snapshot
+    time) instead of historical_predictions.ensemble_max. Lets us correct
+    ml_max separately from the ensemble — they have different residual
+    profiles.
+
+    Horizon = (target_date midnight − snapshot ts) in hours, computed
+    server-side via julianday arithmetic. snapshots taken inside the
+    same day fall in 'short'; previous-day-evening snapshots fall in
+    'mid'; etc. Same buckets as compute_city_bias for consistency.
+
+    Returns the same shape as compute_city_bias.
+    """
+    import math
+    c = _conn_or_init()
+    today = datetime.utcnow().date().isoformat()
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).date().isoformat()
+    # julianday(target_date) treats the date as midnight. ts is unix
+    # epoch seconds; convert to julianday by dividing by 86400 and
+    # adding the unix epoch's julianday (2440587.5). Lead time in hours
+    # = (julianday(target_date) − julianday_from_ts) * 24.
+    rows = c.execute(
+        """
+        SELECT fs.city,
+               fs.target_date,
+               fs.ml_max,
+               ha.actual_max_f,
+               (julianday(fs.target_date) - (fs.ts / 86400.0 + 2440587.5)) * 24.0 AS lead_hours,
+               julianday(?) - julianday(fs.target_date) AS days_old
+        FROM feature_snapshots fs
+        JOIN historical_actuals ha
+          ON ha.city = fs.city AND ha.target_date = fs.target_date
+        WHERE fs.ml_max IS NOT NULL
+          AND ha.actual_max_f IS NOT NULL
+          AND fs.target_date >= ?
+        """,
+        (today, cutoff),
+    ).fetchall()
+    tau = float(half_life_days) / math.log(2.0) if half_life_days > 0 else 1e9
+    agg: Dict = {}
+    for r in rows:
+        city = r["city"]
+        lead = float(r["lead_hours"] or 0)
+        bucket = "short" if lead <= 24 else ("mid" if lead <= 72 else "long")
+        days_old = max(0.0, float(r["days_old"] or 0))
+        w = math.exp(-days_old / tau) if tau > 0 else 1.0
+        residual = float(r["actual_max_f"]) - float(r["ml_max"])
         key = (city, bucket)
         cur = agg.get(key) or {"sum_w": 0.0, "sum_wr": 0.0, "n_raw": 0}
         cur["sum_w"]  += w

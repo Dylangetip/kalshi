@@ -12,6 +12,38 @@ def gauss_cdf(x: float, mean: float, sigma: float) -> float:
     return 0.5 * (1 + math.erf((x - mean) / (sigma * math.sqrt(2))))
 
 
+def quantile_cdf(x: float, p10: float, p50: float, p90: float) -> float:
+    """Empirical CDF: P(X ≤ x) given the model's predicted p10/p50/p90.
+
+    Linear interpolation between the three known points:
+      F(p10) = 0.10, F(p50) = 0.50, F(p90) = 0.90.
+
+    Outside [p10, p90] the curve is linearly extrapolated using the
+    nearest segment's slope (so very-far values clamp toward 0 or 1
+    instead of escaping the unit interval). When the quantile trio
+    is degenerate (any pair equal or ordering wrong), falls back to
+    Gaussian via gauss_cdf with sigma estimated from (p90-p10)/2.56
+    (the empirical 80% IQR width). Caller can detect this fallback by
+    passing valid inputs first.
+    """
+    # Defensive: enforce monotonicity. If quantiles are degenerate
+    # (zero spread or out of order), fall back to a Gaussian fit.
+    if not (p10 <= p50 <= p90) or p10 == p90:
+        sigma_est = max(0.5, (p90 - p10) / 2.563)  # 80% IQR ≈ 2.563σ for normal
+        return gauss_cdf(x, p50, sigma_est)
+    if x <= p10:
+        # Linear extrapolation below p10 using the (p10, p50) slope.
+        slope = 0.4 / (p50 - p10) if p50 > p10 else 0.0
+        return max(0.0, 0.10 + slope * (x - p10))
+    if x <= p50:
+        return 0.10 + 0.40 * (x - p10) / (p50 - p10)
+    if x <= p90:
+        return 0.50 + 0.40 * (x - p50) / (p90 - p50)
+    # x > p90 — linear extrapolation upward using (p50, p90) slope.
+    slope = 0.4 / (p90 - p50) if p90 > p50 else 0.0
+    return min(1.0, 0.90 + slope * (x - p90))
+
+
 def bracket_prob(
     lo: float,
     hi: float,
@@ -19,6 +51,7 @@ def bracket_prob(
     sigma: float,
     lower_tail: bool = False,
     upper_tail: bool = False,
+    quantiles: Optional[Dict[str, float]] = None,
 ) -> float:
     """Probability the daily max falls in this Kalshi bracket.
 
@@ -27,12 +60,33 @@ def bracket_prob(
     T-brackets are open tails — but defined to NOT overlap with the
     adjacent B-bracket, so T70 means "strictly below 70" (cap_strike
     is the threshold, not a member). For T70 with hi=70: integers
-    [..., 69] = (-∞, 69.5) → CDF(hi - 0.5). Symmetric for upper tails."""
+    [..., 69] = (-∞, 69.5) → CDF(hi - 0.5). Symmetric for upper tails.
+
+    When `quantiles={p10, p50, p90}` is supplied (from the ML quantile
+    trio), uses the empirical CDF interpolated through those three
+    points instead of the Gaussian assumption. The quantile path
+    captures the model's actual uncertainty shape — wider on volatile
+    days, tighter on stable ones — which the fixed-σ Gaussian hides.
+    Falls back to Gaussian when quantiles are missing or degenerate.
+    """
+    use_q = (
+        quantiles is not None
+        and quantiles.get("p10") is not None
+        and quantiles.get("p50") is not None
+        and quantiles.get("p90") is not None
+    )
+    if use_q:
+        p10 = float(quantiles["p10"])
+        p50 = float(quantiles["p50"])
+        p90 = float(quantiles["p90"])
+        cdf = lambda x: quantile_cdf(x, p10, p50, p90)
+    else:
+        cdf = lambda x: gauss_cdf(x, mean, sigma)
     if lower_tail:
-        return gauss_cdf(hi - 0.5, mean, sigma)
+        return cdf(hi - 0.5)
     if upper_tail:
-        return 1.0 - gauss_cdf(lo + 0.5, mean, sigma)
-    return gauss_cdf(hi + 0.5, mean, sigma) - gauss_cdf(lo - 0.5, mean, sigma)
+        return 1.0 - cdf(lo + 0.5)
+    return cdf(hi + 0.5) - cdf(lo - 0.5)
 
 
 def make_brackets(model_max: float, count: int = 9, step: int = 2) -> List[Dict]:
