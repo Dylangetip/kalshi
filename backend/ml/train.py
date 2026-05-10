@@ -917,6 +917,10 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
                                         extra_payload=extra or None)
                     _record_per_city_metrics(best_run["id"], c["model"], test_df, X_test, y_test)
                 else:
+                    # Sweep candidates that didn't win are recorded as
+                    # 'archived' from the start. Default 'champion' was
+                    # leaving every algo in every sweep marked champion,
+                    # which made champion selection meaningless.
                     db.insert_ml_run(
                         algorithm=c["algorithm"],
                         n_train=len(train_df), n_test=len(test_df),
@@ -925,6 +929,7 @@ def train(algorithm: str = "linear", min_target_date: Optional[str] = None) -> D
                         holdout_mae_ensemble=round(holdout_mae_ensemble, 3) if holdout_mae_ensemble is not None else None,
                         feature_columns=feature_cols,
                         model_path="(not-persisted)",
+                        role="archived",
                     )
             return {
                 **best_run,

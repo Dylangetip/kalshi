@@ -974,6 +974,23 @@ def update_ml_run_role(run_id: int, role: str) -> None:
         c.commit()
 
 
+def archive_other_champions(except_id: int) -> int:
+    """Archive every persisted-as-champion row OTHER than `except_id`.
+    Sweeping fix for the historical drift where every algo in every
+    sweep was being marked champion. Returns the number archived."""
+    c = _conn_or_init()
+    with _lock:
+        cur = c.execute(
+            "UPDATE ml_runs SET role='archived' "
+            "WHERE role='champion' AND id != ? "
+            "AND COALESCE(skipped, 0) = 0",
+            (except_id,),
+        )
+        archived = cur.rowcount
+        c.commit()
+    return archived
+
+
 def latest_ml_run() -> Optional[Dict]:
     """Most recent ml_runs row whose pickle was actually persisted to
     disk (i.e. won an auto-sweep or was a single-algo train). Excludes

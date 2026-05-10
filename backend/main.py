@@ -698,13 +698,18 @@ async def _ml_retrain_loop() -> None:
         try:
             prev = db.latest_ml_run()
             # Pre-train dedup gate. If the previous run trained on exactly
-            # the same n_paired AND already has both test_mae and
+            # the same total paired set AND already has both test_mae and
             # walk_forward_mae populated, nothing has changed since — skip
             # the entire sweep instead of burning CPU on a duplicate.
             # Triggered runs (data_threshold) already imply n_paired grew,
             # so this only blocks the daily scheduled tick on a quiet day.
+            #
+            # NOTE: prev.n_train is the TRAIN-side of the 80/20 split, not
+            # the full dataset. cur_paired counts ALL paired rows. Compare
+            # against (n_train + n_test) to put them on the same scale.
+            prev_paired_total = ((prev or {}).get("n_train") or 0) + ((prev or {}).get("n_test") or 0)
             if (prev
-                and prev.get("n_train") == cur_paired
+                and prev_paired_total == cur_paired
                 and prev.get("test_mae") is not None
                 and prev.get("walk_forward_mae") is not None
                 and not prev.get("skipped")):
@@ -811,6 +816,18 @@ async def _ml_retrain_loop() -> None:
                             # already had old as 'champion' which we now
                             # demote to 'archived'.
                             db.update_ml_run_role(prev["id"], "archived")
+                        # Sweeping cleanup: archive every persisted-as-
+                        # champion row OTHER than the current `run`. This
+                        # demotes any siblings the auto-sweep wrote with
+                        # the historical default role='champion' bug
+                        # before we changed candidates to insert as
+                        # 'archived'. Idempotent — no-op once the table
+                        # is clean.
+                        if run.get("id"):
+                            cleared = db.archive_other_champions(run["id"])
+                            if cleared:
+                                print(f"[champion-challenger] archived "
+                                      f"{cleared} stale champion rows")
                     except Exception as exc:  # noqa: BLE001
                         print(f"[champion-challenger] promotion logic failed: {exc}")
                 # Drift check on the freshly-trained model — alerts when
@@ -1938,6 +1955,25 @@ def recompute_settled_pl():
 @app.get("/api/stats")
 def get_stats():
     return db.stats_summary()
+
+
+@app.post("/api/ml/runs/normalize-champions")
+def ml_normalize_champions():
+    """One-shot cleanup: keep only the single most-recent persisted
+    `champion` row, archive all other champions. Fixes the historical
+    drift where every algo in every sweep got marked 'champion' by the
+    insert default. Idempotent — safe to call repeatedly."""
+    latest = db.latest_ml_run()
+    if not latest:
+        return {"archived": 0, "champion_id": None}
+    archived = db.archive_other_champions(latest["id"])
+    return {
+        "champion_id": latest["id"],
+        "champion_algorithm": latest["algorithm"],
+        "champion_test_mae": latest.get("test_mae"),
+        "champion_walk_forward_mae": latest.get("walk_forward_mae"),
+        "archived": archived,
+    }
 
 
 @app.post("/api/ml/runs/dedupe")
