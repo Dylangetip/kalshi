@@ -183,6 +183,22 @@ CREATE TABLE IF NOT EXISTS ml_city_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_mlcm_run  ON ml_city_metrics(run_id);
 CREATE INDEX IF NOT EXISTS idx_mlcm_city ON ml_city_metrics(city);
+
+-- Synthetic ML predictions backfilled from historical_predictions ×
+-- historical_actuals via the live ML model. Bumps the ML-bias map's
+-- effective sample size from 5 days of real snapshots to whatever
+-- coverage historical_predictions has (typically 1-2 years × 19 cities).
+-- compute_ml_city_bias UNIONs this with feature_snapshots so corrections
+-- stabilize quickly without waiting for natural data accrual.
+CREATE TABLE IF NOT EXISTS ml_historical_predictions (
+    city                   TEXT    NOT NULL,
+    target_date            TEXT    NOT NULL,
+    forecast_horizon_hours INTEGER NOT NULL DEFAULT 24,
+    ml_max                 REAL    NOT NULL,
+    replayed_at            INTEGER NOT NULL,
+    PRIMARY KEY (city, target_date, forecast_horizon_hours)
+);
+CREATE INDEX IF NOT EXISTS idx_mlhp_target ON ml_historical_predictions(target_date);
 """
 
 _lock = threading.Lock()
@@ -1440,6 +1456,34 @@ def compute_city_bias(half_life_days: float = 30.0, lookback_days: int = 180) ->
     return out
 
 
+def upsert_ml_replay_row(
+    city: str,
+    target_date: str,
+    forecast_horizon_hours: int,
+    ml_max: float,
+) -> None:
+    """Insert a single replayed (synthetic) ML prediction. Idempotent
+    on (city, target_date, forecast_horizon_hours) — re-running the
+    replay overwrites existing rows."""
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            """INSERT INTO ml_historical_predictions
+               (city, target_date, forecast_horizon_hours, ml_max, replayed_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(city, target_date, forecast_horizon_hours) DO UPDATE SET
+                   ml_max = excluded.ml_max,
+                   replayed_at = excluded.replayed_at""",
+            (city, target_date, int(forecast_horizon_hours), float(ml_max), int(_time.time())),
+        )
+        c.commit()
+
+
+def count_ml_replay_rows() -> int:
+    c = _conn_or_init()
+    return int(c.execute("SELECT COUNT(*) FROM ml_historical_predictions").fetchone()[0])
+
+
 def compute_ml_city_bias(half_life_days: float = 30.0, lookback_days: int = 180) -> Dict:
     """Per-(city, horizon-bucket) bias of the ML MODEL's predictions vs the
     NWS-published actual. Mirrors compute_city_bias but pulls predictions
@@ -1465,20 +1509,37 @@ def compute_ml_city_bias(half_life_days: float = 30.0, lookback_days: int = 180)
     # = (julianday(target_date) − julianday_from_ts) * 24.
     rows = c.execute(
         """
-        SELECT fs.city,
-               fs.target_date,
-               fs.ml_max,
-               ha.actual_max_f,
-               (julianday(fs.target_date) - (fs.ts / 86400.0 + 2440587.5)) * 24.0 AS lead_hours,
-               julianday(?) - julianday(fs.target_date) AS days_old
-        FROM feature_snapshots fs
-        JOIN historical_actuals ha
-          ON ha.city = fs.city AND ha.target_date = fs.target_date
-        WHERE fs.ml_max IS NOT NULL
-          AND ha.actual_max_f IS NOT NULL
-          AND fs.target_date >= ?
+        WITH residuals AS (
+            -- Real snapshots (live capture)
+            SELECT fs.city,
+                   fs.ml_max,
+                   ha.actual_max_f,
+                   (julianday(fs.target_date) - (fs.ts / 86400.0 + 2440587.5)) * 24.0 AS lead_hours,
+                   julianday(?) - julianday(fs.target_date) AS days_old
+            FROM feature_snapshots fs
+            JOIN historical_actuals ha
+              ON ha.city = fs.city AND ha.target_date = fs.target_date
+            WHERE fs.ml_max IS NOT NULL
+              AND ha.actual_max_f IS NOT NULL
+              AND fs.target_date >= ?
+            UNION ALL
+            -- Replayed ML predictions (synthetic; backfilled via the
+            -- ml_replay tool against historical_predictions). Use the
+            -- stored horizon directly since there's no ts to derive from.
+            SELECT mhp.city,
+                   mhp.ml_max,
+                   ha.actual_max_f,
+                   CAST(mhp.forecast_horizon_hours AS REAL) AS lead_hours,
+                   julianday(?) - julianday(mhp.target_date) AS days_old
+            FROM ml_historical_predictions mhp
+            JOIN historical_actuals ha
+              ON ha.city = mhp.city AND ha.target_date = mhp.target_date
+            WHERE ha.actual_max_f IS NOT NULL
+              AND mhp.target_date >= ?
+        )
+        SELECT * FROM residuals
         """,
-        (today, cutoff),
+        (today, cutoff, today, cutoff),
     ).fetchall()
     tau = float(half_life_days) / math.log(2.0) if half_life_days > 0 else 1e9
     agg: Dict = {}

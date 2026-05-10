@@ -2053,6 +2053,86 @@ def ml_normalize_champions():
     }
 
 
+@app.post("/api/ml/replay-historical")
+def ml_replay_historical(limit: Optional[int] = None):
+    """Run the active ML model against every historical_predictions row
+    that has a paired actual, and persist the predictions to
+    ml_historical_predictions. The ML-bias map then UNIONs both real
+    snapshots and these synthetic ones, so corrections stabilize from
+    a few days of live capture to weeks/months of backfilled coverage.
+
+    Idempotent — the upsert overwrites existing rows by
+    (city, target_date, forecast_horizon_hours), so re-running after a
+    retrain refreshes every predicted point with the new model.
+
+    Optional `limit` query param caps how many rows to process per call
+    (useful for incremental backfills on big DBs). Default = unlimited.
+    """
+    # Reuse the same training-data join the trainer uses; it has all the
+    # lag/seasonal features pre-computed via the SQL window functions
+    # so we don't have to re-derive them here.
+    rows = db.list_training_data() or []
+    if not rows:
+        return {"replayed": 0, "skipped": 0, "reason": "no historical rows with actuals"}
+    if limit is not None and limit > 0:
+        rows = rows[-int(limit):]   # most recent N — usually what you want
+
+    replayed = 0
+    skipped = 0
+    failed = 0
+    for r in rows:
+        city = r.get("city")
+        target_date = r.get("target_date")
+        horizon = int(r.get("forecast_horizon_hours") or 24)
+        if not city or not target_date:
+            skipped += 1
+            continue
+        # Build the feature dict the model expects. Most fields come
+        # straight off the row; the trainer's `_engineer_features` will
+        # handle derived columns (spreads, doy_sin/cos, etc.) at predict
+        # time inside _predict_with's featurize step.
+        features = {k: r.get(k) for k in (
+            "gfs_max", "ecmwf_max", "icon_max", "om_max",
+            "gfs_mos_max", "nam_mos_max",
+            "t850_c", "t700_c", "t500_c", "h500_m", "rh850_pct",
+            "ensemble_max",
+            "prev_actual_max_f", "lag3_actual_max_f", "lag7_actual_max_f",
+            "roll7_mean_max_f", "seasonal_avg_max_f",
+            "forecast_horizon_hours",
+        )}
+        # target_date is needed by _predict_with's _engineer_features
+        # for doy_sin/doy_cos. The training join already exposes it.
+        features["target_date"] = target_date
+        try:
+            ml_max = ml_predict.predict_max(features, city=city)
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            if failed <= 3:
+                print(f"[ml-replay] predict failed on {city} {target_date}: {exc}")
+            continue
+        if ml_max is None:
+            skipped += 1
+            continue
+        try:
+            db.upsert_ml_replay_row(city, target_date, horizon, float(ml_max))
+            replayed += 1
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            if failed <= 3:
+                print(f"[ml-replay] upsert failed on {city} {target_date}: {exc}")
+    # Invalidate the ML bias cache so the next state build picks up the
+    # newly-populated residuals.
+    _ml_bias_cache["map"] = None
+    _ml_bias_cache["computed_at"] = 0.0
+    _state_cache.clear()
+    return {
+        "replayed": replayed,
+        "skipped": skipped,
+        "failed": failed,
+        "total_replay_rows_now": db.count_ml_replay_rows(),
+    }
+
+
 @app.post("/api/ml/runs/dedupe")
 def ml_runs_dedupe():
     """Bulk-archive duplicate ml_runs rows. Keeps the most recent row
