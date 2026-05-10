@@ -1683,10 +1683,10 @@ function MlDiagnosticsPanel({ diagnostics }) {
   const city = diagnostics.per_city_mae || [];
   const resid = diagnostics.recent_residuals || [];
 
-  const maxFi = Math.max(...fi.map(f => f.importance), 0.01);
-  const maxAbsCorr = Math.max(...corr.map(c => Math.abs(c.r)), 0.01);
-  const maxBy = Math.max(...week.map(w => w.mae), 0.01);
-  const maxCityMae = Math.max(...city.map(c => c.mae), 0.01);
+  const maxFi = Math.max(...fi.map(f => +f.importance || 0), 0.01);
+  const maxAbsCorr = Math.max(...corr.map(c => Math.abs(+c.r || 0)), 0.01);
+  const maxBy = Math.max(...week.map(w => +w.mae || 0), 0.01);
+  const maxCityMae = Math.max(...city.map(c => +c.mae || 0), 0.01);
 
   // Residuals scatter — small SVG, predicted on x, actual on y, perfect
   // line at y=x. Points colored by abs error.
@@ -1735,16 +1735,19 @@ function MlDiagnosticsPanel({ diagnostics }) {
           ) : (
             <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
               <tbody>
-                {fi.slice(0, 15).map(f => (
-                  <tr key={f.feature}>
-                    <td style={{ width: '40%' }}>{f.feature}</td>
-                    <td style={{ width: '50%', padding: '2px 6px' }}>
-                      <div style={{ height: 8, background: 'var(--accent)',
-                        width: `${(f.importance / maxFi) * 100}%`, opacity: 0.8 }} />
-                    </td>
-                    <td className="num-r mono" style={{ width: '10%' }}>{(f.importance * 100).toFixed(1)}%</td>
-                  </tr>
-                ))}
+                {fi.slice(0, 15).map(f => {
+                  const imp = (typeof f.importance === 'number' && isFinite(f.importance)) ? f.importance : 0;
+                  return (
+                    <tr key={f.feature}>
+                      <td style={{ width: '40%' }}>{f.feature}</td>
+                      <td style={{ width: '50%', padding: '2px 6px' }}>
+                        <div style={{ height: 8, background: 'var(--accent)',
+                          width: `${(imp / maxFi) * 100}%`, opacity: 0.8 }} />
+                      </td>
+                      <td className="num-r mono" style={{ width: '10%' }}>{(imp * 100).toFixed(1)}%</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -1760,17 +1763,20 @@ function MlDiagnosticsPanel({ diagnostics }) {
             <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
               <tbody>
                 {corr.map(c => {
-                  const cls = c.r > 0 ? 'pos' : 'neg';
+                  const r = (typeof c.r === 'number' && isFinite(c.r)) ? c.r : 0;
+                  const cls = r > 0 ? 'pos' : 'neg';
                   return (
                     <tr key={c.feature}>
                       <td style={{ width: '40%' }}>{c.feature}</td>
                       <td style={{ width: '40%', padding: '2px 6px' }}>
                         <div style={{
-                          height: 8, background: c.r > 0 ? 'var(--pos)' : 'var(--neg)',
-                          width: `${(Math.abs(c.r) / maxAbsCorr) * 100}%`, opacity: 0.8,
+                          height: 8, background: r > 0 ? 'var(--pos)' : 'var(--neg)',
+                          width: `${(Math.abs(r) / maxAbsCorr) * 100}%`, opacity: 0.8,
                         }} />
                       </td>
-                      <td className={`num-r mono ${cls}`}>{c.r >= 0 ? '+' : ''}{c.r.toFixed(3)}</td>
+                      <td className={`num-r mono ${cls}`}>
+                        {c.r == null ? '—' : (r >= 0 ? '+' : '') + r.toFixed(3)}
+                      </td>
                       <td className="num-r mono" style={{ color: 'var(--fg-3)' }}>n={c.n}</td>
                     </tr>
                   );
@@ -1789,8 +1795,9 @@ function MlDiagnosticsPanel({ diagnostics }) {
           ) : (
             <svg width="320" height="120" style={{ display: 'block' }}>
               {week.map((w, i) => {
+                const mae = (typeof w.mae === 'number' && isFinite(w.mae)) ? w.mae : 0;
                 const x = 8 + (i / Math.max(1, week.length - 1)) * 304;
-                const h = (w.mae / maxBy) * 88;
+                const h = (mae / maxBy) * 88;
                 return <rect key={i} x={x - 5} y={108 - h} width="9" height={h}
                   fill="var(--accent)" opacity="0.8" />;
               })}
@@ -1811,16 +1818,20 @@ function MlDiagnosticsPanel({ diagnostics }) {
           <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
             <thead><tr><th>City</th><th className="num-r">N</th><th className="num-r">MAE</th><th className="num-r">Bias</th></tr></thead>
             <tbody>
-              {city.map(c => (
-                <tr key={c.city}>
-                  <td className="city-cell">{c.city}</td>
-                  <td className="num-r mono">{c.n}</td>
-                  <td className="num-r mono">{c.mae.toFixed(2)}°</td>
-                  <td className={`num-r mono ${c.bias > 0 ? 'pos' : c.bias < 0 ? 'neg' : ''}`}>
-                    {c.bias >= 0 ? '+' : ''}{c.bias.toFixed(2)}°
-                  </td>
-                </tr>
-              ))}
+              {city.map(c => {
+                const mae = (typeof c.mae === 'number' && isFinite(c.mae)) ? c.mae : null;
+                const bias = (typeof c.bias === 'number' && isFinite(c.bias)) ? c.bias : null;
+                return (
+                  <tr key={c.city}>
+                    <td className="city-cell">{c.city}</td>
+                    <td className="num-r mono">{c.n}</td>
+                    <td className="num-r mono">{mae == null ? '—' : mae.toFixed(2) + '°'}</td>
+                    <td className={`num-r mono ${bias != null && bias > 0 ? 'pos' : bias != null && bias < 0 ? 'neg' : ''}`}>
+                      {bias == null ? '—' : (bias >= 0 ? '+' : '') + bias.toFixed(2) + '°'}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
