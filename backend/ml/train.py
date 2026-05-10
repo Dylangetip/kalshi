@@ -90,42 +90,25 @@ def _build_dataframe(min_target_date: Optional[str] = None):
     Recent-only filtering helps when older years have sparser features
     (e.g., MOS only densely populated since ~2024).
 
-    Combines two sources:
-      - historical_predictions × historical_actuals  (one row per day)
-      - feature_snapshots × historical_actuals       (one row per ~5min)
-
-    The snapshot-derived rows give real forecast_horizon_hours variance
-    (the daily archive only stores horizon=24). De-dup is by
-    (city, target_date, forecast_horizon_hours) keeping the snapshot
-    version when both exist, since the snapshot rows have richer feature
-    populations (live MOS, upper-air, etc.).
+    Snapshot-derived rows from feature_snapshots × historical_actuals
+    are intentionally NOT included here. The earlier attempt at mixing
+    them in regressed walk_forward_mae from 0.946 → 1.005 because:
+      - icon_max is NULL on snapshot rows → imputed-mean noise
+      - gfs_max only stored as gfs_mos_max → covariate shift
+      - horizon clamped to 0 → no real variance after dedup
+      - model_max is our own output, leaking into features
+    The snapshot rows are still useful for the per-city ML bias map
+    (db.compute_ml_city_bias), where covariate-shift quirks don't
+    matter — only residuals do.
     """
     import pandas as pd  # type: ignore
-    rows_hist = db.list_training_data() or []
-    rows_snap = []
-    try:
-        rows_snap = db.list_snapshot_training_data() or []
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ml-train] snapshot training source failed: {exc}")
-    rows = rows_hist + rows_snap
+    rows = db.list_training_data() or []
     if not rows:
         return None
     df = pd.DataFrame(rows)
     df = df.dropna(subset=[TARGET_COLUMN])
     if min_target_date:
         df = df[df["target_date"] >= min_target_date]
-    if df.empty:
-        return None
-    # De-dup: snapshots can produce many rows per (city, target, horizon).
-    # Keep the FIRST observation per key — earliest snapshot for each
-    # horizon — so a single forecast doesn't get double-counted as the
-    # snapshot loop ticks. Historical archive rows keep their existing
-    # (city, target_date, 24h) keys; snap rows fill in 0/12/48/72h.
-    if "forecast_horizon_hours" in df.columns:
-        df = df.drop_duplicates(
-            subset=["city", "target_date", "forecast_horizon_hours"],
-            keep="first",
-        )
     if df.empty:
         return None
     return df
