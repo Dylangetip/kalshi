@@ -30,6 +30,11 @@ from ..sources import (
 # IEM is generous but not unlimited. Keep at most this many MOS pulls
 # in flight at once to be polite during bulk backfill.
 _MOS_CONCURRENCY = int(__import__("os").getenv("BETS_MOS_CONCURRENCY", "5"))
+# Open-Meteo doesn't publish a hard rate limit but parallel cities ×
+# parallel chunks can produce 200+ concurrent requests. Cap globally to
+# stay under their fair-use threshold; bump via env if you have a
+# commercial key.
+_OM_CONCURRENCY = int(__import__("os").getenv("BETS_OM_CONCURRENCY", "8"))
 
 
 # Weights that the live ensemble uses on the subset of features we have
@@ -158,10 +163,11 @@ async def run_backfill(
     pred_count = 0
     act_count = 0
 
-    # Single shared semaphore for IEM MOS pulls across ALL cities. Without
-    # this, parallel cities multiply concurrency by city count and IEM
-    # starts 503'ing. Per-process cap, configurable via env.
+    # Shared semaphores so parallel cities don't multiply concurrency
+    # × city count and trigger 429/503 on the upstream APIs. Per-process
+    # caps; tune via BETS_MOS_CONCURRENCY / BETS_OM_CONCURRENCY env.
     mos_sem = asyncio.Semaphore(_MOS_CONCURRENCY)
+    om_sem = asyncio.Semaphore(_OM_CONCURRENCY)
     cities_lock = asyncio.Lock()  # guards the shared progress counters
 
     async def _backfill_one_city(client: httpx.AsyncClient, city: Dict) -> None:
@@ -174,10 +180,11 @@ async def run_backfill(
             chunks = list(_date_chunks(s, e))
 
             async def _one_chunk(chunk_start: date, chunk_end: date):
-                om = await fetch_open_meteo_historical(
-                    client, city["lat"], city["lon"],
-                    chunk_start.isoformat(), chunk_end.isoformat(),
-                )
+                async with om_sem:
+                    om = await fetch_open_meteo_historical(
+                        client, city["lat"], city["lon"],
+                        chunk_start.isoformat(), chunk_end.isoformat(),
+                    )
                 rows_added = 0
                 if om:
                     cur = chunk_start
