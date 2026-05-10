@@ -2544,20 +2544,34 @@ async def ml_backfill_endpoint(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     years: Optional[int] = None,
+    deep: bool = False,
 ):
     """Kick off a historical backfill in the background. Returns
     immediately; poll /api/ml/info to watch progress.
 
-    Three ways to specify the window (in priority order):
+    Window selection (in priority order):
       - explicit start_date / end_date (ISO YYYY-MM-DD)
+      - deep=true       → as far back as Open-Meteo will give (~25 years)
       - years=N         → start = today - N years
-      - neither         → defaults to 3 years
+      - neither         → defaults to 5 years
+
+    Open-Meteo's historical-forecast API typically holds model archives
+    back to ~2022. Older periods produce only IEM ASOS actuals (no
+    paired predictions); the trainer ignores rows missing ensemble_max
+    so this doesn't poison the dataset. deep=true backfills 2001 →
+    yesterday so that any year Open-Meteo serves for any city gets
+    captured.
     """
     if _ml_backfill_progress.get("running"):
         raise HTTPException(409, "backfill already running")
     today = datetime.now(timezone.utc).date()
     if not start_date:
-        lookback_years = years if years is not None else 3
+        if deep:
+            lookback_years = 25
+        elif years is not None:
+            lookback_years = years
+        else:
+            lookback_years = 5
         start_date = (today - timedelta(days=int(lookback_years * 365.25))).isoformat()
     if not end_date:
         end_date = (today - timedelta(days=1)).isoformat()
