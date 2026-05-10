@@ -158,89 +158,116 @@ async def run_backfill(
     pred_count = 0
     act_count = 0
 
-    async with httpx.AsyncClient() as client:
-        for city in CITIES:
-            try:
-                progress["stage"] = f"backfilling {city['code']}"
-                # 1. Predictions, in 90-day chunks
-                for chunk_start, chunk_end in _date_chunks(s, e):
-                    om = await fetch_open_meteo_historical(
-                        client, city["lat"], city["lon"],
-                        chunk_start.isoformat(), chunk_end.isoformat(),
-                    )
-                    if not om:
-                        continue
+    # Single shared semaphore for IEM MOS pulls across ALL cities. Without
+    # this, parallel cities multiply concurrency by city count and IEM
+    # starts 503'ing. Per-process cap, configurable via env.
+    mos_sem = asyncio.Semaphore(_MOS_CONCURRENCY)
+    cities_lock = asyncio.Lock()  # guards the shared progress counters
+
+    async def _backfill_one_city(client: httpx.AsyncClient, city: Dict) -> None:
+        nonlocal pred_count, act_count
+        try:
+            progress["stage"] = f"backfilling {city['code']}"
+            # 1. Predictions, in 90-day chunks. Run the chunks in parallel
+            # for this city — Open-Meteo doesn't rate-limit individual
+            # personal use, and it's the slowest phase per city.
+            chunks = list(_date_chunks(s, e))
+
+            async def _one_chunk(chunk_start: date, chunk_end: date):
+                om = await fetch_open_meteo_historical(
+                    client, city["lat"], city["lon"],
+                    chunk_start.isoformat(), chunk_end.isoformat(),
+                )
+                rows_added = 0
+                if om:
                     cur = chunk_start
                     while cur <= chunk_end:
                         row = _row_from_open_meteo(om, cur.isoformat(), forecast_horizon_hours=24)
                         if row and row.get("ensemble_max") is not None:
                             row["city"] = city["code"]
                             db.upsert_historical_prediction(row)
-                            pred_count += 1
-                            progress["predictions_inserted"] = pred_count
+                            rows_added += 1
                         cur += timedelta(days=1)
+                return rows_added
 
-                # 2. Actuals from IEM ASOS hourly archive — single range pull
-                asos = await fetch_iem_asos_daily_max(
-                    client, city["station"],
-                    start_date, end_date,
-                )
-                if asos:
-                    for d, mx in asos.items():
-                        db.upsert_historical_actual(city["code"], d, mx, "iem_asos")
-                        act_count += 1
-                        progress["actuals_inserted"] = act_count
+            chunk_results = await asyncio.gather(
+                *[_one_chunk(cs, ce) for cs, ce in chunks],
+                return_exceptions=True,
+            )
+            for r in chunk_results:
+                if isinstance(r, int):
+                    async with cities_lock:
+                        pred_count += r
+                        progress["predictions_inserted"] = pred_count
 
-                # 3. Historical MOS bulletins (GFS-MOS + NAM-MOS).
-                # IEM archives back to 2004; per-call cost is ~100ms, so
-                # a 5-yr backfill across one city is ~365×5×2 = ~3650
-                # calls. Throttle via semaphore.
-                progress["stage"] = f"backfilling {city['code']} MOS"
-                sem = asyncio.Semaphore(_MOS_CONCURRENCY)
-                async def _one_mos(target_iso: str, model_name: str):
-                    async with sem:
-                        return await fetch_iem_mos_for_date(
-                            client, city["station"], target_iso, model_name,
-                        )
+            # 2. Actuals from IEM ASOS hourly archive — single range pull
+            asos = await fetch_iem_asos_daily_max(
+                client, city["station"],
+                start_date, end_date,
+            )
+            if asos:
+                added = 0
+                for d, mx in asos.items():
+                    db.upsert_historical_actual(city["code"], d, mx, "iem_asos")
+                    added += 1
+                async with cities_lock:
+                    act_count += added
+                    progress["actuals_inserted"] = act_count
 
-                # Build the list of dates that already have a prediction row
-                # but lack MOS values (cheaper than re-fetching everything).
-                cur = s
-                target_dates: List[str] = []
-                while cur <= e:
-                    target_dates.append(cur.isoformat())
-                    cur += timedelta(days=1)
+            # 3. Historical MOS bulletins. Uses the SHARED semaphore so
+            # all cities respect the same global cap when running in
+            # parallel — total concurrency stays at _MOS_CONCURRENCY.
+            progress["stage"] = f"backfilling {city['code']} MOS"
 
-                tasks = []
-                for td in target_dates:
-                    tasks.append(asyncio.create_task(_one_mos(td, "GFS")))
-                    tasks.append(asyncio.create_task(_one_mos(td, "NAM")))
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+            async def _one_mos(target_iso: str, model_name: str):
+                async with mos_sem:
+                    return await fetch_iem_mos_for_date(
+                        client, city["station"], target_iso, model_name,
+                    )
 
-                # Pair results back with (date, model). Each task list:
-                # [GFS_d1, NAM_d1, GFS_d2, NAM_d2, ...]
-                mos_added = 0
-                for i, td in enumerate(target_dates):
-                    gfs_v = results[2 * i]
-                    nam_v = results[2 * i + 1]
-                    if isinstance(gfs_v, Exception):
-                        gfs_v = None
-                    if isinstance(nam_v, Exception):
-                        nam_v = None
-                    if gfs_v is None and nam_v is None:
-                        continue
-                    db.upsert_historical_prediction({
-                        "city": city["code"],
-                        "target_date": td,
-                        "forecast_horizon_hours": 24,
-                        "gfs_mos_max": gfs_v,
-                        "nam_mos_max": nam_v,
-                    })
-                    mos_added += 1
+            cur = s
+            target_dates: List[str] = []
+            while cur <= e:
+                target_dates.append(cur.isoformat())
+                cur += timedelta(days=1)
+
+            tasks = []
+            for td in target_dates:
+                tasks.append(asyncio.create_task(_one_mos(td, "GFS")))
+                tasks.append(asyncio.create_task(_one_mos(td, "NAM")))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            mos_added = 0
+            for i, td in enumerate(target_dates):
+                gfs_v = results[2 * i]
+                nam_v = results[2 * i + 1]
+                if isinstance(gfs_v, Exception):
+                    gfs_v = None
+                if isinstance(nam_v, Exception):
+                    nam_v = None
+                if gfs_v is None and nam_v is None:
+                    continue
+                db.upsert_historical_prediction({
+                    "city": city["code"],
+                    "target_date": td,
+                    "forecast_horizon_hours": 24,
+                    "gfs_mos_max": gfs_v,
+                    "nam_mos_max": nam_v,
+                })
+                mos_added += 1
+            async with cities_lock:
                 progress["mos_inserted"] = progress.get("mos_inserted", 0) + mos_added
-            except Exception as exc:  # noqa: BLE001 — record and continue
-                progress["errors"].append(f"{city['code']}: {type(exc).__name__}: {exc}")
-            progress["cities_done"] += 1
+        except Exception as exc:  # noqa: BLE001 — record and continue
+            progress["errors"].append(f"{city['code']}: {type(exc).__name__}: {exc}")
+        finally:
+            async with cities_lock:
+                progress["cities_done"] = (progress.get("cities_done") or 0) + 1
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        # Run all cities in parallel. Network-bound work; the IEM-MOS
+        # semaphore caps global concurrency to _MOS_CONCURRENCY across
+        # the whole gather, so we don't hammer any single upstream.
+        await asyncio.gather(*[_backfill_one_city(client, c) for c in CITIES])
 
     progress["running"] = False
     progress["stage"] = "done"
