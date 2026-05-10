@@ -225,7 +225,7 @@ SQL_CONSOLE_ROW_CAP = int(os.getenv("BETS_SQL_CONSOLE_ROW_CAP", "1000"))
 # Runtime-mutable model controls (UI can change without restart).
 # Defaults seeded from env vars. _model_state is read every state build.
 _model_state: Dict = {
-    "modelmax_source": os.getenv("BETS_MODELMAX_SOURCE", "auto").lower(),
+    "modelmax_source": os.getenv("BETS_MODELMAX_SOURCE", "ml").lower(),
     "blend_alpha": float(os.getenv("BETS_BLEND_ALPHA", "0.7")),
     # Per-city bias correction (decaying-weight residuals from
     # historical_predictions × historical_actuals). Disable by setting
