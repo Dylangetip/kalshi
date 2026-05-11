@@ -851,42 +851,22 @@ function PnLView({ history, positions, closedPositions = [], states = [], liveHi
     <div className="pnl-layout">
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
         {(() => {
-          // When account_mode is on, the headline IS the ledger balance —
-          // same number the auto-trader sizes against and the same one
-          // shown on the Auto-Trade page's account card. Subtitle still
-          // shows realized/open for context. When account_mode is off, fall
-          // back to the legacy bankroll + realized model so old dashboards
-          // keep working.
-          const baseline = (autoInfo && typeof autoInfo.bankroll === 'number')
-            ? autoInfo.bankroll
-            : 10000;
+          // Bankroll is gone — the headline is always the ledger balance,
+          // which is the same number the auto-trader sizes against and the
+          // same one shown on the Auto-Trade page. Subtitle shows realized
+          // / open for context.
           const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
           const openStakes = (stats && typeof stats.openStakes === 'number') ? stats.openStakes : 0;
-          if (accountMode) {
-            const headline = accountBalance == null ? 0 : accountBalance;
-            const cls = headline > baseline ? 'pos' : (headline < baseline ? 'neg' : '');
-            return (
-              <div className="signal-card">
-                <div className="label">Account balance <Pill kind="pos">LEDGER</Pill></div>
-                <div className={`big-num ${cls || ''}`}>
-                  {accountBalance == null ? '—' : fmtUSD(headline)}
-                </div>
-                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
-                  ${Math.round(openStakes).toLocaleString()} in open stakes · {fmtSign(realized, 0)} realized
-                </div>
-              </div>
-            );
-          }
-          const totalEquity = baseline + realized;        // settled net worth
-          const cash = totalEquity - openStakes;          // deployable right now
-          const ret = (totalEquity - baseline) / baseline;
-          const cls = ret > 0 ? 'pos' : (ret < 0 ? 'neg' : '');
+          const headline = accountBalance == null ? 0 : accountBalance;
+          const cls = realized > 0 ? 'pos' : (realized < 0 ? 'neg' : '');
           return (
             <div className="signal-card">
-              <div className="label">Account balance</div>
-              <div className={`big-num ${cls || ''}`}>{fmtUSD(totalEquity)}</div>
+              <div className="label">Account balance <Pill kind="pos">LEDGER</Pill></div>
+              <div className={`big-num ${cls || ''}`}>
+                {accountBalance == null ? '—' : fmtUSD(headline)}
+              </div>
               <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
-                {fmtUSD(cash)} cash · ${Math.round(openStakes).toLocaleString()} open · {fmtSign(realized, 0)} settled
+                ${Math.round(openStakes).toLocaleString()} in open stakes · {fmtSign(realized, 0)} realized
               </div>
             </div>
           );
@@ -963,21 +943,19 @@ function PnLView({ history, positions, closedPositions = [], states = [], liveHi
         );
       })()}
 
-      {accountMode && (
-        <div className="panel">
-          <div className="panel-header">
-            <span>Account balance over time <Pill kind="pos">LEDGER</Pill></span>
-            <span className="panel-title-actions">
-              <span><span className="dot" style={{ background: 'var(--pos)' }} /> deposit / win</span>
-              <span><span className="dot" style={{ background: 'var(--accent)' }} /> bet placed</span>
-              <span><span className="dot" style={{ background: 'var(--neg)' }} /> withdraw</span>
-            </span>
-          </div>
-          <div style={{ padding: 14 }}>
-            <AccountBalanceChart history={accountHistory} height={240} />
-          </div>
+      <div className="panel">
+        <div className="panel-header">
+          <span>Account balance over time <Pill kind="pos">LEDGER</Pill></span>
+          <span className="panel-title-actions">
+            <span><span className="dot" style={{ background: 'var(--pos)' }} /> deposit / win</span>
+            <span><span className="dot" style={{ background: 'var(--accent)' }} /> bet placed</span>
+            <span><span className="dot" style={{ background: 'var(--neg)' }} /> withdraw</span>
+          </span>
         </div>
-      )}
+        <div style={{ padding: 14 }}>
+          <AccountBalanceChart history={accountHistory} height={240} />
+        </div>
+      </div>
 
       <div className="panel">
         <div className="panel-header">
@@ -2338,7 +2316,7 @@ function AutoTradeSettings({ cfg, draft, setDraft, apply, busy }) {
     },
     {
       key: 'min_kelly', label: 'Minimum Kelly fraction', def: 0.005, step: 0.001, min: 0, max: 0.5,
-      help: 'Refuse trades where Kelly says risk less than this fraction of bankroll. 0.005 = 0.5%. Filters out marginal edges. Raise to 0.01-0.02 for only meaningful bets.',
+      help: 'Refuse trades where Kelly says risk less than this fraction of the account balance. 0.005 = 0.5%. Filters out marginal edges. Raise to 0.01-0.02 for only meaningful bets.',
     },
     {
       key: 'max_bets_per_city_per_day', label: 'Max bets per city per day', def: 2, step: 1, min: 1, max: 10,
@@ -2346,7 +2324,7 @@ function AutoTradeSettings({ cfg, draft, setDraft, apply, busy }) {
     },
     {
       key: 'max_usd', label: 'Max stake per bet ($)', def: 500, step: 50, min: 10, max: 100000,
-      help: 'Hard cap on a single bet size, regardless of what Kelly suggests. Default is 5% of bankroll. Lower = smoother equity curve, less ruin risk.',
+      help: 'Hard cap on a single bet size, regardless of what Kelly suggests. Lower = smoother equity curve, less ruin risk.',
     },
     {
       key: 'min_usd', label: 'Min stake per bet ($)', def: 50, step: 10, min: 1, max: 10000,
@@ -2355,10 +2333,6 @@ function AutoTradeSettings({ cfg, draft, setDraft, apply, busy }) {
     {
       key: 'interval_seconds', label: 'Tick interval (seconds)', def: 600, step: 30, min: 10, max: 86400,
       help: 'How often the auto-trader scans for bets. 600 = every 10 minutes. Lower = more reactive, more API load. The model+market only update slowly (hourly), so 5-15 minutes is plenty.',
-    },
-    {
-      key: 'bankroll', label: 'Configured bankroll ($)', def: 10000, step: 100, min: 100, max: 10000000,
-      help: 'Reference bankroll for Kelly sizing. The actual cash deployed scales with this — bigger bankroll = bigger bets at the same Kelly fraction.',
     },
   ];
 
@@ -2655,7 +2629,6 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
   const cfg = info || {};
   const enabled = draft.enabled ?? cfg.enabled ?? false;
   const minEdge = draft.min_edge_cents ?? cfg.min_edge_cents ?? 5;
-  const bankroll = draft.bankroll ?? cfg.bankroll ?? 10000;
   const maxUsd = draft.max_usd ?? cfg.max_usd ?? 500;
   const lastRun = cfg.last_run_ts ? ago(cfg.last_run_ts * 1000) : 'never';
 
@@ -2675,7 +2648,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
   return (
     <div className="pnl-layout">
       <AccountPanel />
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
         <div className="signal-card">
           <div className="label">Status</div>
           <div className={`big-num ${enabled ? 'pos' : 'neg'}`}>{enabled ? 'ON' : 'OFF'}</div>
@@ -2687,11 +2660,6 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
           <div className="label">Min edge</div>
           <div className="big-num">{minEdge}¢</div>
           <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>fires above</div>
-        </div>
-        <div className="signal-card">
-          <div className="label">Bankroll</div>
-          <div className="big-num">{fmtUSD(bankroll)}</div>
-          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>¼-Kelly base</div>
         </div>
         <div className="signal-card">
           <div className="label">Last run</div>
@@ -2711,31 +2679,27 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
 
       <div className="panel">
         <div className="panel-header">
-          <span>Set total, flip on</span>
+          <span>Auto-trader</span>
           <span className="panel-title-actions">
-            picks the single highest-edge bracket each tick
+            picks the single highest-edge bracket each tick · sized off the account balance above
           </span>
         </div>
-        <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 14, alignItems: 'end' }}>
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>
-              Bankroll ($) — max per bet auto-set to 5% (¼-Kelly cap)
-            </div>
-            <input type="number" value={bankroll} min={100} step={100}
-              onChange={(e) => setDraft(d => ({ ...d, bankroll: +e.target.value }))}
-              style={{ width: '100%', fontSize: 16 }} />
-          </div>
+        <div style={{ padding: 14, display: 'flex', gap: 14, alignItems: 'center' }}>
           <button
             className={`btn ${enabled ? 'danger' : 'success'}`}
             onClick={() => apply({ ...draft, enabled: !enabled })}
             disabled={busy}
-            style={{ minWidth: 120, fontSize: 13 }}>
+            style={{ minWidth: 140, fontSize: 13 }}>
             {enabled ? 'TURN OFF' : 'TURN ON'}
           </button>
           <button className="btn primary" disabled={busy} onClick={trigger}
-            style={{ minWidth: 120 }}>
+            style={{ minWidth: 140 }}>
             {busy ? 'running…' : 'Trigger Now'}
           </button>
+          <span style={{ flex: 1 }} />
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+            deposit / withdraw via the Account card above
+          </span>
         </div>
         <div style={{ padding: '0 14px 14px', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
           edge threshold {minEdge}¢ · max-per-bet ${maxUsd.toFixed(0)} · {enabled ? `next tick in ≤${Math.round((cfg.interval_seconds || 3600)/60)}m` : 'loop idle'}
@@ -2890,11 +2854,10 @@ function BetSizingPanel({ info, onSetConfig }) {
   const liveMax = info?.max_usd ?? 10000;
   const liveMaxPct = info?.max_pct_of_balance ?? 0.12;
   // Total account equity from the most recent auto-trader tick. The
-  // first time the loop runs it populates total_equity / realized_pl;
-  // before that, fall back to the seed bankroll so the preview still
-  // shows reasonable numbers.
-  const liveEquity = (info?.total_equity)
-    ?? ((info?.bankroll ?? 10000) + (info?.realized_pl ?? 0));
+  // first time the loop runs it populates total_equity (= ledger
+  // balance); before that, fall back to the cached account_balance so
+  // the preview still shows reasonable numbers.
+  const liveEquity = (info?.total_equity) ?? (info?.account_balance ?? 0);
 
   const [mode, setMode] = useState_v(null);
   const [tiers, setTiers] = useState_v(null);
@@ -2989,7 +2952,7 @@ function BetSizingPanel({ info, onSetConfig }) {
             }}
           >
             <option value="tiers">Confidence tiers (fixed $ per edge)</option>
-            <option value="kelly">Kelly (fraction of bankroll)</option>
+            <option value="kelly">Kelly (fraction of account balance)</option>
           </select>
         </label>
 

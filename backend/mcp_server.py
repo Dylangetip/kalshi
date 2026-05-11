@@ -203,8 +203,9 @@ def _api_post(path: str, body: Dict) -> Dict[str, Any]:
 
 @mcp.tool()
 def get_status() -> Dict[str, Any]:
-    """Snapshot of account + auto-trader runtime: bankroll, available cash,
-    total equity, last-run stats, current sizing config, bias settings."""
+    """Snapshot of auto-trader runtime: account balance (from the ledger),
+    open stakes, realized P/L, last-run stats, current sizing config, bias
+    settings."""
     return _api_get("/api/auto-trade/info")
 
 
@@ -262,7 +263,6 @@ def get_recent_bets(args: RecentBetsIn) -> List[Dict[str, Any]]:
 class AutoTradeConfigPatch(BaseModel):
     enabled: Optional[bool] = None
     min_edge_cents: Optional[int] = Field(None, ge=0, le=100)
-    bankroll: Optional[float] = Field(None, gt=0)
     max_usd: Optional[float] = Field(None, gt=0)
     max_pct_of_balance: Optional[float] = Field(None, ge=0, le=1)
     min_usd: Optional[float] = Field(None, ge=0)

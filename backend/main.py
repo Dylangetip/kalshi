@@ -108,12 +108,15 @@ SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 _auto_trade_state: Dict = {
     "enabled": os.getenv("BETS_AUTO_TRADE") == "1",
     "min_edge_cents": int(os.getenv("BETS_AUTO_TRADE_MIN_EDGE", "5")),
-    "bankroll": float(os.getenv("BETS_AUTO_TRADE_BANKROLL", "10000")),
+    # bankroll has been retired. All sizing reads the live account balance
+    # from the ledger (db.account_balance) so the dollar amount tracks
+    # exactly what's deployable. Use deposits / withdrawals to grow or
+    # shrink the trading account.
     # Hard caps on a single bet. Two modes — set either or both:
-    #   max_pct_of_balance: fluid cap as a fraction of total equity. The
-    #     auto-trader recomputes the dollar value each tick, so it tracks
-    #     the live account balance. Default 12% (just above the highest
-    #     tier so tiers can play out).
+    #   max_pct_of_balance: fluid cap as a fraction of account balance.
+    #     The auto-trader recomputes the dollar value each tick, so it
+    #     tracks the live account balance. Default 12% (just above the
+    #     highest tier so tiers can play out).
     #   max_usd: absolute dollar ceiling. Used as a safety belt on top of
     #     the percent cap — whichever is SMALLER binds. Set to a very
     #     large number to effectively disable.
@@ -1087,7 +1090,6 @@ class SizeTierIn(BaseModel):
 class AutoTradeConfigIn(BaseModel):
     enabled: Optional[bool] = None
     min_edge_cents: Optional[int] = Field(None, ge=0, le=100)
-    bankroll: Optional[float] = Field(None, gt=0)
     max_usd: Optional[float] = Field(None, gt=0)
     max_pct_of_balance: Optional[float] = Field(None, ge=0, le=1)
     min_usd: Optional[float] = Field(None, ge=0)
@@ -1115,10 +1117,11 @@ def auto_trade_info():
 @app.post("/api/auto-trade/config")
 def auto_trade_config(c: AutoTradeConfigIn):
     """Update auto-trader config at runtime — takes effect on the next
-    loop tick (no restart needed). When bankroll is changed without an
-    explicit max_usd in the same request, max_usd is auto-recomputed
-    as 5% of bankroll (¼-Kelly cap)."""
-    for k in ("enabled", "min_edge_cents", "bankroll", "max_usd",
+    loop tick (no restart needed). Bankroll has been retired; sizing
+    reads the live ledger via db.account_balance(), so deposits and
+    withdrawals on /api/account/* are the only way to grow or shrink
+    the trading account."""
+    for k in ("enabled", "min_edge_cents", "max_usd",
               "max_pct_of_balance", "min_usd", "min_balance_usd",
               "interval_seconds", "max_bets_per_city_per_day",
               "min_model_pct", "min_kelly", "skip_entry_below_cents",
@@ -1140,12 +1143,6 @@ def auto_trade_config(c: AutoTradeConfigIn):
             if t.size_usd is not None:       row["size_usd"]       = t.size_usd
             out.append(row)
         _auto_trade_state["size_tiers"] = out
-    # max_usd is intentionally NOT recomputed when bankroll changes —
-    # it's a HARD ceiling, not a percentage. Setting bankroll=$1000 used
-    # to silently drop max_usd from $10,000 → $50, which collided with
-    # min_usd=$50 and clamped every bet to exactly the minimum. The
-    # percent-of-balance scaling lives in max_pct_of_balance and the
-    # tier table — both fluid by design. max_usd is the absolute belt.
     errors = _validate_auto_trade_cfg(_auto_trade_state)
     if errors:
         # Don't accept config that would jam the trader.
@@ -1563,10 +1560,10 @@ def place_bet(b: PlaceBetIn):
     cfg = _auto_trade_state
     size = b.size
     if size is None:
-        stats = db.stats_summary()
-        starting_cash = float(cfg.get("bankroll") or 10000)
-        total_equity = starting_cash + stats["realizedPl"]
-        available_cash = total_equity - stats["openStakes"]
+        # Same sizing source the auto-trader uses: live account balance
+        # from the ledger. Bankroll is gone, so deposits / withdrawals
+        # via /api/account/* are the only way to grow the deployable pot.
+        balance = db.account_balance()
         # Edge fallback: if frontend didn't pass it, treat as 0 — Kelly
         # fraction will be tiny and tier lookup will fall through to the
         # min_usd floor. Better to under-size than to silently $0-out.
@@ -1575,12 +1572,12 @@ def place_bet(b: PlaceBetIn):
         # kalshi_pct ≈ entry_cents / 100. Use that for the kelly arg.
         kalshi_pct = (b.entry_cents or 50) / 100.0
         kelly = kelly_fraction(edge_frac, kalshi_pct)
-        size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
+        size = _size_for_bet(cfg, edge_cents, kelly, balance, total_equity=balance)
         if size <= 0:
             raise HTTPException(
                 400,
-                "auto-sized to $0 — available cash too low or edge below tier thresholds. "
-                "Pass an explicit `size` to override.",
+                "auto-sized to $0 — account balance too low or edge below tier thresholds. "
+                "Deposit via /api/account/deposit or pass an explicit `size`.",
             )
     row = db.insert_bet(
         city=city_code,
@@ -1734,7 +1731,7 @@ async def _settlement_loop() -> None:
 # scoped on purpose.
 _AUTO_TRADE_STATE_FILE = Path(__file__).parent / "auto_trade_state.json"
 _AUTO_TRADE_PERSIST_KEYS = (
-    "enabled", "min_edge_cents", "bankroll", "max_usd", "max_pct_of_balance",
+    "enabled", "min_edge_cents", "max_usd", "max_pct_of_balance",
     "min_usd", "max_bets_per_city_per_day", "min_model_pct", "min_kelly",
     "skip_entry_below_cents", "interval_seconds",
     "require_peak_in_bracket", "prevent_overlapping_brackets",
@@ -1777,27 +1774,27 @@ def _load_auto_trade_state() -> None:
 def _sizing_balance(cfg: Dict, total_equity: float, available_cash: float) -> tuple:
     """Pick the (equity, cash) pair the sizer should use.
 
-    account_mode → both come from db.account_balance(). The ledger debits
-    the stake at placement and credits the gross payout at settlement, so
-    one number is simultaneously "what's in the account" and "what's
-    deployable." Bankroll, virtual_current_balance, and live Kalshi cash
-    are ignored. The persisted cfg["account_balance"] mirrors the ledger
-    for fast read paths and is reconciled on startup.
+    account_mode (default) → both come from db.account_balance(). The
+    ledger debits the stake at placement and credits the gross payout at
+    settlement, so one number is simultaneously "what's in the account"
+    and "what's deployable." The persisted cfg["account_balance"] mirrors
+    the ledger for fast read paths and is reconciled on startup.
 
-    virtual_mode → both come from virtual_current_balance (legacy path).
+    virtual_mode → both come from virtual_current_balance (legacy paper-
+    trading sandbox; preserved for A/B comparisons).
 
-    Real mode → equity = starting cash + realized P/L, cash = equity − open
-    stakes. Old behavior preserved for non-virtual setups."""
+    Otherwise → fall back to the ledger too. Bankroll has been retired,
+    so there is no separate "real mode" sizing source — the ledger IS
+    the bank account."""
     if cfg.get("account_mode"):
-        # Trust the ledger; refresh the cached cfg value at the same time
-        # so the next config-read sees the same number the sizer used.
         bal = db.account_balance()
         cfg["account_balance"] = round(bal, 2)
         return bal, bal
     if cfg.get("virtual_mode"):
         v = float(cfg.get("virtual_current_balance") or 0)
         return v, v
-    return total_equity, available_cash
+    bal = db.account_balance()
+    return bal, bal
 
 
 def _validate_auto_trade_cfg(cfg: Dict) -> List[str]:
@@ -1808,14 +1805,11 @@ def _validate_auto_trade_cfg(cfg: Dict) -> List[str]:
     Invariants:
       - min_usd > 0
       - min_usd < max_usd  (otherwise sizing is clamped to a single value)
-      - min_balance_usd < bankroll  (otherwise the floor blocks the seed)
       - max_pct_of_balance ∈ [0, 1]
     """
     errors: List[str] = []
     min_usd = float(cfg.get("min_usd") or 0)
     max_usd = float(cfg.get("max_usd") or 0)
-    bankroll = float(cfg.get("bankroll") or 0)
-    min_balance = float(cfg.get("min_balance_usd") or 0)
     max_pct = cfg.get("max_pct_of_balance")
     if min_usd <= 0:
         errors.append(f"min_usd ({min_usd}) must be > 0")
@@ -1825,11 +1819,6 @@ def _validate_auto_trade_cfg(cfg: Dict) -> List[str]:
         errors.append(
             f"min_usd ({min_usd}) must be < max_usd ({max_usd}) — they currently "
             f"clamp every bet to a single value"
-        )
-    if bankroll > 0 and min_balance >= bankroll:
-        errors.append(
-            f"min_balance_usd ({min_balance}) must be < bankroll ({bankroll}) — "
-            f"the stop-loss floor is at or above the starting cash"
         )
     if max_pct is not None:
         try:
@@ -2014,17 +2003,19 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     # Rolling bank-account math: starting_cash + realized_pl − open stakes.
     # Money leaves the account when a bet is placed and returns + profit
     # when it wins. We sit out a tick if available cash is below min_usd.
+    # Bankroll is gone — equity == account balance from the ledger. We
+    # still surface realized_pl / open_stakes for the UI so the auto-trade
+    # info card can show "where the money has flowed."
     stats = db.stats_summary()
-    starting_cash = float(cfg.get("bankroll") or 10000)
-    real_total_equity = starting_cash + stats["realizedPl"]
-    real_available_cash = real_total_equity - stats["openStakes"]
-    cfg["available_cash"] = round(real_available_cash, 2)
-    cfg["total_equity"] = round(real_total_equity, 2)
+    ledger_balance = db.account_balance()
+    cfg["available_cash"] = round(ledger_balance, 2)
+    cfg["total_equity"] = round(ledger_balance, 2)
     cfg["realized_pl"] = stats["realizedPl"]
     cfg["open_stakes"] = stats["openStakes"]
     # Pick the balance the sizer should see. account_mode → ledger;
-    # virtual_mode → simulated bankroll; real mode → bank-account math.
-    total_equity, available_cash = _sizing_balance(cfg, real_total_equity, real_available_cash)
+    # virtual_mode → simulated balance; otherwise → ledger as well, since
+    # bankroll is retired.
+    total_equity, available_cash = _sizing_balance(cfg, ledger_balance, ledger_balance)
     # Halt the entire run if the funding source is below the floor —
     # account_mode and virtual_mode both gate on the same min_balance_usd.
     if cfg.get("account_mode") or cfg.get("virtual_mode"):
@@ -2984,11 +2975,22 @@ async def kalshi_series(category: Optional[str] = None, limit: int = 100):
 
 
 @app.get("/api/equity")
-def get_equity(hours: float = 72.0, starting_balance: float = 10000.0):
-    """Live session equity curve. Per-tick equity = starting bankroll + sum
-    of open-position P/L at that snapshot tick. Empty until at least one
-    bet has been placed and one snapshot loop has run."""
-    return db.list_equity_points(hours=hours, starting_balance=starting_balance)
+def get_equity(hours: float = 72.0, starting_balance: Optional[float] = None):
+    """Live session equity curve. Per-tick equity = baseline + sum of
+    open-position P/L at that snapshot tick. The baseline defaults to the
+    sum of all account deposits (not the current balance — we want the
+    curve anchored to "money put in" so withdrawals don't depress it).
+    Empty until at least one bet has been placed and one snapshot loop
+    has run."""
+    if starting_balance is None:
+        # Total ever deposited; if nothing has been deposited yet, fall back
+        # to the current balance so the curve still has a sensible baseline.
+        c = db._conn_or_init()
+        row = c.execute(
+            "SELECT COALESCE(SUM(amount), 0.0) AS d FROM account_transactions WHERE type = 'deposit'"
+        ).fetchone()
+        starting_balance = float(row["d"] or 0.0) or db.account_balance() or 0.0
+    return db.list_equity_points(hours=hours, starting_balance=float(starting_balance))
 
 
 @app.get("/api/snapshots/{code}")
