@@ -79,11 +79,181 @@ function liveStatusReason(p, cs) {
 }
 
 // Drill-down row content — rich detail when an open-position row is expanded.
+// Compute today's ISO date in the city's local timezone using Intl.
+// Falls back to the browser's local date if tz is null or invalid.
+function todayInCityTz(tz) {
+  try {
+    if (!tz) return new Date().toISOString().slice(0, 10);
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(new Date());
+    const y = parts.find(p => p.type === 'year').value;
+    const m = parts.find(p => p.type === 'month').value;
+    const d = parts.find(p => p.type === 'day').value;
+    return `${y}-${m}-${d}`;
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+// Local-hour-in-city helper for the Live indicator's 6am–8pm window.
+function hourInCityTz(tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz || undefined, hour: 'numeric', hour12: false,
+    });
+    return parseInt(fmt.format(new Date()), 10);
+  } catch {
+    return new Date().getHours();
+  }
+}
+
+// Three-state temperature block for a bet card. Decides state purely by
+// date comparison (or by whether the actual is already in the DB), and
+// renders one of:
+//   future → "Forecast high / Bracket window / Edge to bracket"
+//   today  → "Current temp / Forecast peak / Bracket window / Gap to bracket"
+//   past   → "Official high / Bracket window / Result"
+function BetCardTempBlock({ position, cityState }) {
+  const p = position;
+  const cs = cityState;
+  const fmt = (x) => x == null ? '—' : `${Number(x).toFixed(1)}°F`;
+  // City's "today" — prefer the data the server emitted (already in the
+  // city's tz), fall back to client-side derivation if cs wasn't passed.
+  const today = cs?.dataDate || todayInCityTz(p.cityTz);
+  const target = p.targetDate;
+
+  // State pivot. If actual_max_f is in the DB we always treat the bet as
+  // settled — admin lag from Kalshi shouldn't drag the card back into
+  // forecast / live language.
+  const hasActual = p.actualMaxF != null;
+  let state;
+  if (hasActual) state = 'past';
+  else if (!target || !today) state = 'today';
+  else if (target > today) state = 'future';
+  else if (target < today) state = 'past';
+  else state = 'today';
+
+  const lo = p.bracketLo;
+  const hi = p.bracketHi;
+  const bracketLabel = (lo != null && hi != null) ? `${lo}–${hi}°F` : (p.bracket || '—');
+
+  // ── State 1: target_date in the future ────────────────────────────
+  if (state === 'future') {
+    const forecast = cs?.activeMax ?? cs?.modelMax;
+    let edgeLine = '—';
+    if (forecast != null && lo != null && hi != null) {
+      if (forecast < lo) edgeLine = `+${(lo - forecast).toFixed(1)}°F needed`;
+      else if (forecast > hi) edgeLine = `${(forecast - hi).toFixed(1)}°F over ceiling`;
+      else edgeLine = 'inside bracket';
+    }
+    return (
+      <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+        <tbody>
+          <tr><td>Forecast high</td><td className="num-r mono">{fmt(forecast)}</td></tr>
+          <tr><td>Bracket window</td><td className="num-r mono">{bracketLabel}</td></tr>
+          <tr><td>Edge to bracket</td><td className="num-r mono">{edgeLine}</td></tr>
+        </tbody>
+      </table>
+    );
+  }
+
+  // ── State 3: target_date past, OR actual already in DB ────────────
+  if (state === 'past') {
+    const actual = p.actualMaxF ?? p.maxSoFarF;
+    let result = '—';
+    let resultCls = '';
+    if (actual != null && lo != null && hi != null) {
+      if (actual >= lo && actual <= hi) {
+        result = 'Hit (in bracket)';
+        resultCls = 'pos';
+      } else if (actual < lo) {
+        result = `Missed by ${(lo - actual).toFixed(1)}°F (below)`;
+        resultCls = 'neg';
+      } else {
+        result = `Missed by ${(actual - hi).toFixed(1)}°F (above)`;
+        resultCls = 'neg';
+      }
+    }
+    return (
+      <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+        <tbody>
+          <tr>
+            <td>Official high</td>
+            <td className="num-r mono">
+              {fmt(actual)}{' '}
+              <span className="pill pos" style={{ marginLeft: 6, fontSize: 10 }}>✓ Final</span>
+            </td>
+          </tr>
+          <tr><td>Bracket window</td><td className="num-r mono">{bracketLabel}</td></tr>
+          <tr><td>Result</td><td className={`num-r mono ${resultCls}`}>{result}</td></tr>
+        </tbody>
+      </table>
+    );
+  }
+
+  // ── State 2: target_date is today ─────────────────────────────────
+  const current = cs?.obsCurrent;
+  const peak = cs?.activeMax ?? cs?.modelMax;
+  // Gap to bracket: distance from current temp to the FLOOR (lo). If
+  // already past the ceiling, render that too. Color tier:
+  //   green  — within 2°F of the floor (or inside)
+  //   yellow — within 5°F
+  //   red    — further away OR past the ceiling
+  let gapLine = '—';
+  let gapCls = '';
+  if (current != null && lo != null && hi != null) {
+    if (current >= lo && current <= hi) {
+      gapLine = 'inside bracket';
+      gapCls = 'pos';
+    } else if (current > hi) {
+      gapLine = `${(current - hi).toFixed(1)}°F past ceiling`;
+      gapCls = 'neg';
+    } else {
+      const gap = lo - current;
+      gapLine = `${gap.toFixed(1)}°F remaining`;
+      if (gap <= 2) gapCls = 'pos';
+      else if (gap <= 5) gapCls = 'warn';
+      else gapCls = 'neg';
+    }
+  }
+  // Live indicator only during city-local 6am–8pm.
+  const localHour = hourInCityTz(p.cityTz);
+  const liveActive = localHour >= 6 && localHour < 20;
+  return (
+    <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+      <tbody>
+        <tr>
+          <td>Current temp</td>
+          <td className="num-r mono">
+            {fmt(current)}
+            {liveActive && (
+              <span className="pill info" style={{ marginLeft: 6, fontSize: 10 }}>
+                <span className="dot info" style={{ marginRight: 4 }} />Live
+              </span>
+            )}
+          </td>
+        </tr>
+        <tr><td>Forecast peak</td><td className="num-r mono">{fmt(peak)}</td></tr>
+        <tr><td>Bracket window</td><td className="num-r mono">{bracketLabel}</td></tr>
+        <tr><td>Gap to bracket</td><td className={`num-r mono ${gapCls}`}>{gapLine}</td></tr>
+      </tbody>
+    </table>
+  );
+}
+
+
 function PositionDrilldown({ position, cityState, colSpan }) {
   const cs = cityState;
   const p = position;
-  const fmt = (x, suf = '°') => x == null ? '—' : `${Number(x).toFixed(1)}${suf}`;
-  const sources = cs ? [
+  const fmt = (x) => x == null ? '—' : `${Number(x).toFixed(1)}°`;
+  const today = cs?.dataDate || todayInCityTz(p.cityTz);
+  const target = p.targetDate;
+  const isPast = (p.actualMaxF != null) || (target && today && target < today);
+  // Forecast sources are only meaningful BEFORE the day is over. Once
+  // it's settled (or actual is in the DB), drop the panel entirely —
+  // showing GFS / NAM / ECMWF picks for a finished day is just noise.
+  const sources = (!isPast && cs) ? [
     ['GFS MOS', cs.mosMax],
     ['NAM MOS', cs.namMos],
     ['NWS forecast', cs.nwsForecast],
@@ -93,37 +263,35 @@ function PositionDrilldown({ position, cityState, colSpan }) {
     ['Ensemble', cs.modelMax],
     ['Active model', cs.activeMax],
   ] : [];
+  const headerLabel = isPast ? 'Final result' :
+    (target && today && target > today) ? 'Forecast' : 'Live today';
   return (
     <tr style={{ background: 'var(--bg-2)' }}>
       <td colSpan={colSpan} style={{ padding: '12px 16px', borderBottom: '2px solid var(--border)' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18, fontSize: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: sources.length ? '1fr 1fr' : '1fr', gap: 18, fontSize: 12 }}>
           <div>
-            <div className="label" style={{ marginBottom: 6 }}>Today's progress</div>
-            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
-              <tbody>
-                <tr><td>Today's max so far</td><td className="num-r mono">{fmt(p.maxSoFarF)}</td></tr>
-                <tr><td>Forecast remainder peak</td><td className="num-r mono">{fmt(cs?.forecastRemainderMaxF)}</td></tr>
-                <tr><td>Current observed temp</td><td className="num-r mono">{fmt(cs?.obsCurrent)}</td></tr>
-                <tr><td>Bracket window</td><td className="num-r mono">{p.bracket}</td></tr>
-                <tr><td>Distance from bracket</td><td className="num-r mono">{p.degreesFromBracket == null ? '—' : (p.degreesFromBracket === 0 ? 'inside' : (p.degreesFromBracket > 0 ? `+${p.degreesFromBracket}° over` : `${p.degreesFromBracket}° below`))}</td></tr>
-              </tbody>
-            </table>
+            <div className="label" style={{ marginBottom: 6 }}>{headerLabel}</div>
+            <BetCardTempBlock position={p} cityState={cs} />
           </div>
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>Forecast sources for day max</div>
-            <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
-              <tbody>
-                {sources.map(([name, val]) => (
-                  <tr key={name}><td>{name}</td><td className="num-r mono">{fmt(val)}</td></tr>
-                ))}
-              </tbody>
-            </table>
+          {sources.length > 0 && (
+            <div>
+              <div className="label" style={{ marginBottom: 6 }}>Forecast sources for day max</div>
+              <table className="tbl" style={{ width: '100%', fontSize: 11 }}>
+                <tbody>
+                  {sources.map(([name, val]) => (
+                    <tr key={name}><td>{name}</td><td className="num-r mono">{fmt(val)}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+        {!isPast && (
+          <div style={{ marginTop: 12, padding: 10, background: 'var(--bg-1)', borderRadius: 4, border: '1px solid var(--border)', fontSize: 12, color: 'var(--fg-1)' }}>
+            <span className="label" style={{ marginRight: 8 }}>Status reason:</span>
+            {liveStatusReason(p, cs)}
           </div>
-        </div>
-        <div style={{ marginTop: 12, padding: 10, background: 'var(--bg-1)', borderRadius: 4, border: '1px solid var(--border)', fontSize: 12, color: 'var(--fg-1)' }}>
-          <span className="label" style={{ marginRight: 8 }}>Status reason:</span>
-          {liveStatusReason(p, cs)}
-        </div>
+        )}
       </td>
     </tr>
   );

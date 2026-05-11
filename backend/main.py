@@ -1481,6 +1481,7 @@ def _mark_bet_to_market(
     max_so_far = city_state.get("maxSoFarF") if city_state else None
     forecast_rem = city_state.get("forecastRemainderMaxF") if city_state else None
     data_date = city_state.get("dataDate") if city_state else None
+    city_tz = (city_state.get("city") or {}).get("tz") if city_state else None
     # Has the trading window already closed for this bet? (closeAt = end of
     # day on target_date in city local tz). We only declare winners /
     # losers after the window shuts — until then it's pending/in_bracket.
@@ -1497,9 +1498,21 @@ def _mark_bet_to_market(
         today_target_date=data_date,
         market_closed=market_closed,
     )
+    # actual_max_f from historical_actuals when target_date is in the past.
+    # Lets the frontend render State 3 ("Official high … Missed by N°F")
+    # even before Kalshi posts the official settlement — the IEM ASOS /
+    # NWS CLI archive is usually posted hours before Kalshi marks the
+    # market settled.
+    actual_max_f = None
+    target = b.get("target_date")
+    if target and data_date and target < data_date:
+        ha = db.get_historical_actual(b["city"], target)
+        if ha:
+            actual_max_f = ha.get("actual_max_f")
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
+        "cityTz": city_tz,
         "bracket": b["bracket_label"],
         "bracketLo": b.get("bracket_lo"),
         "bracketHi": b.get("bracket_hi"),
@@ -1511,8 +1524,10 @@ def _mark_bet_to_market(
         "ifLose": if_lose,
         "liveStatus": live["status"],
         "maxSoFarF": max_so_far if (data_date and b.get("target_date") == data_date) else None,
+        "actualMaxF": actual_max_f,
         "degreesFromBracket": live["degreesFromBracket"],
         "targetDate": b.get("target_date"),
+        "dataDate": data_date,
         "marketClosed": market_closed,
     }
 
@@ -3013,11 +3028,14 @@ def get_snapshots(code: str, hours: float = 24.0, limit: int = 500):
 
 def _settled_bet_to_position(b: Dict) -> Dict:
     """Project a settled bet row into the same shape /api/positions returns
-    so the P&L "Closed positions" panel can render it without branching."""
+    so the P&L "Closed positions" panel can render it without branching.
+    actualMaxF mirrors settled_max_f so the bet card's State-3 (Final)
+    block can render without needing a separate historical_actuals lookup."""
     entry = b["entry_cents"] / 100
     size = b["size"]
     settled_pl = b.get("settled_pl") or 0
     win = settled_pl > 0
+    settled_max = b.get("settled_max_f")
     return {
         "id": f"P{b['id']}",
         "city": b["city"],
@@ -3031,7 +3049,8 @@ def _settled_bet_to_position(b: Dict) -> Dict:
         "ifWin": settled_pl if win else round((1 - entry) * (size / entry), 2) if b["side"] == "YES" else round(entry * (size / (1 - entry)), 2),
         "ifLose": settled_pl if not win else -size,
         "liveStatus": "locked_win" if win else "locked_loss",
-        "maxSoFarF": b.get("settled_max_f"),
+        "maxSoFarF": settled_max,
+        "actualMaxF": settled_max,
         "degreesFromBracket": 0.0,
         "targetDate": b.get("target_date"),
         "marketClosed": True,
