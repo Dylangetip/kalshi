@@ -85,6 +85,192 @@ _GBM_GRID = [
 ]
 
 
+# Random-search spaces for the continuous sweep loop. Each tick the sweep
+# picks an algorithm (weighted by configured probabilities) and samples
+# one combo from the matching space. Fingerprint dedup in db.compute_ml_run_fingerprint
+# guarantees we don't re-train an identical config — over time the sweep
+# drifts toward unexplored corners of the space without explicit scheduling.
+_RIDGE_SPACE = {
+    "alpha": [0.1, 0.3, 1.0, 3.0, 10.0, 30.0],
+}
+_RF_SPACE = {
+    "n_estimators": [200, 300, 500, 800],
+    "max_depth": [6, 8, 10, 12, 16],
+    "min_samples_leaf": [1, 3, 5],
+}
+_GBM_SPACE = {
+    "n_estimators": [100, 200, 300, 400, 500, 600, 800, 1000],
+    "max_depth": [2, 3, 4, 5],
+    "learning_rate": [0.005, 0.01, 0.02, 0.05, 0.1],
+    "min_samples_leaf": [1, 3, 5, 10],
+}
+
+
+def sample_random_hyperparams(algorithm_weights: Optional[Dict[str, float]] = None,
+                                rng=None) -> Dict:
+    """Pick (algorithm, hyperparams) for one sweep candidate.
+    algorithm_weights: {ridge, rf, gbm} → float; normalised internally.
+    Returns {"algorithm": str, "hyperparams": dict}. Caller is responsible
+    for fingerprint-dedup before training."""
+    import random as _random
+    rng = rng or _random
+    weights = algorithm_weights or {"ridge": 0.10, "rf": 0.20, "gbm": 0.70}
+    algos = list(weights.keys())
+    raw = [max(0.0, float(weights[a] or 0.0)) for a in algos]
+    total = sum(raw) or 1.0
+    probs = [w / total for w in raw]
+    # Weighted choice without numpy (sweep loop runs in worker thread).
+    pick = rng.random()
+    acc = 0.0
+    algo = algos[-1]
+    for a, p in zip(algos, probs):
+        acc += p
+        if pick <= acc:
+            algo = a
+            break
+    if algo == "ridge":
+        params = {"alpha": rng.choice(_RIDGE_SPACE["alpha"])}
+    elif algo == "rf":
+        params = {k: rng.choice(v) for k, v in _RF_SPACE.items()}
+    else:  # gbm
+        params = {k: rng.choice(v) for k, v in _GBM_SPACE.items()}
+    return {"algorithm": algo, "hyperparams": params}
+
+
+def _fit_with_params(algorithm: str, params: Dict, X_train, y_train, X_test, y_test) -> Dict:
+    """Single-config fitter parameterised by hyperparams, used by the
+    continuous sweep loop. Returns the same shape _fit_one returns so
+    _persist can consume it directly."""
+    import numpy as _np  # type: ignore
+    if algorithm == "ridge":
+        from sklearn.linear_model import Ridge  # type: ignore
+        from sklearn.preprocessing import StandardScaler  # type: ignore
+        from sklearn.pipeline import Pipeline  # type: ignore
+        m = Pipeline([
+            ("scaler", StandardScaler()),
+            ("ridge", Ridge(alpha=float(params.get("alpha", 1.0)))),
+        ])
+        label = f"ridge[a={params.get('alpha')}]"
+    elif algorithm == "rf":
+        from sklearn.ensemble import RandomForestRegressor  # type: ignore
+        m = RandomForestRegressor(
+            n_estimators=int(params.get("n_estimators", 300)),
+            max_depth=int(params.get("max_depth", 12)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 3)),
+            random_state=42, n_jobs=-1,
+        )
+        label = (f"rf[ne={params.get('n_estimators')},d={params.get('max_depth')},"
+                 f"l={params.get('min_samples_leaf')}]")
+    elif algorithm == "gbm":
+        from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+        m = GradientBoostingRegressor(
+            n_estimators=int(params.get("n_estimators", 200)),
+            max_depth=int(params.get("max_depth", 3)),
+            learning_rate=float(params.get("learning_rate", 0.05)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            random_state=42,
+        )
+        label = (f"gbm[ne={params.get('n_estimators')},d={params.get('max_depth')},"
+                 f"lr={params.get('learning_rate')},l={params.get('min_samples_leaf')}]")
+    else:
+        raise ValueError(f"unknown sweep algorithm {algorithm!r}")
+    m.fit(X_train, y_train)
+    return {
+        "model": m,
+        "algorithm": label,
+        "train_mae": float(_np.abs(m.predict(X_train) - y_train).mean()),
+        "test_mae": float(_np.abs(m.predict(X_test) - y_test).mean()),
+    }
+
+
+def train_random_candidate(
+    algorithm_weights: Optional[Dict[str, float]] = None,
+    min_target_date: Optional[str] = None,
+    rng=None,
+    pre_picked: Optional[Dict] = None,
+) -> Dict:
+    """One iteration of the continuous sweep: sample a config, dedup, train,
+    persist. Returns {status, algorithm, hyperparams, walk_forward_mae?,
+    test_mae?, run_id?, skipped_reason?} so the loop and the activity log
+    can render it uniformly.
+
+    Status values:
+      - "skipped_dedup"   : fingerprint already in ml_runs
+      - "skipped_no_data" : training set too small
+      - "ok"              : trained + persisted; check walk_forward_mae for selection
+      - "error"           : exception during fit; details in "error"
+    """
+    import os as _os
+    if min_target_date is None:
+        min_target_date = _os.getenv("BETS_ML_MIN_TRAIN_DATE") or None
+    pick = pre_picked or sample_random_hyperparams(algorithm_weights, rng=rng)
+    algo, params = pick["algorithm"], pick["hyperparams"]
+    try:
+        df = _build_dataframe(min_target_date=min_target_date)
+        if df is None or len(df) < 20:
+            return {"status": "skipped_no_data", "algorithm": algo,
+                    "hyperparams": params,
+                    "reason": f"only {0 if df is None else len(df)} rows; need ≥20"}
+        train_df, test_df = _split(df, test_frac=0.2)
+        if train_df.empty or test_df.empty:
+            return {"status": "skipped_no_data", "algorithm": algo,
+                    "hyperparams": params, "reason": "empty split"}
+        X_train, feature_cols = _featurize(train_df)
+        # Fingerprint check BEFORE doing the expensive featurize-test + fit.
+        fp = db.compute_ml_run_fingerprint(algo, len(train_df), feature_cols, params)
+        prior = db.find_ml_run_by_fingerprint(fp)
+        if prior:
+            return {"status": "skipped_dedup", "algorithm": algo,
+                    "hyperparams": params, "matched_run_id": prior.get("id"),
+                    "fingerprint": fp, "n_train": len(train_df)}
+        X_test, _ = _featurize(test_df, fitted_columns=feature_cols)
+        y_train = train_df[TARGET_COLUMN].astype(float)
+        y_test = test_df[TARGET_COLUMN].astype(float)
+        ens_test = test_df["ensemble_max"].astype(float)
+        ens_mask = ens_test.notna()
+        holdout_mae_ensemble = (
+            float((ens_test[ens_mask] - y_test[ens_mask]).abs().mean())
+            if ens_mask.sum() > 0 else None
+        )
+        fit = _fit_with_params(algo, params, X_train, y_train, X_test, y_test)
+        # Walk-forward MAE — the honest selection metric. Reuses the same
+        # fit logic via a closure so the splits get a freshly-fit model.
+        def _fit_fn(tr_df, te_df):
+            Xtr, fcols = _featurize(tr_df)
+            Xte, _ = _featurize(te_df, fitted_columns=fcols)
+            ytr = tr_df[TARGET_COLUMN].astype(float)
+            yte = te_df[TARGET_COLUMN].astype(float)
+            sub = _fit_with_params(algo, params, Xtr, ytr, Xte, yte)
+            return sub["test_mae"]
+        try:
+            wf = walk_forward_mae(df, _fit_fn)
+        except Exception:  # noqa: BLE001 — WF is best-effort
+            wf = None
+        run = _persist(
+            fit, feature_cols, len(train_df), len(test_df),
+            holdout_mae_ensemble,
+            walk_forward_mae_v=wf,
+            hyperparams=params,
+            fingerprint=fp,
+        )
+        return {
+            "status": "ok",
+            "run_id": run.get("id"),
+            "algorithm": algo,
+            "algorithm_label": fit.get("algorithm"),
+            "hyperparams": params,
+            "test_mae": fit.get("test_mae"),
+            "walk_forward_mae": wf,
+            "holdout_mae_ensemble": holdout_mae_ensemble,
+            "n_train": len(train_df),
+            "n_test": len(test_df),
+            "fingerprint": fp,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "algorithm": algo,
+                "hyperparams": params, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _build_dataframe(min_target_date: Optional[str] = None):
     """Pull training data, optionally filtered to target_date >= a cutoff.
     Recent-only filtering helps when older years have sparser features
@@ -528,8 +714,14 @@ def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
              holdout_mae_ensemble: Optional[float],
              extra_payload: Optional[Dict] = None,
              walk_forward_mae_v: Optional[float] = None,
-             hyperparams: Optional[Dict] = None) -> Dict:
-    """Save a fitted model to disk and record the run in ml_runs."""
+             hyperparams: Optional[Dict] = None,
+             fingerprint: Optional[str] = None) -> Dict:
+    """Save a fitted model to disk and record the run in ml_runs.
+    `fingerprint` lets the sweep loop pre-compute the dedup hash from
+    the BARE algorithm name (e.g. 'ridge') and reuse it on persist —
+    otherwise insert_ml_run rebuilds the hash from fit['algorithm']
+    which is the formatted label ('ridge[a=1.0]'), so the next sweep
+    iteration's dedup lookup would miss this row."""
     import joblib  # type: ignore
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
@@ -553,6 +745,7 @@ def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
         model_path=str(model_path),
         walk_forward_mae=walk_forward_mae_v,
         hyperparams=hyperparams,
+        fingerprint=fingerprint,
     )
 
 

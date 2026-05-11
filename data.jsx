@@ -277,6 +277,33 @@ async function fetchMlDiagnostics() {
   } catch { return null; }
 }
 
+async function fetchSweepStatus() {
+  try {
+    const r = await fetch(API_BASE + '/api/ml/sweep/status', { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+async function fetchTopRuns(metric = 'walk_forward_mae', limit = 10) {
+  try {
+    const r = await fetch(
+      API_BASE + `/api/ml/runs/top?metric=${encodeURIComponent(metric)}&limit=${limit}`,
+      { cache: 'no-store' },
+    );
+    if (!r.ok) return [];
+    return await r.json();
+  } catch { return []; }
+}
+
+async function postSweepControl(action) {
+  try {
+    const r = await fetch(API_BASE + `/api/ml/sweep/${action}`, { method: 'POST' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
 async function fetchLiveState() {
   try {
     const r = await fetch(API_BASE + '/api/state', { cache: 'no-store' });

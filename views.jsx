@@ -2352,28 +2352,426 @@ function MlDataFreshnessBadge({ mlInfo, events }) {
 }
 
 
-function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill, onMlTrain, onModelConfig }) {
+// ── Model Mission Control ─────────────────────────────────────────────
+// Self-fetching dashboard wrapped in .claude-theme. Polls /api/ml/sweep/status
+// every 5s, /api/ml/runs/top + sweep_candidate_done events every 10s. The
+// existing MlActivityPanel / MlDiagnosticsPanel / accuracy table all live
+// in the collapsed "Diagnostics" drawer at the bottom — same content, just
+// out of the main eye-line.
+
+function MissionControlHero({ status, onPause, onStart }) {
+  const enabled = !!status?.enabled;
+  const cur = status?.currently_training;
+  const last = status?.last_candidate;
+  const trained = status?.total_trained_today ?? 0;
+  const skipped = status?.total_skipped_today ?? 0;
+  const improved = status?.improvements_today ?? 0;
+  const total = trained + skipped;
+  const skipPct = total > 0 ? Math.round((skipped / total) * 100) : 0;
+  let line;
+  if (!enabled) {
+    line = <span>Sweep paused — no candidates running.</span>;
+  } else if (cur) {
+    const hp = Object.entries(cur.hyperparams || {})
+      .map(([k, v]) => `${k}=${v}`).join(' · ');
+    line = (
+      <>
+        <span style={{ fontWeight: 500 }}>Training {cur.algorithm.toUpperCase()}</span>
+        <span className="ct-current">{hp}</span>
+      </>
+    );
+  } else if (last) {
+    const since = last.ts ? Math.max(0, Math.floor((Date.now() / 1000 - last.ts))) : null;
+    line = (
+      <>
+        <span>Idle — last candidate {since != null ? `${since}s ago` : 'just now'}</span>
+        <span className="ct-current">
+          {last.algorithm}{last.walk_forward_mae != null ? ` · wf=${last.walk_forward_mae.toFixed(3)}` : ''}
+        </span>
+      </>
+    );
+  } else {
+    line = <span>Sweep idle — waiting for first candidate.</span>;
+  }
   return (
-    <div className="pnl-layout">
-      <MlDataFreshnessBadge mlInfo={mlInfo} events={events} />
-
-      <MlActivityPanel events={events} />
-
-      <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
-
-      <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
-
-      <MlModelDiffPanel modelDiff={modelDiff} />
-
-      <MlDiagnosticsPanel diagnostics={diagnostics} />
-
-      <div className="panel">
-        <div className="panel-header">
-          <span>Model accuracy</span>
-          <span className="panel-title-actions">
-            ensemble vs ML · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
-          </span>
+    <div className="panel">
+      <div className="ct-hero">
+        <div className="ct-hero-status">
+          <div className="label">Sweep status</div>
+          <div className="ct-hero-status-line">
+            <span className={`dot ${enabled && cur ? 'pulsing' : enabled ? 'info' : 'warn'}`} />
+            {line}
+          </div>
+          <div className="ct-hero-counters">
+            <div className="ct-hero-counter">
+              <div className="ct-counter-num">{trained.toLocaleString()}</div>
+              <div className="label">Trained today</div>
+            </div>
+            <div className="ct-hero-counter">
+              <div className="ct-counter-num">{skipPct}%</div>
+              <div className="label">Skipped (dedup)</div>
+            </div>
+            <div className="ct-hero-counter">
+              <div className="ct-counter-num pos">{improved}</div>
+              <div className="label">Improved champion</div>
+            </div>
+          </div>
         </div>
+        <div className="ct-hero-controls">
+          {enabled
+            ? <button onClick={onPause}>Pause sweep</button>
+            : <button onClick={onStart}>Resume sweep</button>}
+          <button className="ghost" onClick={() => window.location.reload()}>Refresh page</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MissionControlChampion({ status }) {
+  const ch = status?.champion;
+  const wfMae = ch?.walk_forward_mae;
+  const testMae = ch?.test_mae;
+  const headline = wfMae ?? testMae;
+  const fmtAlgo = ch?.algorithm || '—';
+  const trainedAt = ch?.trained_at ? new Date(ch.trained_at * 1000) : null;
+  const ago = trainedAt ? Math.max(1, Math.floor((Date.now() - trainedAt.getTime()) / 1000 / 60)) : null;
+  const agoLabel = ago == null ? '—' :
+    ago < 60 ? `${ago}m ago` :
+    ago < 1440 ? `${Math.round(ago / 60)}h ago` :
+    `${Math.round(ago / 1440)}d ago`;
+  return (
+    <div className="panel">
+      <div className="ct-champion">
+        <div>
+          <div className="label" style={{ marginBottom: 10 }}>Current champion</div>
+          <div className="ct-champ-num">
+            <span className="big-num">{headline != null ? headline.toFixed(3) : '—'}</span>
+            <span className="ct-suffix">{wfMae != null ? '°F walk-forward MAE' : (testMae != null ? '°F test MAE' : '')}</span>
+          </div>
+          <div className="mono" style={{ fontSize: 12, color: 'var(--fg-2)', marginTop: 6 }}>{fmtAlgo}</div>
+        </div>
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>Best today</div>
+          <div className="mono" style={{ fontSize: 18, color: 'var(--fg-1)' }}>
+            {status?.best_today_walk_forward_mae != null
+              ? status.best_today_walk_forward_mae.toFixed(3) + '°F'
+              : '—'}
+          </div>
+        </div>
+        <div>
+          <div className="label" style={{ marginBottom: 6 }}>Trained</div>
+          <div className="mono" style={{ fontSize: 14, color: 'var(--fg-2)' }}>
+            {agoLabel} · {(ch?.n_train ?? 0).toLocaleString()} rows
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MissionControlStream({ events }) {
+  const fmtHp = (hp) => {
+    if (!hp || typeof hp !== 'object') return '';
+    return Object.entries(hp).map(([k, v]) => `${k}=${v}`).join(' ');
+  };
+  const fmtTime = (ts) => {
+    try {
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch { return '—'; }
+  };
+  const rows = (events || []).slice(0, 20);
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Live sweep stream</span>
+        <span className="panel-title-actions">last {rows.length} candidates · auto-refreshes</span>
+      </div>
+      {rows.length === 0 ? (
+        <div style={{ padding: 18, color: 'var(--fg-3)', fontSize: 12 }}>
+          No candidates yet — sweep results will appear here as they finish.
+        </div>
+      ) : (
+        <div style={{ padding: '4px 0 8px' }}>
+          {rows.map(e => {
+            const p = e.payload || {};
+            const status = p.status || 'trained';
+            const isImprovement = status === 'champion';
+            const isSkip = status === 'skip';
+            const isErr = status === 'error';
+            const icon = isImprovement ? '✓' : isSkip ? '×' : isErr ? '!' : '·';
+            const mae = p.walk_forward_mae ?? p.test_mae;
+            const rowCls = `ct-stream-row${isImprovement ? ' improvement' : ''}${isSkip ? ' skip' : ''}`;
+            return (
+              <div key={e.id} className={rowCls}>
+                <div className="ct-stream-icon" style={{
+                  color: isImprovement ? 'var(--accent)' :
+                         isSkip ? 'var(--fg-3)' :
+                         isErr ? 'var(--neg)' : 'var(--fg-2)',
+                }}>{icon}</div>
+                <div className="ct-stream-ts">{fmtTime(e.ts)}</div>
+                <div className="ct-stream-algo">{(p.algorithm || '—').toUpperCase()}</div>
+                <div className="ct-stream-params" title={fmtHp(p.hyperparams)}>{fmtHp(p.hyperparams)}</div>
+                <div className="ct-stream-mae">
+                  {mae != null ? mae.toFixed(3) :
+                    isSkip ? 'dedup' :
+                    isErr ? 'error' : '—'}
+                  {isImprovement && p.improvement_pct != null && (
+                    <span style={{ marginLeft: 6, fontSize: 11 }}>↓{p.improvement_pct.toFixed(1)}%</span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MissionControlTrendChart({ topRuns, height = 220 }) {
+  // Plot the running-best (champion line) over time using the top runs by
+  // trained_at order. Faint dots for individual candidates, accent line for
+  // running best.
+  if (!topRuns || topRuns.length === 0) {
+    return (
+      <div className="panel">
+        <div className="panel-header"><span>MAE trend</span></div>
+        <div style={{ padding: 18, color: 'var(--fg-3)', fontSize: 12 }}>
+          Trend appears after the first dozen candidates have finished.
+        </div>
+      </div>
+    );
+  }
+  // Order runs by trained_at ascending for the chart.
+  const runs = [...topRuns]
+    .filter(r => r.walk_forward_mae != null)
+    .sort((a, b) => (a.trained_at || 0) - (b.trained_at || 0));
+  if (runs.length < 2) {
+    return (
+      <div className="panel">
+        <div className="panel-header"><span>MAE trend</span></div>
+        <div style={{ padding: 18, color: 'var(--fg-3)', fontSize: 12 }}>
+          Need ≥2 trained candidates to draw the trend.
+        </div>
+      </div>
+    );
+  }
+  const W = 1000, H = height, pad = { l: 56, r: 16, t: 14, b: 32 };
+  const ts = runs.map(r => r.trained_at);
+  const ys = runs.map(r => r.walk_forward_mae);
+  const xMin = Math.min(...ts), xMax = Math.max(...ts);
+  const yMin = Math.min(...ys) * 0.97, yMax = Math.max(...ys) * 1.03;
+  const xScale = x => pad.l + ((x - xMin) / Math.max(1, xMax - xMin)) * (W - pad.l - pad.r);
+  const yScale = y => H - pad.b - ((y - yMin) / Math.max(0.001, yMax - yMin)) * (H - pad.t - pad.b);
+  // Running best line
+  let best = Infinity;
+  const bestPath = runs.map((r, i) => {
+    if (r.walk_forward_mae < best) best = r.walk_forward_mae;
+    return `${i === 0 ? 'M' : 'L'} ${xScale(r.trained_at).toFixed(1)} ${yScale(best).toFixed(1)}`;
+  }).join(' ');
+  const fmtTick = t => new Date(t * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Walk-forward MAE trend</span>
+        <span className="panel-title-actions">
+          <span><span className="dot" style={{ background: 'var(--accent)' }} /> running best</span>
+          <span><span className="dot" style={{ background: 'rgba(20,20,20,0.4)' }} /> candidate</span>
+        </span>
+      </div>
+      <div style={{ padding: 18 }}>
+        <svg className="ct-trend-svg" viewBox={`0 0 ${W} ${H}`} height={H}>
+          {[yMin, (yMin + yMax) / 2, yMax].map((y, i) => (
+            <g key={i}>
+              <line className="grid" x1={pad.l} x2={W - pad.r} y1={yScale(y)} y2={yScale(y)} />
+              <text className="axis" x={pad.l - 8} y={yScale(y) + 3} textAnchor="end">{y.toFixed(2)}</text>
+            </g>
+          ))}
+          <text className="axis" x={pad.l} y={H - 8}>{fmtTick(xMin)}</text>
+          <text className="axis" x={W - pad.r} y={H - 8} textAnchor="end">{fmtTick(xMax)}</text>
+          {runs.map((r, i) => {
+            const algo = (r.algorithm || '').split('[')[0].toLowerCase() || 'gbm';
+            const cls = algo.includes('ridge') ? 'ridge' : algo.includes('rf') ? 'rf' : 'gbm';
+            return (
+              <circle key={i} className={`candidate-dot ${cls}`}
+                cx={xScale(r.trained_at)} cy={yScale(r.walk_forward_mae)} r="3" />
+            );
+          })}
+          <path className="champion-line" d={bestPath} />
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+function MissionControlWhatsWorking({ topRuns }) {
+  if (!topRuns || topRuns.length === 0) return null;
+  // Common-pattern extractor: for each hyperparam dimension that appears
+  // in 5+ of the top runs, find the most common value and its frequency.
+  const patterns = (() => {
+    const dimCounts = {};   // dim → {value → count}
+    const dimRuns = {};     // dim → count of runs that have it
+    topRuns.forEach(r => {
+      const hp = r.hyperparams || {};
+      Object.entries(hp).forEach(([k, v]) => {
+        dimRuns[k] = (dimRuns[k] || 0) + 1;
+        dimCounts[k] = dimCounts[k] || {};
+        const key = String(v);
+        dimCounts[k][key] = (dimCounts[k][key] || 0) + 1;
+      });
+    });
+    const out = [];
+    Object.entries(dimCounts).forEach(([dim, counts]) => {
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      const [val, n] = sorted[0];
+      if (n >= Math.max(5, Math.ceil(topRuns.length * 0.6))) {
+        out.push({ dim, val, n, total: dimRuns[dim] });
+      }
+    });
+    return out;
+  })();
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>What's working</span>
+        <span className="panel-title-actions">top {topRuns.length} by walk-forward MAE</span>
+      </div>
+      <div style={{ padding: '0 24px' }}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th style={{ width: 30 }}>#</th>
+              <th>Algorithm</th>
+              <th>Hyperparams</th>
+              <th className="num-r">WF MAE</th>
+              <th className="num-r">N train</th>
+            </tr>
+          </thead>
+          <tbody>
+            {topRuns.map((r, i) => (
+              <tr key={r.id}>
+                <td className="mono" style={{ color: 'var(--fg-3)' }}>{i + 1}</td>
+                <td className="mono" style={{ fontWeight: i === 0 ? 600 : 400 }}>{r.algorithm}</td>
+                <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                  {r.hyperparams ? Object.entries(r.hyperparams).map(([k, v]) => `${k}=${v}`).join(' ') : '—'}
+                </td>
+                <td className="num-r">{r.walk_forward_mae != null ? r.walk_forward_mae.toFixed(3) : '—'}</td>
+                <td className="num-r mono" style={{ color: 'var(--fg-3)' }}>{(r.n_train || 0).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {patterns.length > 0 && (
+          <div style={{ padding: '14px 0 24px', fontSize: 12, color: 'var(--fg-2)' }}>
+            <div className="label" style={{ marginBottom: 8 }}>Common patterns in top {topRuns.length}</div>
+            {patterns.map(p => (
+              <div key={p.dim} className="mono" style={{ marginBottom: 4 }}>
+                <span style={{ color: 'var(--accent)' }}>{p.n}/{p.total}</span> use{' '}
+                <span style={{ color: 'var(--fg-1)' }}>{p.dim}={p.val}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill, onMlTrain, onModelConfig }) {
+  const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
+    ? window.__BETS_API__ : '';
+  const [sweepStatus, setSweepStatus] = useState_v(null);
+  const [topRuns, setTopRuns] = useState_v([]);
+  const [sweepEvents, setSweepEvents] = useState_v([]);
+  const [showDiagnostics, setShowDiagnostics] = useState_v(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const refreshStatus = async () => {
+      try {
+        const r = await fetch(apiBase + '/api/ml/sweep/status', { cache: 'no-store' });
+        if (!cancelled && r.ok) setSweepStatus(await r.json());
+      } catch {}
+    };
+    const refreshRest = async () => {
+      try {
+        const [tR, eR] = await Promise.all([
+          fetch(apiBase + '/api/ml/runs/top?metric=walk_forward_mae&limit=10', { cache: 'no-store' }),
+          fetch(apiBase + '/api/ml/events?kinds=sweep_candidate_done&limit=20', { cache: 'no-store' }),
+        ]);
+        if (!cancelled && tR.ok) setTopRuns(await tR.json());
+        if (!cancelled && eR.ok) {
+          const j = await eR.json();
+          setSweepEvents(j.events || []);
+        }
+      } catch {}
+    };
+    refreshStatus(); refreshRest();
+    const sId = setInterval(refreshStatus, 5000);
+    const rId = setInterval(refreshRest, 10000);
+    return () => { cancelled = true; clearInterval(sId); clearInterval(rId); };
+  }, [apiBase]);
+
+  const sendSweep = async (action) => {
+    try {
+      const r = await fetch(apiBase + `/api/ml/sweep/${action}`, { method: 'POST' });
+      if (r.ok) setSweepStatus(await r.json());
+    } catch {}
+  };
+
+  return (
+    <div className="claude-theme">
+      <div className="ct-page">
+        <MissionControlHero
+          status={sweepStatus}
+          onPause={() => sendSweep('pause')}
+          onStart={() => sendSweep('start')}
+        />
+        <MissionControlChampion status={sweepStatus} />
+        <MissionControlStream events={sweepEvents} />
+        <MissionControlTrendChart topRuns={topRuns} />
+        <MissionControlWhatsWorking topRuns={topRuns} />
+
+        <div className="panel">
+          <div className="panel-header">
+            <span>Recent activity</span>
+            <button className="ct-toggle" onClick={() => setShowDiagnostics(s => !s)}>
+              {showDiagnostics ? 'Hide diagnostics ↑' : 'Show diagnostics ↓'}
+            </button>
+          </div>
+          <MlActivityPanel events={events} />
+        </div>
+
+        {showDiagnostics && (
+          <>
+            <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
+            <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
+            <MlModelDiffPanel modelDiff={modelDiff} />
+            <MlDiagnosticsPanel diagnostics={diagnostics} />
+            <MlAccuracyPanel accuracy={accuracy} />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// Old "Model accuracy" panel, extracted so the diagnostics drawer can
+// render it the same way it did pre-redesign without inlining its 70-line
+// table block in the new MlView.
+function MlAccuracyPanel({ accuracy }) {
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Model accuracy</span>
+        <span className="panel-title-actions">
+          ensemble vs ML · {accuracy?.n_predictions || 0} settled day{(accuracy?.n_predictions || 0) === 1 ? '' : 's'}
+        </span>
+      </div>
         {!accuracy || accuracy.n_predictions === 0 ? (
           <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
             no settled predictions yet — accuracy populates after the first
@@ -2455,7 +2853,6 @@ function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill
             </div>
           </div>
         )}
-      </div>
     </div>
   );
 }

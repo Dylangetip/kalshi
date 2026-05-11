@@ -177,6 +177,24 @@ _auto_trade_state: Dict = {
     # so the trader gracefully no-ops until the user makes a deposit.
     "account_mode": os.getenv("BETS_ACCOUNT_MODE", "1") == "1",
     "account_balance": float(os.getenv("BETS_ACCOUNT_START", "0")),
+    # Continuous ML sweep. Each tick samples a random hyperparam config
+    # (weighted toward GBM since it currently wins), fingerprint-dedups
+    # against ml_runs, and trains if novel. Champion promotion reuses
+    # the ≥5% walk_forward_mae improvement gate at the bottom of the
+    # tick body. Toggle from the UI via /api/ml/sweep/{start,pause}.
+    "sweep_enabled": os.getenv("BETS_SWEEP_ENABLED", "1") == "1",
+    "sweep_interval_seconds": int(os.getenv("BETS_SWEEP_INTERVAL", "60")),
+    "sweep_algorithm_weights": {"ridge": 0.10, "rf": 0.20, "gbm": 0.70},
+    "sweep_max_active_rows": int(os.getenv("BETS_SWEEP_MAX_ROWS", "2000")),
+    # Session counters so the UI's "today" pill is accurate without
+    # re-querying ml_runs every poll. Reset to 0 at midnight UTC.
+    "sweep_total_trained_today": 0,
+    "sweep_total_skipped_today": 0,
+    "sweep_improvements_today": 0,
+    "sweep_best_today": None,
+    "sweep_today_anchor": None,
+    "sweep_last_candidate": None,
+    "sweep_currently_training": None,
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -761,187 +779,180 @@ async def _snapshot_loop() -> None:
         await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
 
 
-async def _ml_retrain_loop() -> None:
-    """Retrain via the 'auto' sweep every BETS_ML_RETRAIN_INTERVAL
-    seconds (default daily). Each cycle:
-      - sweeps linear (Ridge) + rf + gbm hyperparameter grid
-      - persists the lowest test_mae candidate as the active model
-      - logs every candidate to ml_runs so the history table shows
-        the full sweep and the trend sparkline traces actual progress
+def _sweep_reset_today_counters_if_needed(cfg: Dict) -> None:
+    """Reset the per-day counters at UTC midnight. Anchor stored as the
+    ISO date of the most recent reset; comparing with today's UTC date
+    is enough."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if cfg.get("sweep_today_anchor") != today:
+        cfg["sweep_today_anchor"] = today
+        cfg["sweep_total_trained_today"] = 0
+        cfg["sweep_total_skipped_today"] = 0
+        cfg["sweep_improvements_today"] = 0
+        cfg["sweep_best_today"] = None
 
-    Combined with _ml_incremental_backfill_loop (which extends the
-    historical tables daily), the model genuinely improves over time
-    as more settled data accrues AND as the sweep finds better
-    configurations on that data."""
-    last_paired_count = db.count_paired_total()
+
+async def _ml_sweep_loop() -> None:
+    """Continuous hyperparameter sweep. Each iteration samples a random
+    config (weighted toward GBM), fingerprint-dedups against ml_runs,
+    trains if novel, and promotes the new run to champion if its
+    walk-forward MAE beats the current champion by ≥5%.
+
+    Replaces the legacy "once-per-day batch sweep" approach. Identical
+    promotion logic (reuse the same ≥5% improvement gate and ≥20%
+    rollback gate); the only thing that changed is cadence and the
+    per-iteration shape (one candidate at a time, not a fixed grid)."""
+    cfg = _auto_trade_state
+    # Defer first iteration so uvicorn startup can finish.
+    await asyncio.sleep(ML_RETRAIN_INITIAL_DELAY_SECONDS)
+    print(f"[ml-sweep] continuous sweep loop active "
+          f"(interval={cfg.get('sweep_interval_seconds')}s, "
+          f"enabled={cfg.get('sweep_enabled')})")
     while True:
-        # Defer the first sweep so uvicorn lifespan startup can finish
-        # before we monopolize CPU. Subsequent iterations sleep at the
-        # bottom of the loop on the configured interval.
-        await asyncio.sleep(ML_RETRAIN_INITIAL_DELAY_SECONDS)
-        # Data-driven trigger: also fire if at least 50 new paired rows
-        # have arrived since the last retrain. Logged with `trigger`
-        # field in the start event so the activity feed shows why.
-        cur_paired = db.count_paired_total()
-        new_rows = cur_paired - last_paired_count
-        trigger = "data_threshold" if new_rows >= 50 else "scheduled"
         try:
-            prev = db.latest_ml_run()
-            # Pre-train dedup gate. If the previous run trained on exactly
-            # the same total paired set AND already has both test_mae and
-            # walk_forward_mae populated, nothing has changed since — skip
-            # the entire sweep instead of burning CPU on a duplicate.
-            # Triggered runs (data_threshold) already imply n_paired grew,
-            # so this only blocks the daily scheduled tick on a quiet day.
-            #
-            # NOTE: prev.n_train is the TRAIN-side of the 80/20 split, not
-            # the full dataset. cur_paired counts ALL paired rows. Compare
-            # against (n_train + n_test) to put them on the same scale.
-            prev_paired_total = ((prev or {}).get("n_train") or 0) + ((prev or {}).get("n_test") or 0)
-            if (prev
-                and prev_paired_total == cur_paired
-                and prev.get("test_mae") is not None
-                and prev.get("walk_forward_mae") is not None
-                and not prev.get("skipped")):
-                db.log_ml_event(
-                    "retrain_done",
-                    {"skipped": True, "n_paired": cur_paired,
-                     "matched_run_id": prev["id"], "reason": "no new data"},
-                    f"retrain skipped — no new pairs since run {prev['id']} "
-                    f"(n_paired={cur_paired:,})",
-                )
-                # Mark a stub row so the activity feed reflects the tick.
-                fp = db.compute_ml_run_fingerprint(
-                    prev["algorithm"], cur_paired, [], None,
-                )
-                db.log_ml_run_skipped(
-                    prev["algorithm"], cur_paired, fp, prev["id"],
-                )
-                last_paired_count = cur_paired
-                await asyncio.sleep(max(0, ML_RETRAIN_INTERVAL_SECONDS - ML_RETRAIN_INITIAL_DELAY_SECONDS))
+            _sweep_reset_today_counters_if_needed(cfg)
+            if not cfg.get("sweep_enabled"):
+                cfg["sweep_currently_training"] = None
+                await asyncio.sleep(max(5, int(cfg.get("sweep_interval_seconds") or 60)))
                 continue
-            db.log_ml_event(
-                "retrain_start",
-                {"trigger": trigger, "n_paired": cur_paired, "new_since_last": new_rows},
-                f"retrain started — trigger={trigger}, n_paired={cur_paired:,}",
+            # Pick a candidate up-front so the UI sees "currently training" right away.
+            from .ml import train as _train_mod
+            pick = _train_mod.sample_random_hyperparams(cfg.get("sweep_algorithm_weights"))
+            cfg["sweep_currently_training"] = {
+                "algorithm": pick["algorithm"],
+                "hyperparams": pick["hyperparams"],
+                "started_at": int(time.time()),
+            }
+            # Train in a thread so the event loop stays responsive.
+            # Pass pre_picked so the worker uses the exact config we just
+            # surfaced as "currently training" — no double-sampling.
+            result = await asyncio.to_thread(
+                _train_mod.train_random_candidate,
+                cfg.get("sweep_algorithm_weights"),
+                None,         # min_target_date — falls back to env
+                None,         # rng — unused when pre_picked is supplied
+                pick,         # pre_picked
             )
-            # Training is sync and CPU-bound (sklearn). Run it in a thread
-            # so the event loop stays free for HTTP traffic.
-            run = await asyncio.to_thread(ml_train.train, algorithm="auto")
-            if run.get("error"):
-                print(f"[ml-retrain] auto skipped: {run['error']}")
+            cfg["sweep_currently_training"] = None
+            cfg["sweep_last_candidate"] = {
+                "ts": int(time.time()),
+                "algorithm": result.get("algorithm"),
+                "algorithm_label": result.get("algorithm_label"),
+                "hyperparams": result.get("hyperparams"),
+                "status": result.get("status"),
+                "walk_forward_mae": result.get("walk_forward_mae"),
+                "test_mae": result.get("test_mae"),
+            }
+            # Update per-day counters and log the activity event.
+            if result.get("status") == "skipped_dedup":
+                cfg["sweep_total_skipped_today"] = int(cfg.get("sweep_total_skipped_today") or 0) + 1
                 db.log_ml_event(
-                    "retrain_done",
-                    {"error": run["error"]},
-                    f"retrain skipped: {run['error']}",
+                    "sweep_candidate_done",
+                    {"status": "skip", "algorithm": result.get("algorithm"),
+                     "hyperparams": result.get("hyperparams"),
+                     "matched_run_id": result.get("matched_run_id")},
+                    f"sweep skip — {result.get('algorithm')} "
+                    f"(already tried as run {result.get('matched_run_id')})",
                 )
-            else:
-                cands = run.get("auto_candidates") or []
-                summary = ", ".join(f"{c['algorithm']}={c['test_mae']}" for c in cands)
-                print(f"[ml-retrain] auto sweep: {summary} → kept {run.get('algorithm')}")
+            elif result.get("status") == "error":
                 db.log_ml_event(
-                    "retrain_done",
-                    {"algorithm": run.get("algorithm"), "test_mae": run.get("test_mae"),
-                     "n_train": run.get("n_train"), "n_test": run.get("n_test"),
-                     "candidates": cands},
-                    f"retrain done — kept {run.get('algorithm')} "
-                    f"(test_mae={run.get('test_mae')})",
+                    "sweep_candidate_done",
+                    {"status": "error", "algorithm": result.get("algorithm"),
+                     "hyperparams": result.get("hyperparams"),
+                     "error": result.get("error")},
+                    f"sweep error — {result.get('algorithm')}: {result.get('error')}",
                 )
-                # Champion selection prefers walk_forward_mae (the honest
-                # time-series eval). Falls back to test_mae if WF wasn't
-                # computed for either run, but a model with no WF metric
-                # is ineligible to take champion from a model that has one.
-                prev_wf = (prev or {}).get("walk_forward_mae")
-                run_wf  = run.get("walk_forward_mae")
+            elif result.get("status") == "skipped_no_data":
+                # Don't count toward today — this is an environmental skip,
+                # not a hyperparam-dedup skip.
+                pass
+            elif result.get("status") == "ok":
+                cfg["sweep_total_trained_today"] = int(cfg.get("sweep_total_trained_today") or 0) + 1
+                wf = result.get("walk_forward_mae")
+                best_today = cfg.get("sweep_best_today")
+                if wf is not None and (best_today is None or wf < best_today):
+                    cfg["sweep_best_today"] = round(float(wf), 4)
+                # Promotion gate — reuse the existing ≥5% / >20% logic.
+                champ_rows = db.list_runs_by_role("champion", limit=1)
+                champion = champ_rows[0] if champ_rows else db.latest_ml_run()
+                run_wf = wf
+                prev_wf = (champion or {}).get("walk_forward_mae")
                 metric_used = "walk_forward_mae" if (prev_wf is not None and run_wf is not None) else "test_mae"
-                prev_v = prev_wf if metric_used == "walk_forward_mae" else (prev or {}).get("test_mae")
-                run_v  = run_wf  if metric_used == "walk_forward_mae" else run.get("test_mae")
-                if prev and prev_v and run_v:
+                prev_v = prev_wf if metric_used == "walk_forward_mae" else (champion or {}).get("test_mae")
+                run_v = run_wf if metric_used == "walk_forward_mae" else result.get("test_mae")
+                promoted = False
+                pct = None
+                if champion and champion.get("id") != result.get("run_id") and prev_v and run_v:
                     delta = run_v - prev_v
                     pct = (delta / prev_v) * 100 if prev_v else 0.0
-                    arrow = "↘" if delta < 0 else "↗"
-                    db.log_ml_event(
-                        "model_swap",
-                        {"from": prev.get("algorithm"), "to": run.get("algorithm"),
-                         "metric_used": metric_used,
-                         f"from_{metric_used}": prev_v,
-                         f"to_{metric_used}":   run_v,
-                         "delta": round(delta, 4), "pct": round(pct, 2)},
-                        f"model swap — {metric_used} {prev_v:.3f} {arrow} "
-                        f"{run_v:.3f} ({pct:+.1f}%)",
-                    )
-                    # ── Champion/challenger gate ──
-                    # Auto-promote new model if it beats champion by ≥5%.
-                    # Otherwise mark new run as 'archived' (stays in
-                    # ml_runs for diff visibility but doesn't go live).
-                    # Auto-rollback (re-promote prev) if new model is
-                    # >20% worse — protects against bad retrains.
+                    improved_pct = -pct
                     try:
-                        improved_pct = -pct  # negative pct = better
                         if improved_pct >= 5.0:
-                            db.update_ml_run_role(prev["id"], "archived")
-                            # New run already inserted as 'champion' default
+                            db.update_ml_run_role(champion["id"], "archived")
+                            # New run was inserted as champion default; archive siblings.
+                            db.archive_other_champions(result["run_id"])
+                            cfg["sweep_improvements_today"] = int(cfg.get("sweep_improvements_today") or 0) + 1
+                            promoted = True
                             db.log_ml_event(
                                 "model_promoted",
-                                {"new_id": run["id"], "old_id": prev["id"],
-                                 "improvement_pct": round(improved_pct, 2)},
+                                {"new_id": result["run_id"], "old_id": champion["id"],
+                                 "improvement_pct": round(improved_pct, 2),
+                                 "metric_used": metric_used},
                                 f"challenger promoted to champion "
-                                f"(+{improved_pct:.1f}% MAE improvement)",
+                                f"(+{improved_pct:.1f}% {metric_used} improvement)",
                             )
                         elif improved_pct < -20.0:
-                            # New model is materially worse — rollback
-                            db.update_ml_run_role(run["id"], "archived")
-                            db.update_ml_run_role(prev["id"], "champion")
+                            db.update_ml_run_role(result["run_id"], "archived")
+                            db.update_ml_run_role(champion["id"], "champion")
                             db.log_ml_event(
                                 "model_rolled_back",
-                                {"reverted_to_id": prev["id"], "rejected_id": run["id"],
+                                {"reverted_to_id": champion["id"], "rejected_id": result["run_id"],
                                  "regression_pct": round(-improved_pct, 2)},
-                                f"new model rejected — {-improved_pct:.1f}% worse, "
-                                f"reverted to previous champion",
+                                f"sweep candidate rejected — {-improved_pct:.1f}% worse",
                             )
                         else:
-                            # Marginal change — keep new as challenger,
-                            # old stays archived. Default 'champion' on
-                            # the new row is fine since the previous loop
-                            # already had old as 'champion' which we now
-                            # demote to 'archived'.
-                            db.update_ml_run_role(prev["id"], "archived")
-                        # Sweeping cleanup: archive every persisted-as-
-                        # champion row OTHER than the current `run`. This
-                        # demotes any siblings the auto-sweep wrote with
-                        # the historical default role='champion' bug
-                        # before we changed candidates to insert as
-                        # 'archived'. Idempotent — no-op once the table
-                        # is clean.
-                        if run.get("id"):
-                            cleared = db.archive_other_champions(run["id"])
-                            if cleared:
-                                print(f"[champion-challenger] archived "
-                                      f"{cleared} stale champion rows")
+                            # Marginal — leave champion in place, mark new as archived.
+                            db.update_ml_run_role(result["run_id"], "archived")
                     except Exception as exc:  # noqa: BLE001
-                        print(f"[champion-challenger] promotion logic failed: {exc}")
-                # Drift check on the freshly-trained model — alerts when
-                # last week's MAE is materially worse than the trailing 4w.
-                try:
-                    drift = await asyncio.to_thread(ml_diagnostics.drift_check)
-                    if drift.get("drifting"):
-                        db.log_ml_event(
-                            "drift_alert",
-                            drift,
-                            f"drift alert — last-week MAE {drift['last_week_mae']}° "
-                            f"vs trailing-4w {drift['trailing_4w_mae']}° "
-                            f"(ratio {drift['ratio']}×)",
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[ml-retrain] drift check failed: {exc}")
-                last_paired_count = cur_paired
+                        print(f"[ml-sweep] promotion logic failed: {exc}")
+                # One unified event for every trained candidate (the live
+                # stream in the UI reads from this).
+                db.log_ml_event(
+                    "sweep_candidate_done",
+                    {"status": "champion" if promoted else "trained",
+                     "algorithm": result.get("algorithm"),
+                     "algorithm_label": result.get("algorithm_label"),
+                     "hyperparams": result.get("hyperparams"),
+                     "walk_forward_mae": run_wf,
+                     "test_mae": result.get("test_mae"),
+                     "run_id": result.get("run_id"),
+                     "improvement_pct": round(-pct, 2) if pct is not None else None,
+                     "metric_used": metric_used},
+                    (f"sweep ✓ {result.get('algorithm')} "
+                     f"wf_mae={run_wf:.3f}" if run_wf is not None else
+                     f"sweep · {result.get('algorithm')}") +
+                    (f" — promoted (+{-pct:.1f}%)" if promoted and pct is not None else ""),
+                )
+            # Optional housekeeping: cap ml_runs table size by archiving
+            # the oldest non-champion rows.
+            try:
+                cap = int(cfg.get("sweep_max_active_rows") or 2000)
+                if cap > 0 and hasattr(db, "trim_ml_runs"):
+                    db.trim_ml_runs(cap)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
-            print(f"[ml-retrain] error: {exc}")
-            db.log_ml_event("retrain_done", {"error": str(exc)},
-                            f"retrain error: {exc}")
-        # Subsequent cadence — wait a full interval before the next
-        # sweep. (First-iteration delay is at the top of the loop.)
-        await asyncio.sleep(max(0, ML_RETRAIN_INTERVAL_SECONDS - ML_RETRAIN_INITIAL_DELAY_SECONDS))
+            print(f"[ml-sweep] error: {exc}")
+            cfg["sweep_currently_training"] = None
+        # Persist counters periodically (every ~10 ticks). Cheap to do
+        # every iteration if the json write becomes annoying we'll throttle.
+        try:
+            _persist_auto_trade_state()
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(max(5, int(cfg.get("sweep_interval_seconds") or 60)))
+
+
 
 
 async def _ml_incremental_backfill_loop() -> None:
@@ -1060,7 +1071,7 @@ async def _startup() -> None:
     if _auto_trader_task is None:
         _auto_trader_task = asyncio.create_task(_auto_trader_loop())
     if not ML_RETRAIN_LOOP_DISABLED and _ml_retrain_task is None:
-        _ml_retrain_task = asyncio.create_task(_ml_retrain_loop())
+        _ml_retrain_task = asyncio.create_task(_ml_sweep_loop())
     if not ML_BACKFILL_LOOP_DISABLED and _ml_incremental_backfill_task is None:
         _ml_incremental_backfill_task = asyncio.create_task(_ml_incremental_backfill_loop())
 
@@ -1753,6 +1764,8 @@ _AUTO_TRADE_PERSIST_KEYS = (
     "min_balance_usd", "bet_sizing_mode", "size_tiers",
     "virtual_mode", "virtual_starting_balance", "virtual_current_balance",
     "account_mode", "account_balance",
+    "sweep_enabled", "sweep_interval_seconds", "sweep_algorithm_weights",
+    "sweep_max_active_rows",
 )
 
 
@@ -2613,6 +2626,105 @@ def ml_events(limit: int = 200, since_ts: Optional[int] = None,
             "retrain": in_flight("retrain_start", "retrain_done"),
         },
     }
+
+
+# ── Continuous sweep control ───────────────────────────────────────────
+
+def _sweep_status_payload() -> Dict:
+    cfg = _auto_trade_state
+    _sweep_reset_today_counters_if_needed(cfg)
+    champ_rows = db.list_runs_by_role("champion", limit=1)
+    champion = champ_rows[0] if champ_rows else None
+    return {
+        "enabled": bool(cfg.get("sweep_enabled")),
+        "interval_seconds": int(cfg.get("sweep_interval_seconds") or 60),
+        "algorithm_weights": cfg.get("sweep_algorithm_weights") or {},
+        "today_anchor": cfg.get("sweep_today_anchor"),
+        "total_trained_today": int(cfg.get("sweep_total_trained_today") or 0),
+        "total_skipped_today": int(cfg.get("sweep_total_skipped_today") or 0),
+        "improvements_today": int(cfg.get("sweep_improvements_today") or 0),
+        "best_today_walk_forward_mae": cfg.get("sweep_best_today"),
+        "currently_training": cfg.get("sweep_currently_training"),
+        "last_candidate": cfg.get("sweep_last_candidate"),
+        "champion": {
+            "id": (champion or {}).get("id"),
+            "algorithm": (champion or {}).get("algorithm"),
+            "walk_forward_mae": (champion or {}).get("walk_forward_mae"),
+            "test_mae": (champion or {}).get("test_mae"),
+            "trained_at": (champion or {}).get("trained_at"),
+            "n_train": (champion or {}).get("n_train"),
+            "n_test": (champion or {}).get("n_test"),
+            "hyperparams": _safe_json_load((champion or {}).get("hyperparams")),
+        } if champion else None,
+    }
+
+
+def _safe_json_load(v):
+    if not v:
+        return None
+    if isinstance(v, dict):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@app.get("/api/ml/sweep/status")
+def ml_sweep_status():
+    """Snapshot for the Mission Control hero card. Includes per-day
+    counters, currently-training row, last-finished candidate, and the
+    current champion's identity."""
+    return _sweep_status_payload()
+
+
+@app.post("/api/ml/sweep/start")
+def ml_sweep_start():
+    """Resume the continuous sweep loop."""
+    _auto_trade_state["sweep_enabled"] = True
+    _persist_auto_trade_state()
+    db.log_ml_event("sweep_paused", {"enabled": True},
+                    "sweep resumed via /api/ml/sweep/start")
+    return _sweep_status_payload()
+
+
+@app.post("/api/ml/sweep/pause")
+def ml_sweep_pause():
+    """Pause the continuous sweep loop. The in-flight candidate (if any)
+    finishes first; no new candidates are sampled until resumed."""
+    _auto_trade_state["sweep_enabled"] = False
+    _persist_auto_trade_state()
+    db.log_ml_event("sweep_paused", {"enabled": False},
+                    "sweep paused via /api/ml/sweep/pause")
+    return _sweep_status_payload()
+
+
+@app.get("/api/ml/runs/top")
+def ml_runs_top(limit: int = 10, metric: str = "walk_forward_mae"):
+    """Top N runs by the requested metric (walk_forward_mae or test_mae).
+    Drives the "What's working" panel — surfaces both the leaderboard
+    AND lets the UI extract the most-common hyperparam values across
+    the top configs."""
+    metric = "walk_forward_mae" if metric not in ("walk_forward_mae", "test_mae") else metric
+    capped = max(1, min(int(limit or 10), 100))
+    c = db._conn_or_init()
+    rows = c.execute(
+        f"""SELECT id, trained_at, algorithm, n_train, n_test,
+                   train_mae, test_mae, walk_forward_mae,
+                   holdout_mae_ensemble, role, hyperparams
+              FROM ml_runs
+             WHERE {metric} IS NOT NULL
+               AND COALESCE(skipped, 0) = 0
+             ORDER BY {metric} ASC
+             LIMIT ?""",
+        (capped,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["hyperparams"] = _safe_json_load(d.get("hyperparams"))
+        out.append(d)
+    return out
 
 
 @app.get("/api/ml/model-diff")
