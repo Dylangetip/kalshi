@@ -2699,6 +2699,45 @@ def ml_sweep_pause():
     return _sweep_status_payload()
 
 
+@app.get("/api/ml/runs")
+def ml_runs_recent(since_hours: float = 168.0, limit: int = 1000):
+    """Recent ml_runs rows for the Mission Control charts. Returns all
+    non-skipped runs whose trained_at is within the last `since_hours`,
+    newest first, up to `limit`. Hyperparams parsed from JSON. Powers
+    the per-algorithm scatter, sensitivity grid, coverage heatmap,
+    candidates-per-hour bars, and improvement waterfall on the UI."""
+    capped = max(1, min(int(limit or 1000), 5000))
+    cutoff = int(time.time()) - int(max(0.0, float(since_hours)) * 3600)
+    c = db._conn_or_init()
+    rows = c.execute(
+        """SELECT id, trained_at, algorithm, n_train, n_test,
+                  train_mae, test_mae, walk_forward_mae,
+                  holdout_mae_ensemble, role, hyperparams, skipped, fingerprint
+             FROM ml_runs
+            WHERE trained_at >= ?
+            ORDER BY trained_at DESC, id DESC
+            LIMIT ?""",
+        (cutoff, capped),
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["hyperparams"] = _safe_json_load(d.get("hyperparams"))
+        # Derive a coarse algo bucket so the UI doesn't need to parse the
+        # formatted label every render. ridge[a=1.0] → ridge, etc.
+        algo_label = (d.get("algorithm") or "").lower()
+        if algo_label.startswith("ridge"):
+            d["algo_bucket"] = "ridge"
+        elif algo_label.startswith("rf"):
+            d["algo_bucket"] = "rf"
+        elif algo_label.startswith("gbm"):
+            d["algo_bucket"] = "gbm"
+        else:
+            d["algo_bucket"] = "other"
+        out.append(d)
+    return out
+
+
 @app.get("/api/ml/runs/top")
 def ml_runs_top(limit: int = 10, metric: str = "walk_forward_mae"):
     """Top N runs by the requested metric (walk_forward_mae or test_mae).

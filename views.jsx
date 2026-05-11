@@ -2353,11 +2353,10 @@ function MlDataFreshnessBadge({ mlInfo, events }) {
 
 
 // ── Model Mission Control ─────────────────────────────────────────────
-// Self-fetching dashboard wrapped in .claude-theme. Polls /api/ml/sweep/status
-// every 5s, /api/ml/runs/top + sweep_candidate_done events every 10s. The
-// existing MlActivityPanel / MlDiagnosticsPanel / accuracy table all live
-// in the collapsed "Diagnostics" drawer at the bottom — same content, just
-// out of the main eye-line.
+// Dark-palette dashboard for the continuous sweep. Self-fetching:
+// /api/ml/sweep/status every 5s, recent runs + sweep_candidate_done events
+// every 10s. All charts are plain SVG using the global --accent / --pos /
+// --warn / --info / --fg-* tokens so they match the rest of the app.
 
 function MissionControlHero({ status, onPause, onStart }) {
   const enabled = !!status?.enabled;
@@ -2370,58 +2369,62 @@ function MissionControlHero({ status, onPause, onStart }) {
   const skipPct = total > 0 ? Math.round((skipped / total) * 100) : 0;
   let line;
   if (!enabled) {
-    line = <span>Sweep paused — no candidates running.</span>;
+    line = <span style={{ color: 'var(--fg-2)' }}>Sweep paused — no candidates running.</span>;
   } else if (cur) {
-    const hp = Object.entries(cur.hyperparams || {})
-      .map(([k, v]) => `${k}=${v}`).join(' · ');
+    const hp = Object.entries(cur.hyperparams || {}).map(([k, v]) => `${k}=${v}`).join(' · ');
     line = (
       <>
-        <span style={{ fontWeight: 500 }}>Training {cur.algorithm.toUpperCase()}</span>
-        <span className="ct-current">{hp}</span>
+        <span style={{ fontWeight: 600 }}>Training {String(cur.algorithm || '').toUpperCase()}</span>
+        <span className="mc-current">{hp}</span>
       </>
     );
   } else if (last) {
     const since = last.ts ? Math.max(0, Math.floor((Date.now() / 1000 - last.ts))) : null;
     line = (
       <>
-        <span>Idle — last candidate {since != null ? `${since}s ago` : 'just now'}</span>
-        <span className="ct-current">
+        <span style={{ color: 'var(--fg-2)' }}>Idle — last candidate {since != null ? `${since}s ago` : 'just now'}</span>
+        <span className="mc-current">
           {last.algorithm}{last.walk_forward_mae != null ? ` · wf=${last.walk_forward_mae.toFixed(3)}` : ''}
         </span>
       </>
     );
   } else {
-    line = <span>Sweep idle — waiting for first candidate.</span>;
+    line = <span style={{ color: 'var(--fg-2)' }}>Sweep idle — waiting for first candidate.</span>;
   }
   return (
     <div className="panel">
-      <div className="ct-hero">
-        <div className="ct-hero-status">
-          <div className="label">Sweep status</div>
-          <div className="ct-hero-status-line">
-            <span className={`dot ${enabled && cur ? 'pulsing' : enabled ? 'info' : 'warn'}`} />
+      <div className="panel-header">
+        <span>Sweep status</span>
+        <span className="panel-title-actions">
+          {status?.interval_seconds ? `interval ${status.interval_seconds}s` : ''}
+        </span>
+      </div>
+      <div className="mc-hero">
+        <div className="mc-hero-status">
+          <div className="mc-hero-line">
+            <span className={`dot ${enabled && cur ? 'pulsing info' : enabled ? 'info' : 'warn'}`} />
             {line}
           </div>
-          <div className="ct-hero-counters">
-            <div className="ct-hero-counter">
-              <div className="ct-counter-num">{trained.toLocaleString()}</div>
+          <div className="mc-hero-counters">
+            <div className="mc-counter">
+              <div className="mc-counter-num">{trained.toLocaleString()}</div>
               <div className="label">Trained today</div>
             </div>
-            <div className="ct-hero-counter">
-              <div className="ct-counter-num">{skipPct}%</div>
+            <div className="mc-counter">
+              <div className="mc-counter-num">{skipPct}%</div>
               <div className="label">Skipped (dedup)</div>
             </div>
-            <div className="ct-hero-counter">
-              <div className="ct-counter-num pos">{improved}</div>
-              <div className="label">Improved champion</div>
+            <div className="mc-counter">
+              <div className="mc-counter-num pos">{improved}</div>
+              <div className="label">Champion improvements</div>
             </div>
           </div>
         </div>
-        <div className="ct-hero-controls">
+        <div className="mc-hero-controls">
           {enabled
-            ? <button onClick={onPause}>Pause sweep</button>
-            : <button onClick={onStart}>Resume sweep</button>}
-          <button className="ghost" onClick={() => window.location.reload()}>Refresh page</button>
+            ? <button className="btn danger" onClick={onPause}>Pause sweep</button>
+            : <button className="btn success" onClick={onStart}>Resume sweep</button>}
+          <button className="btn" onClick={() => window.location.reload()}>Refresh page</button>
         </div>
       </div>
     </div>
@@ -2442,25 +2445,25 @@ function MissionControlChampion({ status }) {
     `${Math.round(ago / 1440)}d ago`;
   return (
     <div className="panel">
-      <div className="ct-champion">
+      <div className="panel-header"><span>Current champion</span></div>
+      <div className="mc-champion">
         <div>
-          <div className="label" style={{ marginBottom: 10 }}>Current champion</div>
-          <div className="ct-champ-num">
+          <div className="mc-champion-num">
             <span className="big-num">{headline != null ? headline.toFixed(3) : '—'}</span>
-            <span className="ct-suffix">{wfMae != null ? '°F walk-forward MAE' : (testMae != null ? '°F test MAE' : '')}</span>
+            <span className="suffix">{wfMae != null ? '°F walk-forward MAE' : (testMae != null ? '°F test MAE' : '')}</span>
           </div>
           <div className="mono" style={{ fontSize: 12, color: 'var(--fg-2)', marginTop: 6 }}>{fmtAlgo}</div>
         </div>
         <div>
-          <div className="label" style={{ marginBottom: 6 }}>Best today</div>
-          <div className="mono" style={{ fontSize: 18, color: 'var(--fg-1)' }}>
+          <div className="label" style={{ marginBottom: 4 }}>Best today</div>
+          <div className="mono pos" style={{ fontSize: 18 }}>
             {status?.best_today_walk_forward_mae != null
               ? status.best_today_walk_forward_mae.toFixed(3) + '°F'
               : '—'}
           </div>
         </div>
         <div>
-          <div className="label" style={{ marginBottom: 6 }}>Trained</div>
+          <div className="label" style={{ marginBottom: 4 }}>Trained</div>
           <div className="mono" style={{ fontSize: 14, color: 'var(--fg-2)' }}>
             {agoLabel} · {(ch?.n_train ?? 0).toLocaleString()} rows
           </div>
@@ -2471,10 +2474,9 @@ function MissionControlChampion({ status }) {
 }
 
 function MissionControlStream({ events }) {
-  const fmtHp = (hp) => {
-    if (!hp || typeof hp !== 'object') return '';
-    return Object.entries(hp).map(([k, v]) => `${k}=${v}`).join(' ');
-  };
+  const fmtHp = (hp) => hp && typeof hp === 'object'
+    ? Object.entries(hp).map(([k, v]) => `${k}=${v}`).join(' ')
+    : '';
   const fmtTime = (ts) => {
     try {
       const d = new Date(ts * 1000);
@@ -2489,11 +2491,11 @@ function MissionControlStream({ events }) {
         <span className="panel-title-actions">last {rows.length} candidates · auto-refreshes</span>
       </div>
       {rows.length === 0 ? (
-        <div style={{ padding: 18, color: 'var(--fg-3)', fontSize: 12 }}>
+        <div style={{ padding: 14, color: 'var(--fg-3)', fontSize: 12 }}>
           No candidates yet — sweep results will appear here as they finish.
         </div>
       ) : (
-        <div style={{ padding: '4px 0 8px' }}>
+        <div>
           {rows.map(e => {
             const p = e.payload || {};
             const status = p.status || 'trained';
@@ -2502,23 +2504,23 @@ function MissionControlStream({ events }) {
             const isErr = status === 'error';
             const icon = isImprovement ? '✓' : isSkip ? '×' : isErr ? '!' : '·';
             const mae = p.walk_forward_mae ?? p.test_mae;
-            const rowCls = `ct-stream-row${isImprovement ? ' improvement' : ''}${isSkip ? ' skip' : ''}`;
+            const rowCls = `mc-stream-row${isImprovement ? ' improvement' : ''}${isSkip ? ' skip' : ''}`;
             return (
               <div key={e.id} className={rowCls}>
-                <div className="ct-stream-icon" style={{
-                  color: isImprovement ? 'var(--accent)' :
+                <div className="mc-stream-icon" style={{
+                  color: isImprovement ? 'var(--pos)' :
                          isSkip ? 'var(--fg-3)' :
                          isErr ? 'var(--neg)' : 'var(--fg-2)',
                 }}>{icon}</div>
-                <div className="ct-stream-ts">{fmtTime(e.ts)}</div>
-                <div className="ct-stream-algo">{(p.algorithm || '—').toUpperCase()}</div>
-                <div className="ct-stream-params" title={fmtHp(p.hyperparams)}>{fmtHp(p.hyperparams)}</div>
-                <div className="ct-stream-mae">
+                <div className="mc-stream-ts">{fmtTime(e.ts)}</div>
+                <div className="mc-stream-algo">{(p.algorithm || '—').toUpperCase()}</div>
+                <div className="mc-stream-params" title={fmtHp(p.hyperparams)}>{fmtHp(p.hyperparams)}</div>
+                <div className="mc-stream-mae">
                   {mae != null ? mae.toFixed(3) :
                     isSkip ? 'dedup' :
                     isErr ? 'error' : '—'}
                   {isImprovement && p.improvement_pct != null && (
-                    <span style={{ marginLeft: 6, fontSize: 11 }}>↓{p.improvement_pct.toFixed(1)}%</span>
+                    <span className="pos" style={{ marginLeft: 6, fontSize: 11 }}>↓{p.improvement_pct.toFixed(1)}%</span>
                   )}
                 </div>
               </div>
@@ -2530,89 +2532,399 @@ function MissionControlStream({ events }) {
   );
 }
 
-function MissionControlTrendChart({ topRuns, height = 220 }) {
-  // Plot the running-best (champion line) over time using the top runs by
-  // trained_at order. Faint dots for individual candidates, accent line for
-  // running best.
-  if (!topRuns || topRuns.length === 0) {
-    return (
-      <div className="panel">
-        <div className="panel-header"><span>MAE trend</span></div>
-        <div style={{ padding: 18, color: 'var(--fg-3)', fontSize: 12 }}>
-          Trend appears after the first dozen candidates have finished.
-        </div>
+// ── Reusable scatter chart helper (used by multiple panels) ───────────
+function ChartPanel({ title, subtitle, legend, children, height = 220 }) {
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>{title}</span>
+        <span className="panel-title-actions">
+          {legend && <span className="mc-legend">{legend}</span>}
+          {subtitle && !legend && <span>{subtitle}</span>}
+        </span>
       </div>
-    );
-  }
-  // Order runs by trained_at ascending for the chart.
-  const runs = [...topRuns]
-    .filter(r => r.walk_forward_mae != null)
-    .sort((a, b) => (a.trained_at || 0) - (b.trained_at || 0));
-  if (runs.length < 2) {
+      <div style={{ padding: 14, height }}>{children}</div>
+    </div>
+  );
+}
+
+// Trend chart: running-best champion line + per-candidate dots colored by algo.
+function MissionControlTrendChart({ runs, height = 240 }) {
+  const fmtTick = t => new Date(t * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const filtered = (runs || []).filter(r => r.walk_forward_mae != null && !r.skipped)
+                                .sort((a, b) => (a.trained_at || 0) - (b.trained_at || 0));
+  if (filtered.length < 2) {
     return (
-      <div className="panel">
-        <div className="panel-header"><span>MAE trend</span></div>
-        <div style={{ padding: 18, color: 'var(--fg-3)', fontSize: 12 }}>
-          Need ≥2 trained candidates to draw the trend.
-        </div>
-      </div>
+      <ChartPanel title="Walk-forward MAE trend">
+        <div style={{ color: 'var(--fg-3)', fontSize: 12 }}>Need ≥2 trained candidates to draw the trend.</div>
+      </ChartPanel>
     );
   }
   const W = 1000, H = height, pad = { l: 56, r: 16, t: 14, b: 32 };
-  const ts = runs.map(r => r.trained_at);
-  const ys = runs.map(r => r.walk_forward_mae);
+  const ys = filtered.map(r => r.walk_forward_mae);
+  const xMin = filtered[0].trained_at, xMax = filtered[filtered.length - 1].trained_at;
+  const yMin = Math.min(...ys) * 0.97, yMax = Math.max(...ys) * 1.03;
+  const xScale = x => pad.l + ((x - xMin) / Math.max(1, xMax - xMin)) * (W - pad.l - pad.r);
+  const yScale = y => H - pad.b - ((y - yMin) / Math.max(0.001, yMax - yMin)) * (H - pad.t - pad.b);
+  let best = Infinity;
+  const bestPath = filtered.map((r, i) => {
+    if (r.walk_forward_mae < best) best = r.walk_forward_mae;
+    return `${i === 0 ? 'M' : 'L'} ${xScale(r.trained_at).toFixed(1)} ${yScale(best).toFixed(1)}`;
+  }).join(' ');
+  const legend = (
+    <>
+      <span><span className="mc-legend-swatch" style={{ background: 'var(--accent)' }} /> running best</span>
+      <span><span className="mc-legend-swatch" style={{ background: 'var(--accent)' }} /> GBM</span>
+      <span><span className="mc-legend-swatch" style={{ background: 'var(--warn)' }} /> RF</span>
+      <span><span className="mc-legend-swatch" style={{ background: 'var(--info)' }} /> Ridge</span>
+    </>
+  );
+  return (
+    <ChartPanel title="Walk-forward MAE trend" legend={legend} height={height + 36}>
+      <svg className="mc-chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        {[yMin, (yMin + yMax) / 2, yMax].map((y, i) => (
+          <g key={i}>
+            <line className="grid" x1={pad.l} x2={W - pad.r} y1={yScale(y)} y2={yScale(y)} />
+            <text className="axis" x={pad.l - 8} y={yScale(y) + 3} textAnchor="end">{y.toFixed(2)}</text>
+          </g>
+        ))}
+        <text className="axis" x={pad.l} y={H - 8}>{fmtTick(xMin)}</text>
+        <text className="axis" x={W - pad.r} y={H - 8} textAnchor="end">{fmtTick(xMax)}</text>
+        {filtered.map((r, i) => {
+          const bucket = r.algo_bucket || 'gbm';
+          return (
+            <circle key={i} className={`candidate-dot ${bucket}`}
+              cx={xScale(r.trained_at)} cy={yScale(r.walk_forward_mae)} r="3">
+              <title>{r.algorithm} → {r.walk_forward_mae.toFixed(3)}°F</title>
+            </circle>
+          );
+        })}
+        <path className="champion-line" d={bestPath} />
+      </svg>
+    </ChartPanel>
+  );
+}
+
+// Per-algorithm scatter: one column per algorithm, dot = candidate, height = MAE.
+// Reveals which algorithm wins overall and how spread its results are.
+function MissionControlAlgoCompare({ runs, height = 240 }) {
+  const trained = (runs || []).filter(r => r.walk_forward_mae != null && !r.skipped);
+  if (trained.length < 3) return null;
+  const buckets = ['ridge', 'rf', 'gbm'];
+  const byBucket = {};
+  buckets.forEach(b => { byBucket[b] = trained.filter(r => r.algo_bucket === b); });
+  const ys = trained.map(r => r.walk_forward_mae);
+  const yMin = Math.min(...ys) * 0.97, yMax = Math.max(...ys) * 1.03;
+  const stats = (arr) => {
+    if (!arr.length) return null;
+    const vals = arr.map(r => r.walk_forward_mae);
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    return { n: vals.length, min, max, mean };
+  };
+  const W = 1000, H = height, pad = { l: 56, r: 16, t: 14, b: 40 };
+  const colW = (W - pad.l - pad.r) / buckets.length;
+  const yScale = y => H - pad.b - ((y - yMin) / Math.max(0.001, yMax - yMin)) * (H - pad.t - pad.b);
+  return (
+    <ChartPanel title="Per-algorithm MAE distribution" subtitle={`${trained.length} candidates`} height={height + 36}>
+      <svg className="mc-chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        {[yMin, (yMin + yMax) / 2, yMax].map((y, i) => (
+          <g key={i}>
+            <line className="grid" x1={pad.l} x2={W - pad.r} y1={yScale(y)} y2={yScale(y)} />
+            <text className="axis" x={pad.l - 8} y={yScale(y) + 3} textAnchor="end">{y.toFixed(2)}</text>
+          </g>
+        ))}
+        {buckets.map((b, i) => {
+          const cx = pad.l + colW * (i + 0.5);
+          const st = stats(byBucket[b]);
+          return (
+            <g key={b}>
+              <text className="axis" x={cx} y={H - 18} textAnchor="middle">
+                {b.toUpperCase()}
+              </text>
+              <text className="axis" x={cx} y={H - 6} textAnchor="middle">
+                {st ? `n=${st.n}` : 'n=0'}
+              </text>
+              {st && (
+                <line x1={cx - 28} x2={cx + 28} y1={yScale(st.mean)} y2={yScale(st.mean)}
+                      stroke="var(--fg-2)" strokeWidth="1.2" strokeDasharray="3 3" />
+              )}
+              {byBucket[b].map((r, j) => {
+                // jitter x by ±15px for visibility
+                const jx = cx + (((j * 31) % 30) - 15);
+                return (
+                  <circle key={j} className={`candidate-dot ${b}`}
+                    cx={jx} cy={yScale(r.walk_forward_mae)} r="3">
+                    <title>{r.algorithm} → {r.walk_forward_mae.toFixed(3)}°F</title>
+                  </circle>
+                );
+              })}
+            </g>
+          );
+        })}
+      </svg>
+    </ChartPanel>
+  );
+}
+
+// 2×2 grid of mini-scatters showing GBM MAE vs each hyperparam.
+function MissionControlSensitivity({ runs }) {
+  const gbm = (runs || []).filter(r => r.algo_bucket === 'gbm' && r.walk_forward_mae != null && r.hyperparams && !r.skipped);
+  if (gbm.length < 5) return null;
+  const dims = ['n_estimators', 'max_depth', 'learning_rate', 'min_samples_leaf'];
+  const ys = gbm.map(r => r.walk_forward_mae);
+  const yMin = Math.min(...ys) * 0.97, yMax = Math.max(...ys) * 1.03;
+  const Cell = ({ dim }) => {
+    const pts = gbm.map(r => ({ x: +r.hyperparams[dim], y: r.walk_forward_mae }))
+                   .filter(p => p.x != null && !isNaN(p.x));
+    if (pts.length === 0) return null;
+    const xs = pts.map(p => p.x);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const W = 380, H = 140, pad = { l: 40, r: 8, t: 8, b: 20 };
+    const sx = x => pad.l + ((x - xMin) / Math.max(0.0001, xMax - xMin)) * (W - pad.l - pad.r);
+    const sy = y => H - pad.b - ((y - yMin) / Math.max(0.001, yMax - yMin)) * (H - pad.t - pad.b);
+    // Find best y for this dim's most common value (informative summary)
+    const byX = {};
+    pts.forEach(p => { byX[p.x] = byX[p.x] || []; byX[p.x].push(p.y); });
+    const summary = Object.entries(byX).map(([x, vals]) => ({ x: +x, best: Math.min(...vals) }))
+                                       .sort((a, b) => a.best - b.best)[0];
+    return (
+      <div className="mc-sens-cell">
+        <div className="mc-sens-title">
+          MAE vs <span style={{ color: 'var(--fg-1)' }}>{dim}</span>
+          {summary && <span style={{ marginLeft: 8, color: 'var(--pos)' }}>best at {dim}={summary.x}</span>}
+        </div>
+        <svg className="mc-chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ height: 140 }}>
+          {[yMin, yMax].map((y, i) => (
+            <g key={i}>
+              <line className="grid" x1={pad.l} x2={W - pad.r} y1={sy(y)} y2={sy(y)} />
+              <text className="axis" x={pad.l - 4} y={sy(y) + 3} textAnchor="end">{y.toFixed(2)}</text>
+            </g>
+          ))}
+          <text className="axis" x={pad.l} y={H - 4}>{xMin}</text>
+          <text className="axis" x={W - pad.r} y={H - 4} textAnchor="end">{xMax}</text>
+          {pts.map((p, i) => (
+            <circle key={i} className="candidate-dot gbm" cx={sx(p.x)} cy={sy(p.y)} r="2.5">
+              <title>{dim}={p.x} → {p.y.toFixed(3)}°F</title>
+            </circle>
+          ))}
+        </svg>
+      </div>
+    );
+  };
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>GBM hyperparam sensitivity</span>
+        <span className="panel-title-actions">{gbm.length} GBM candidates · which knob moves MAE</span>
+      </div>
+      <div className="mc-sens-grid">
+        {dims.map(d => <Cell key={d} dim={d} />)}
+      </div>
+    </div>
+  );
+}
+
+// Heatmap of GBM coverage: (n_estimators × max_depth) with the BEST MAE
+// achieved in each cell. Empty cells = unexplored corners.
+function MissionControlCoverage({ runs }) {
+  const gbm = (runs || []).filter(r => r.algo_bucket === 'gbm' && r.walk_forward_mae != null && r.hyperparams && !r.skipped);
+  if (gbm.length < 3) return null;
+  // Discrete grid values from the random-search space defined in train.py.
+  const nEsts = [100, 200, 300, 400, 500, 600, 800, 1000];
+  const depths = [2, 3, 4, 5];
+  const cells = {}; // key: "ne|d" → best MAE
+  gbm.forEach(r => {
+    const ne = r.hyperparams.n_estimators;
+    const d = r.hyperparams.max_depth;
+    if (!nEsts.includes(ne) || !depths.includes(d)) return;
+    const k = `${ne}|${d}`;
+    if (cells[k] == null || r.walk_forward_mae < cells[k]) cells[k] = r.walk_forward_mae;
+  });
+  const allMaes = Object.values(cells);
+  if (allMaes.length === 0) return null;
+  const mMin = Math.min(...allMaes), mMax = Math.max(...allMaes);
+  // Map MAE to a green-to-red ramp (lower MAE = greener).
+  const colorFor = (mae) => {
+    if (mae == null) return null;
+    const t = mMax === mMin ? 0 : (mae - mMin) / (mMax - mMin);
+    const hue = 130 * (1 - t);   // 130=green, 0=red
+    return `hsl(${hue.toFixed(0)}, 50%, 32%)`;
+  };
+  const cols = nEsts.length + 1;
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>GBM coverage map</span>
+        <span className="panel-title-actions">
+          {Object.keys(cells).length}/{nEsts.length * depths.length} cells explored ·
+          best {mMin.toFixed(3)}°F · worst {mMax.toFixed(3)}°F
+        </span>
+      </div>
+      <div className="mc-heatmap" style={{ gridTemplateColumns: `60px repeat(${nEsts.length}, 1fr)` }}>
+        <div className="mc-heat-cell label" style={{ textAlign: 'left' }}>depth↓ / n_est→</div>
+        {nEsts.map(ne => <div key={ne} className="mc-heat-cell label">{ne}</div>)}
+        {depths.map(d => (
+          <React.Fragment key={d}>
+            <div className="mc-heat-cell label" style={{ textAlign: 'left' }}>depth={d}</div>
+            {nEsts.map(ne => {
+              const mae = cells[`${ne}|${d}`];
+              return (
+                <div key={ne}
+                     className={`mc-heat-cell ${mae == null ? 'empty' : ''}`}
+                     style={mae != null ? { background: colorFor(mae), color: '#fff' } : null}
+                     title={mae != null ? `n_est=${ne}, depth=${d} → best ${mae.toFixed(3)}°F` :
+                            `n_est=${ne}, depth=${d} — unexplored`}>
+                  {mae != null ? mae.toFixed(2) : '·'}
+                </div>
+              );
+            })}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Stacked bars: candidates per hour (trained + skipped), last 24h.
+function MissionControlVelocity({ runs, height = 200 }) {
+  if (!runs || runs.length === 0) return null;
+  const nowHour = Math.floor(Date.now() / 1000 / 3600);
+  const startHour = nowHour - 23;
+  const buckets = {};
+  for (let h = startHour; h <= nowHour; h++) buckets[h] = { trained: 0, skipped: 0 };
+  runs.forEach(r => {
+    if (r.trained_at == null) return;
+    const h = Math.floor(r.trained_at / 3600);
+    if (!buckets[h]) return;
+    if (r.skipped) buckets[h].skipped += 1;
+    else buckets[h].trained += 1;
+  });
+  const bars = Object.entries(buckets).sort((a, b) => +a[0] - +b[0]);
+  const maxN = Math.max(1, ...bars.map(([, v]) => v.trained + v.skipped));
+  const W = 1000, H = height, pad = { l: 36, r: 8, t: 12, b: 28 };
+  const barW = (W - pad.l - pad.r) / bars.length - 2;
+  const yScale = n => H - pad.b - (n / maxN) * (H - pad.t - pad.b);
+  const fmtHour = h => {
+    const d = new Date(h * 3600 * 1000);
+    return d.getHours().toString().padStart(2, '0');
+  };
+  const legend = (
+    <>
+      <span><span className="mc-legend-swatch" style={{ background: 'var(--accent)' }} /> trained</span>
+      <span><span className="mc-legend-swatch" style={{ background: 'var(--fg-3)' }} /> skipped (dedup)</span>
+    </>
+  );
+  return (
+    <ChartPanel title="Candidates per hour" subtitle="last 24h" legend={legend} height={height + 36}>
+      <svg className="mc-chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        {[0, Math.floor(maxN / 2), maxN].map((n, i) => (
+          <g key={i}>
+            <line className="grid" x1={pad.l} x2={W - pad.r} y1={yScale(n)} y2={yScale(n)} />
+            <text className="axis" x={pad.l - 4} y={yScale(n) + 3} textAnchor="end">{n}</text>
+          </g>
+        ))}
+        {bars.map(([h, v], i) => {
+          const x = pad.l + (i * (barW + 2));
+          const total = v.trained + v.skipped;
+          const trainedH = (v.trained / maxN) * (H - pad.t - pad.b);
+          const skippedH = (v.skipped / maxN) * (H - pad.t - pad.b);
+          const trainedY = H - pad.b - trainedH;
+          const skippedY = trainedY - skippedH;
+          return (
+            <g key={h}>
+              {v.skipped > 0 && (
+                <rect className="bar skipped" x={x} y={skippedY} width={barW} height={skippedH}>
+                  <title>hour {fmtHour(+h)}: {v.skipped} skipped</title>
+                </rect>
+              )}
+              {v.trained > 0 && (
+                <rect className="bar trained" x={x} y={trainedY} width={barW} height={trainedH}>
+                  <title>hour {fmtHour(+h)}: {v.trained} trained</title>
+                </rect>
+              )}
+              {(i % 3 === 0) && (
+                <text className="axis" x={x + barW / 2} y={H - 8} textAnchor="middle">{fmtHour(+h)}</text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </ChartPanel>
+  );
+}
+
+// Improvement waterfall: each champion promotion as a step-down.
+function MissionControlWaterfall({ runs, height = 200 }) {
+  const trained = (runs || []).filter(r => r.walk_forward_mae != null && !r.skipped)
+                              .sort((a, b) => (a.trained_at || 0) - (b.trained_at || 0));
+  if (trained.length < 2) return null;
+  // Pull out the champion promotions: each strictly-lower MAE than the previous best.
+  const promos = [];
+  let prev = null;
+  trained.forEach(r => {
+    if (prev == null || r.walk_forward_mae < prev) {
+      promos.push({
+        ts: r.trained_at,
+        mae: r.walk_forward_mae,
+        prev,
+        algorithm: r.algorithm,
+        delta: prev != null ? prev - r.walk_forward_mae : 0,
+      });
+      prev = r.walk_forward_mae;
+    }
+  });
+  if (promos.length < 2) return null;
+  const W = 1000, H = height, pad = { l: 56, r: 16, t: 14, b: 32 };
+  const ts = promos.map(p => p.ts);
+  const ys = promos.map(p => p.mae);
   const xMin = Math.min(...ts), xMax = Math.max(...ts);
   const yMin = Math.min(...ys) * 0.97, yMax = Math.max(...ys) * 1.03;
   const xScale = x => pad.l + ((x - xMin) / Math.max(1, xMax - xMin)) * (W - pad.l - pad.r);
   const yScale = y => H - pad.b - ((y - yMin) / Math.max(0.001, yMax - yMin)) * (H - pad.t - pad.b);
-  // Running best line
-  let best = Infinity;
-  const bestPath = runs.map((r, i) => {
-    if (r.walk_forward_mae < best) best = r.walk_forward_mae;
-    return `${i === 0 ? 'M' : 'L'} ${xScale(r.trained_at).toFixed(1)} ${yScale(best).toFixed(1)}`;
-  }).join(' ');
+  // Step-down path.
+  let pathD = '';
+  promos.forEach((p, i) => {
+    if (i === 0) pathD = `M ${xScale(p.ts).toFixed(1)} ${yScale(p.mae).toFixed(1)}`;
+    else {
+      pathD += ` L ${xScale(p.ts).toFixed(1)} ${yScale(promos[i - 1].mae).toFixed(1)}`;
+      pathD += ` L ${xScale(p.ts).toFixed(1)} ${yScale(p.mae).toFixed(1)}`;
+    }
+  });
   const fmtTick = t => new Date(t * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   return (
-    <div className="panel">
-      <div className="panel-header">
-        <span>Walk-forward MAE trend</span>
-        <span className="panel-title-actions">
-          <span><span className="dot" style={{ background: 'var(--accent)' }} /> running best</span>
-          <span><span className="dot" style={{ background: 'rgba(20,20,20,0.4)' }} /> candidate</span>
-        </span>
-      </div>
-      <div style={{ padding: 18 }}>
-        <svg className="ct-trend-svg" viewBox={`0 0 ${W} ${H}`} height={H}>
-          {[yMin, (yMin + yMax) / 2, yMax].map((y, i) => (
-            <g key={i}>
-              <line className="grid" x1={pad.l} x2={W - pad.r} y1={yScale(y)} y2={yScale(y)} />
-              <text className="axis" x={pad.l - 8} y={yScale(y) + 3} textAnchor="end">{y.toFixed(2)}</text>
-            </g>
-          ))}
-          <text className="axis" x={pad.l} y={H - 8}>{fmtTick(xMin)}</text>
-          <text className="axis" x={W - pad.r} y={H - 8} textAnchor="end">{fmtTick(xMax)}</text>
-          {runs.map((r, i) => {
-            const algo = (r.algorithm || '').split('[')[0].toLowerCase() || 'gbm';
-            const cls = algo.includes('ridge') ? 'ridge' : algo.includes('rf') ? 'rf' : 'gbm';
-            return (
-              <circle key={i} className={`candidate-dot ${cls}`}
-                cx={xScale(r.trained_at)} cy={yScale(r.walk_forward_mae)} r="3" />
-            );
-          })}
-          <path className="champion-line" d={bestPath} />
-        </svg>
-      </div>
-    </div>
+    <ChartPanel title="Champion improvement waterfall"
+                subtitle={`${promos.length} champion promotions`}
+                height={height + 36}>
+      <svg className="mc-chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        {[yMin, (yMin + yMax) / 2, yMax].map((y, i) => (
+          <g key={i}>
+            <line className="grid" x1={pad.l} x2={W - pad.r} y1={yScale(y)} y2={yScale(y)} />
+            <text className="axis" x={pad.l - 8} y={yScale(y) + 3} textAnchor="end">{y.toFixed(2)}</text>
+          </g>
+        ))}
+        <text className="axis" x={pad.l} y={H - 8}>{fmtTick(xMin)}</text>
+        <text className="axis" x={W - pad.r} y={H - 8} textAnchor="end">{fmtTick(xMax)}</text>
+        <path className="waterfall-step" d={pathD} />
+        {promos.map((p, i) => (
+          <circle key={i} cx={xScale(p.ts)} cy={yScale(p.mae)} r="3.5" fill="var(--pos)">
+            <title>
+              {p.algorithm} → {p.mae.toFixed(3)}°F
+              {p.delta > 0 ? ` (↓${p.delta.toFixed(3)}°F)` : ''}
+            </title>
+          </circle>
+        ))}
+      </svg>
+    </ChartPanel>
   );
 }
 
 function MissionControlWhatsWorking({ topRuns }) {
   if (!topRuns || topRuns.length === 0) return null;
   // Common-pattern extractor: for each hyperparam dimension that appears
-  // in 5+ of the top runs, find the most common value and its frequency.
+  // in 60%+ of the top runs, surface the most common value.
   const patterns = (() => {
-    const dimCounts = {};   // dim → {value → count}
-    const dimRuns = {};     // dim → count of runs that have it
+    const dimCounts = {}, dimRuns = {};
     topRuns.forEach(r => {
       const hp = r.hyperparams || {};
       Object.entries(hp).forEach(([k, v]) => {
@@ -2626,7 +2938,7 @@ function MissionControlWhatsWorking({ topRuns }) {
     Object.entries(dimCounts).forEach(([dim, counts]) => {
       const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
       const [val, n] = sorted[0];
-      if (n >= Math.max(5, Math.ceil(topRuns.length * 0.6))) {
+      if (n >= Math.max(3, Math.ceil(topRuns.length * 0.6))) {
         out.push({ dim, val, n, total: dimRuns[dim] });
       }
     });
@@ -2638,8 +2950,8 @@ function MissionControlWhatsWorking({ topRuns }) {
         <span>What's working</span>
         <span className="panel-title-actions">top {topRuns.length} by walk-forward MAE</span>
       </div>
-      <div style={{ padding: '0 24px' }}>
-        <table className="tbl">
+      <div style={{ padding: '4px 14px 4px' }}>
+        <table className="tbl" style={{ fontSize: 12 }}>
           <thead>
             <tr>
               <th style={{ width: 30 }}>#</th>
@@ -2664,11 +2976,11 @@ function MissionControlWhatsWorking({ topRuns }) {
           </tbody>
         </table>
         {patterns.length > 0 && (
-          <div style={{ padding: '14px 0 24px', fontSize: 12, color: 'var(--fg-2)' }}>
-            <div className="label" style={{ marginBottom: 8 }}>Common patterns in top {topRuns.length}</div>
+          <div style={{ padding: '10px 0 16px', fontSize: 12, color: 'var(--fg-2)' }}>
+            <div className="label" style={{ marginBottom: 6 }}>Common patterns in top {topRuns.length}</div>
             {patterns.map(p => (
-              <div key={p.dim} className="mono" style={{ marginBottom: 4 }}>
-                <span style={{ color: 'var(--accent)' }}>{p.n}/{p.total}</span> use{' '}
+              <div key={p.dim} className="mono" style={{ marginBottom: 3 }}>
+                <span className="pos">{p.n}/{p.total}</span> use{' '}
                 <span style={{ color: 'var(--fg-1)' }}>{p.dim}={p.val}</span>
               </div>
             ))}
@@ -2685,6 +2997,7 @@ function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill
     ? window.__BETS_API__ : '';
   const [sweepStatus, setSweepStatus] = useState_v(null);
   const [topRuns, setTopRuns] = useState_v([]);
+  const [recentRuns, setRecentRuns] = useState_v([]);
   const [sweepEvents, setSweepEvents] = useState_v([]);
   const [showDiagnostics, setShowDiagnostics] = useState_v(false);
 
@@ -2698,15 +3011,17 @@ function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill
     };
     const refreshRest = async () => {
       try {
-        const [tR, eR] = await Promise.all([
+        const [tR, eR, rR] = await Promise.all([
           fetch(apiBase + '/api/ml/runs/top?metric=walk_forward_mae&limit=10', { cache: 'no-store' }),
           fetch(apiBase + '/api/ml/events?kinds=sweep_candidate_done&limit=20', { cache: 'no-store' }),
+          fetch(apiBase + '/api/ml/runs?since_hours=168&limit=2000', { cache: 'no-store' }),
         ]);
         if (!cancelled && tR.ok) setTopRuns(await tR.json());
         if (!cancelled && eR.ok) {
           const j = await eR.json();
           setSweepEvents(j.events || []);
         }
+        if (!cancelled && rR.ok) setRecentRuns(await rR.json());
       } catch {}
     };
     refreshStatus(); refreshRest();
@@ -2723,38 +3038,46 @@ function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill
   };
 
   return (
-    <div className="claude-theme">
-      <div className="ct-page">
-        <MissionControlHero
-          status={sweepStatus}
-          onPause={() => sendSweep('pause')}
-          onStart={() => sendSweep('start')}
-        />
-        <MissionControlChampion status={sweepStatus} />
-        <MissionControlStream events={sweepEvents} />
-        <MissionControlTrendChart topRuns={topRuns} />
-        <MissionControlWhatsWorking topRuns={topRuns} />
+    <div className="mission-control">
+      <MissionControlHero
+        status={sweepStatus}
+        onPause={() => sendSweep('pause')}
+        onStart={() => sendSweep('start')}
+      />
+      <MissionControlChampion status={sweepStatus} />
+      <MissionControlStream events={sweepEvents} />
 
-        <div className="panel">
-          <div className="panel-header">
-            <span>Recent activity</span>
-            <button className="ct-toggle" onClick={() => setShowDiagnostics(s => !s)}>
-              {showDiagnostics ? 'Hide diagnostics ↑' : 'Show diagnostics ↓'}
-            </button>
-          </div>
-          <MlActivityPanel events={events} />
-        </div>
+      <MissionControlTrendChart runs={recentRuns} />
+      <MissionControlWaterfall runs={recentRuns} />
 
-        {showDiagnostics && (
-          <>
-            <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
-            <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
-            <MlModelDiffPanel modelDiff={modelDiff} />
-            <MlDiagnosticsPanel diagnostics={diagnostics} />
-            <MlAccuracyPanel accuracy={accuracy} />
-          </>
-        )}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <MissionControlAlgoCompare runs={recentRuns} />
+        <MissionControlVelocity runs={recentRuns} />
       </div>
+
+      <MissionControlSensitivity runs={recentRuns} />
+      <MissionControlCoverage runs={recentRuns} />
+      <MissionControlWhatsWorking topRuns={topRuns} />
+
+      <div className="panel">
+        <div className="panel-header">
+          <span>Recent activity</span>
+          <button className="btn small" onClick={() => setShowDiagnostics(s => !s)}>
+            {showDiagnostics ? 'Hide diagnostics ↑' : 'Show diagnostics ↓'}
+          </button>
+        </div>
+        <MlActivityPanel events={events} />
+      </div>
+
+      {showDiagnostics && (
+        <>
+          <MlTrainingPanel mlInfo={mlInfo} onMlBackfill={onMlBackfill} onMlTrain={onMlTrain} />
+          <ModelSourcePanel mlInfo={mlInfo} onModelConfig={onModelConfig} />
+          <MlModelDiffPanel modelDiff={modelDiff} />
+          <MlDiagnosticsPanel diagnostics={diagnostics} />
+          <MlAccuracyPanel accuracy={accuracy} />
+        </>
+      )}
     </div>
   );
 }
