@@ -123,7 +123,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         header = request.headers.get("authorization", "")
         if not header.lower().startswith("bearer "):
             return JSONResponse({"error": "missing bearer token"}, status_code=401)
-        if header.split(None, 1)[1].strip() != self.token:
+        presented = header[7:].strip()
+        if not presented or presented != self.token:
             return JSONResponse({"error": "invalid token"}, status_code=401)
         return await call_next(request)
 
