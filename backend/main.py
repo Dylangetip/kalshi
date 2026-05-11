@@ -351,6 +351,7 @@ from .model import (
     compute_ladder,
     ensemble_model_max,
     kelly_fraction,
+    live_style_ensemble,
     parse_afd,
 )
 from .sources import (
@@ -451,13 +452,13 @@ async def _build_city_state(client: httpx.AsyncClient, city: Dict) -> Optional[D
     data_date_local = today_str
 
     # Doc §2.1: MOS is the highest-value source; weight it accordingly.
-    raw_model_max = ensemble_model_max([
-        (gfs_mos_f, 0.40),
-        (nam_mos_f, 0.20),
-        (nws_max_f, 0.15),
-        (om_max_f, 0.15),
-        (ecmwf_max_f, 0.10),
-    ])
+    # Weights live in model.LIVE_ENSEMBLE_WEIGHTS so the historical recompute
+    # pass (db.recompute_historical_ensemble_max) produces the SAME ensemble
+    # formula that lives here — no more train/inference covariate shift on
+    # the ensemble_max feature.
+    raw_model_max = live_style_ensemble(
+        gfs_mos_f, nam_mos_f, nws_max_f, om_max_f, ecmwf_max_f,
+    )
     # Apply per-city, per-horizon bias correction if enabled. The raw
     # ensemble systematically under-forecasts most cities by 0.5-1°F (see
     # /api/bias for the running residuals); shifting the headline by that
@@ -2051,6 +2052,25 @@ def ml_normalize_champions():
         "champion_walk_forward_mae": latest.get("walk_forward_mae"),
         "archived": archived,
     }
+
+
+@app.post("/api/ml/recompute-ensemble")
+def ml_recompute_ensemble():
+    """Recompute every historical_predictions.ensemble_max using the LIVE
+    blend formula (model.live_style_ensemble) so training data sees the
+    same ensemble pipeline that drives live inference. Closes the
+    train/inference covariate shift on the ensemble_max feature.
+
+    Idempotent and read-most/write-some: rows whose recomputed value
+    matches the stored value are skipped. After running this, also
+    POST /api/ml/train to refit the model on the aligned data, then
+    /api/ml/replay-historical to refresh the bias map with the new
+    predictions.
+
+    Returns {updated, cleared, skipped, total} so the caller can see how
+    many rows actually changed.
+    """
+    return db.recompute_historical_ensemble_max()
 
 
 @app.post("/api/ml/replay-historical")

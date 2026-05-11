@@ -109,6 +109,37 @@ def ensemble_model_max(contributions: List[Tuple[Optional[float], float]]) -> Op
     return sum(v * w for v, w in valid) / total
 
 
+# Single source of truth for the live ensemble blend. Used by main.py for
+# live state and by db.recompute_historical_ensemble_max for training-data
+# alignment so the ML model sees the same ensemble formula at train and
+# inference time. NWS daily-forecast isn't archived historically — it's
+# None on historical rows and the renormalization in ensemble_model_max
+# handles the missing weight cleanly.
+LIVE_ENSEMBLE_WEIGHTS: Dict[str, float] = {
+    "gfs_mos": 0.40,
+    "nam_mos": 0.20,
+    "nws":     0.15,
+    "om":      0.15,
+    "ecmwf":   0.10,
+}
+
+
+def live_style_ensemble(
+    gfs_mos: Optional[float],
+    nam_mos: Optional[float],
+    nws: Optional[float],
+    om: Optional[float],
+    ecmwf: Optional[float],
+) -> Optional[float]:
+    return ensemble_model_max([
+        (gfs_mos, LIVE_ENSEMBLE_WEIGHTS["gfs_mos"]),
+        (nam_mos, LIVE_ENSEMBLE_WEIGHTS["nam_mos"]),
+        (nws,     LIVE_ENSEMBLE_WEIGHTS["nws"]),
+        (om,      LIVE_ENSEMBLE_WEIGHTS["om"]),
+        (ecmwf,   LIVE_ENSEMBLE_WEIGHTS["ecmwf"]),
+    ])
+
+
 def compute_ladder(
     model_max: float,
     model_sigma: float = 1.8,

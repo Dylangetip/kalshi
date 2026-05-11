@@ -366,13 +366,18 @@ def reset() -> None:
 
 
 def insert_snapshot(state: Dict, ts: Optional[int] = None) -> None:
-    """Persist a city snapshot. Pulls model_max + recommended bracket from
-    the same response shape /api/state returns, so the caller doesn't need
-    to reshape data. Pass `ts` explicitly to keep all cities in a snapshot
-    loop iteration synchronized to the same wall-clock second."""
+    """Persist a city snapshot. The model_max column records the ACTIVE
+    prediction — the value that actually drives the ladder, recommended
+    bracket, and edge calc. When an ML model is loaded that's the ML
+    output (or blend); when not, it falls back to the raw ensemble. The
+    raw ensemble feature is still recorded in feature_snapshots.model_max
+    for downstream training/bias use."""
     if ts is None:
         ts = int(time.time())
     best = state["settlementBracket"]
+    active = state.get("activeMax")
+    if active is None:
+        active = state["modelMax"]
     c = _conn_or_init()
     with _lock:
         c.execute(
@@ -383,7 +388,7 @@ def insert_snapshot(state: Dict, ts: Optional[int] = None) -> None:
             (
                 ts,
                 state["city"]["code"],
-                float(state["modelMax"]),
+                float(active),
                 int(state["bestEdgeCents"]),
                 str(best["label"]),
                 float(best["kalshiPct"]),
@@ -611,6 +616,70 @@ def cleanup_orphan_predictions() -> int:
         c.commit()
         after = c.execute("SELECT COUNT(*) AS n FROM historical_predictions").fetchone()["n"]
     return int(before - after)
+
+
+def recompute_historical_ensemble_max() -> Dict[str, int]:
+    """Recompute every historical_predictions row's ensemble_max using the
+    LIVE blend formula (model.live_style_ensemble) so training data uses
+    the same ensemble pipeline that drives live inference.
+
+    Before: ensemble_max was a 3-way (gfs / ecmwf / icon) Open-Meteo blend
+    written by backfill._row_from_open_meteo. Live ensemble_max was a 5-way
+    MOS/NAM/NWS/OM/ECMWF blend with bias correction. The ML model trained
+    on column A and inferred on column B — covariate shift baked in.
+
+    After: both paths route through live_style_ensemble(). NWS daily-forecast
+    isn't archived historically, so historical rows pass None for that slot
+    and ensemble_model_max renormalizes weights across the four available
+    sources.
+
+    Rows whose four sources are ALL null get ensemble_max cleared to NULL
+    (consistent with cleanup_orphan_predictions). Returns a counts dict so
+    the admin endpoint can show before/after parity.
+    """
+    from .model import live_style_ensemble
+    c = _conn_or_init()
+    updated = 0
+    cleared = 0
+    skipped = 0
+    with _lock:
+        rows = c.execute(
+            """SELECT city, target_date, forecast_horizon_hours,
+                      gfs_mos_max, nam_mos_max, om_max, ecmwf_max,
+                      ensemble_max
+                 FROM historical_predictions""",
+        ).fetchall()
+        for r in rows:
+            new_val = live_style_ensemble(
+                r["gfs_mos_max"], r["nam_mos_max"],
+                None,  # NWS daily-forecast not archived for historical dates
+                r["om_max"], r["ecmwf_max"],
+            )
+            old_val = r["ensemble_max"]
+            if new_val is None and old_val is None:
+                skipped += 1
+                continue
+            new_rounded = round(new_val, 2) if new_val is not None else None
+            if new_rounded == (round(old_val, 2) if old_val is not None else None):
+                skipped += 1
+                continue
+            c.execute(
+                """UPDATE historical_predictions
+                      SET ensemble_max = ?
+                    WHERE city = ?
+                      AND target_date = ?
+                      AND forecast_horizon_hours = ?""",
+                (
+                    new_rounded,
+                    r["city"], r["target_date"], int(r["forecast_horizon_hours"]),
+                ),
+            )
+            if new_rounded is None:
+                cleared += 1
+            else:
+                updated += 1
+        c.commit()
+    return {"updated": updated, "cleared": cleared, "skipped": skipped, "total": len(rows)}
 
 
 def upsert_historical_actual(city: str, target_date: str, actual_max_f: float, source: str) -> None:
