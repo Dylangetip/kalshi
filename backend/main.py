@@ -195,6 +195,23 @@ _auto_trade_state: Dict = {
     "sweep_today_anchor": None,
     "sweep_last_candidate": None,
     "sweep_currently_training": None,
+    # Per-city confidence — scales bet sizes down on cities the model is
+    # bad at (high per-city test MAE) and up on cities it's good at, and
+    # optionally hard-skips cities whose MAE exceeds a threshold. Reads
+    # from db.get_city_mae_map() which the sweep loop keeps fresh.
+    #
+    # confidence_factor = clamp(
+    #     (global_mae / city_mae) ** city_confidence_alpha,
+    #     min_city_confidence_factor, max_city_confidence_factor)
+    # final_stake = base_stake * confidence_factor
+    "city_confidence_enabled": os.getenv("BETS_CITY_CONF_ENABLED", "1") == "1",
+    "city_confidence_alpha": float(os.getenv("BETS_CITY_CONF_ALPHA", "0.5")),
+    "min_city_confidence_factor": float(os.getenv("BETS_CITY_CONF_MIN", "0.5")),
+    "max_city_confidence_factor": float(os.getenv("BETS_CITY_CONF_MAX", "1.5")),
+    "max_city_mae_to_trade": (
+        float(os.getenv("BETS_CITY_CONF_SKIP_ABOVE"))
+        if os.getenv("BETS_CITY_CONF_SKIP_ABOVE") else None
+    ),
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -1766,6 +1783,9 @@ _AUTO_TRADE_PERSIST_KEYS = (
     "account_mode", "account_balance",
     "sweep_enabled", "sweep_interval_seconds", "sweep_algorithm_weights",
     "sweep_max_active_rows",
+    "city_confidence_enabled", "city_confidence_alpha",
+    "min_city_confidence_factor", "max_city_confidence_factor",
+    "max_city_mae_to_trade",
 )
 
 
@@ -1856,6 +1876,68 @@ def _validate_auto_trade_cfg(cfg: Dict) -> List[str]:
         except (TypeError, ValueError):
             errors.append(f"max_pct_of_balance ({max_pct!r}) must be numeric")
     return errors
+
+
+def _city_confidence_info(cfg: Dict, champion_wf_mae: Optional[float] = None) -> Dict:
+    """Per-city confidence factor map. For each city we have a per-city
+    MAE for, compute a stake multiplier in [min, max] based on how much
+    better or worse than the global MAE the model is for that city.
+
+    Returns {global_mae, factors: {CITY: {mae, factor, skip}}, …}.
+    Cheap enough to call inside the auto-trader tick — db.get_city_mae_map
+    is TTL-cached and the math is trivial."""
+    out = {
+        "enabled": bool(cfg.get("city_confidence_enabled")),
+        "alpha": float(cfg.get("city_confidence_alpha") or 0.5),
+        "min_factor": float(cfg.get("min_city_confidence_factor") or 0.5),
+        "max_factor": float(cfg.get("max_city_confidence_factor") or 1.5),
+        "skip_above_mae": cfg.get("max_city_mae_to_trade"),
+        "factors": {},
+    }
+    if not out["enabled"]:
+        return out
+    city_map = db.get_city_mae_map()
+    if not city_map:
+        return out
+    # Baseline: prefer the explicitly-passed champion wf_mae; otherwise
+    # use the median per-city MAE as a reference (less sensitive to one
+    # outlier city than the mean).
+    if champion_wf_mae is None:
+        try:
+            champ_rows = db.list_runs_by_role("champion", limit=1)
+            champion_wf_mae = (champ_rows[0].get("walk_forward_mae")
+                               if champ_rows else None)
+        except Exception:  # noqa: BLE001
+            champion_wf_mae = None
+    if champion_wf_mae is None or champion_wf_mae <= 0:
+        vals = sorted(city_map.values())
+        champion_wf_mae = vals[len(vals) // 2]
+    out["global_mae"] = float(champion_wf_mae)
+    skip_threshold = out["skip_above_mae"]
+    for city, city_mae in city_map.items():
+        if city_mae is None or city_mae <= 0:
+            continue
+        raw = (champion_wf_mae / city_mae) ** out["alpha"]
+        factor = max(out["min_factor"], min(out["max_factor"], raw))
+        skip = skip_threshold is not None and city_mae > float(skip_threshold)
+        out["factors"][city] = {
+            "mae": round(float(city_mae), 3),
+            "factor": round(float(factor), 3),
+            "skip": bool(skip),
+        }
+    return out
+
+
+def _city_confidence_factor(info: Dict, city_code: str) -> Dict:
+    """Single-city lookup against the precomputed info map. Returns
+    {factor, skip, mae} — defaults to neutral (factor=1.0, skip=False)
+    when the city isn't in the map or confidence is disabled."""
+    if not info.get("enabled") or not info.get("factors"):
+        return {"factor": 1.0, "skip": False, "mae": None}
+    row = info["factors"].get(city_code)
+    if not row:
+        return {"factor": 1.0, "skip": False, "mae": None}
+    return row
 
 
 def _size_for_bet(
@@ -2076,6 +2158,12 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     floor_skips = 0   # # of candidates we passed up because they'd breach the floor
     if candidates and available_cash >= cfg["min_usd"]:
         candidates.sort(key=lambda c: -c[0])
+        # Per-city confidence map — used to scale stakes (boost on good
+        # cities like LAS/OKC, shrink on bad ones like DCA/DEN) and
+        # optionally hard-skip cities whose MAE exceeds a threshold.
+        city_conf_info = _city_confidence_info(cfg)
+        cfg["city_confidence_last"] = city_conf_info
+        city_skipped = 0
         # Walk candidates highest-edge first; place the first one whose
         # size fits the stop-loss floor. The previous "pick top, place or
         # nothing" rule meant a single oversized candidate would silently
@@ -2083,7 +2171,25 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
         for cand_idx, cand in enumerate(candidates):
             edge_cents, city, state, bracket, target = cand
             kelly = kelly_fraction(bracket.get("edge") or 0, bracket.get("kalshiPct") or 0.5)
-            size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
+            # Per-city confidence: hard-skip cities exceeding the MAE
+            # threshold, otherwise multiply the base stake by the city's
+            # confidence factor. Neutral (factor=1.0) when disabled or
+            # when we have no per-city MAE for this code.
+            conf = _city_confidence_factor(city_conf_info, city["code"])
+            if conf["skip"]:
+                city_skipped += 1
+                print(f"[auto-trader] city-skip {city['code']} {bracket['label']} "
+                      f"(per-city MAE={conf['mae']}° > threshold "
+                      f"{city_conf_info.get('skip_above_mae')}°)")
+                continue
+            base_size = _size_for_bet(cfg, edge_cents, kelly, available_cash, total_equity=total_equity)
+            size = int(round(base_size * conf["factor"])) if base_size > 0 else 0
+            if base_size > 0 and size < cfg["min_usd"]:
+                # Confidence factor shrank the stake below the floor.
+                # Clamp UP to min_usd rather than skipping — confidence is
+                # a sizing hint, not a quality gate (we already passed all
+                # the quality gates upstream).
+                size = int(cfg["min_usd"])
             if size < cfg["min_usd"]:
                 continue
             # Stop-loss floor — refuse a bet that would drop deployable
@@ -2173,6 +2279,9 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     cfg["last_run_placed"] = len(placed)
     cfg["last_run_considered"] = len(candidates)
     cfg["last_run_floor_skips"] = floor_skips
+    # city_skipped is set inside the placement loop above; pull it back
+    # out via a local fallback if the loop didn't run (no candidates).
+    cfg["last_run_city_skips"] = locals().get("city_skipped", 0)
     cfg["total_runs"] += 1
     cfg["total_placed"] += len(placed)
     return placed
@@ -2697,6 +2806,33 @@ def ml_sweep_pause():
     db.log_ml_event("sweep_paused", {"enabled": False},
                     "sweep paused via /api/ml/sweep/pause")
     return _sweep_status_payload()
+
+
+@app.get("/api/ml/city-confidence")
+def ml_city_confidence():
+    """Per-city confidence factors used by the auto-trader's bet sizing.
+    Returns the same dict the placement loop reads on each tick, so the
+    UI can render exactly which cities are being boosted / shrunk /
+    skipped right now without recomputing anything client-side."""
+    info = _city_confidence_info(_auto_trade_state)
+    rows = []
+    for code, row in (info.get("factors") or {}).items():
+        rows.append({
+            "city": code,
+            "mae": row["mae"],
+            "factor": row["factor"],
+            "skip": row["skip"],
+        })
+    rows.sort(key=lambda r: r["mae"] or 0)
+    return {
+        "enabled": info["enabled"],
+        "alpha": info["alpha"],
+        "min_factor": info["min_factor"],
+        "max_factor": info["max_factor"],
+        "skip_above_mae": info["skip_above_mae"],
+        "global_mae": info.get("global_mae"),
+        "cities": rows,
+    }
 
 
 @app.get("/api/ml/runs")

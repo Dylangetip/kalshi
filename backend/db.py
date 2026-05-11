@@ -1311,6 +1311,43 @@ def list_ml_city_metrics(run_id: Optional[int] = None, limit: int = 100) -> List
     return [dict(r) for r in rows]
 
 
+_city_mae_cache: Dict = {"ts": 0, "map": None, "global_mae": None}
+
+
+def get_city_mae_map(ttl_seconds: int = 300) -> Dict[str, float]:
+    """Most-recent test_mae per city, used by the auto-trader to scale
+    bet sizing / skip cities the model is bad at.
+
+    Strategy: pull the most-recent ml_city_metrics row per city across
+    ALL runs (champion or otherwise). The sweep loop records city
+    metrics on every candidate, so this stays fresh; even if no
+    metrics exist for the current champion, the previous run's metrics
+    are still informative.
+
+    Cached for ttl_seconds — invalidated automatically when a new
+    champion gets promoted (see _on_champion_change calls). Lookup is
+    keyed by city CODE (NYC, LAX, …)."""
+    now = int(_time.time())
+    if _city_mae_cache["map"] is not None and (now - _city_mae_cache["ts"]) < ttl_seconds:
+        return dict(_city_mae_cache["map"])
+    c = _conn_or_init()
+    rows = c.execute(
+        """SELECT city, test_mae
+             FROM ml_city_metrics
+            WHERE id IN (SELECT MAX(id) FROM ml_city_metrics GROUP BY city)
+              AND test_mae IS NOT NULL""",
+    ).fetchall()
+    out = {r["city"]: float(r["test_mae"]) for r in rows if r["city"]}
+    _city_mae_cache.update({"ts": now, "map": out})
+    return dict(out)
+
+
+def invalidate_city_mae_cache() -> None:
+    """Reset the city-MAE cache. Call after a new champion is promoted so
+    the auto-trader picks up the freshest per-city stats on the next tick."""
+    _city_mae_cache.update({"ts": 0, "map": None})
+
+
 def list_runs_by_role(role: str, limit: int = 10) -> List[Dict]:
     """Filter ml_runs by role (champion / challenger / archived)."""
     c = _conn_or_init()

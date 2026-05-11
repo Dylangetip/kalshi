@@ -3285,6 +3285,97 @@ function AutoTradeSettings({ cfg, draft, setDraft, apply, busy }) {
 }
 
 
+// Per-city confidence panel — shows which cities the ML model is good
+// or bad at, the resulting stake multiplier the auto-trader applies, and
+// which cities (if any) are hard-skipped because their MAE exceeds the
+// configured threshold. Self-fetching from /api/ml/city-confidence.
+function CityConfidencePanel() {
+  const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
+    ? window.__BETS_API__ : '';
+  const [data, setData] = useState_v(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const r = await fetch(apiBase + '/api/ml/city-confidence', { cache: 'no-store' });
+        if (!cancelled && r.ok) setData(await r.json());
+      } catch {}
+    };
+    refresh();
+    const id = setInterval(refresh, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [apiBase]);
+  if (!data || !data.cities || data.cities.length === 0) return null;
+  const cities = [...data.cities].sort((a, b) => (a.mae || 0) - (b.mae || 0));
+  const fmtFactor = f => (f * 100).toFixed(0) + '%';
+  const factorCls = f => f >= 1.05 ? 'pos' : f <= 0.95 ? 'neg' : '';
+  const boostCount = cities.filter(c => c.factor >= 1.05 && !c.skip).length;
+  const shrinkCount = cities.filter(c => c.factor <= 0.95 && !c.skip).length;
+  const skipCount = cities.filter(c => c.skip).length;
+  return (
+    <div className="panel" style={{ marginBottom: 10 }}>
+      <div className="panel-header">
+        <span>Per-city confidence</span>
+        <span className="panel-title-actions">
+          {data.enabled
+            ? <>global MAE {data.global_mae != null ? data.global_mae.toFixed(3) + '°F' : '—'} · α={data.alpha}</>
+            : <span className="warn">disabled</span>}
+        </span>
+      </div>
+      <div style={{ padding: '10px 14px', display: 'flex', gap: 14, fontSize: 11, color: 'var(--fg-2)' }}>
+        <span><span className="pos">{boostCount} boosted</span> (model is good)</span>
+        <span><span className="neg">{shrinkCount} shrunk</span> (model is bad)</span>
+        {skipCount > 0 && <span><span className="warn">{skipCount} hard-skipped</span> (above MAE threshold)</span>}
+        {data.skip_above_mae != null && (
+          <span style={{ marginLeft: 'auto', color: 'var(--fg-3)' }}>
+            skip threshold: {data.skip_above_mae}°F MAE
+          </span>
+        )}
+      </div>
+      <div style={{ padding: '0 14px 14px' }}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>City</th>
+              <th className="num-r">Test MAE</th>
+              <th className="num-r">vs global</th>
+              <th className="num-r">Stake ×</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cities.map(c => {
+              const rel = data.global_mae ? (c.mae / data.global_mae) : 1;
+              return (
+                <tr key={c.city} style={c.skip ? { opacity: 0.55 } : null}>
+                  <td className="city-cell">{c.city}</td>
+                  <td className="num-r mono">{c.mae != null ? c.mae.toFixed(3) : '—'}°F</td>
+                  <td className={`num-r mono ${rel < 1 ? 'pos' : rel > 1 ? 'neg' : ''}`}>
+                    {rel < 1 ? '↓' : rel > 1 ? '↑' : ''}{Math.abs((rel - 1) * 100).toFixed(0)}%
+                  </td>
+                  <td className={`num-r mono ${factorCls(c.factor)}`}>
+                    {fmtFactor(c.factor)}
+                  </td>
+                  <td className="mono" style={{ fontSize: 11 }}>
+                    {c.skip
+                      ? <span className="warn">⊘ skip</span>
+                      : c.factor >= 1.05
+                        ? <span className="pos">boost</span>
+                        : c.factor <= 0.95
+                          ? <span className="neg">shrink</span>
+                          : <span style={{ color: 'var(--fg-3)' }}>neutral</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
 // Bank-account-style virtual balance: deposits, withdrawals, stake debits,
 // payout credits — all flow through /api/account/* and are auditable per
 // row in account_transactions. This panel owns its own polling so the
@@ -3536,6 +3627,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
   return (
     <div className="pnl-layout">
       <AccountPanel />
+      <CityConfidencePanel />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
         <div className="signal-card">
           <div className="label">Status</div>

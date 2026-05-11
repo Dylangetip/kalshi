@@ -253,6 +253,14 @@ def train_random_candidate(
             hyperparams=params,
             fingerprint=fp,
         )
+        # Record per-city test MAE so the auto-trader can scale bet
+        # sizing / skip cities the model is bad at. Best-effort —
+        # failures here shouldn't sink the sweep tick.
+        try:
+            _record_per_city_metrics(run["id"], fit["model"], test_df, X_test, y_test)
+            db.invalidate_city_mae_cache()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sweep] per-city metrics skipped: {exc}")
         return {
             "status": "ok",
             "run_id": run.get("id"),
