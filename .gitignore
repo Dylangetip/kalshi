@@ -13,3 +13,4 @@ backend/bets.db-shm
 *.key
 backend/ml/models/*.pkl
 .mcp-token
+backend/auto_trade_state.json
