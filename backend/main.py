@@ -165,6 +165,15 @@ _auto_trade_state: Dict = {
     "virtual_mode": os.getenv("BETS_VIRTUAL_MODE", "0") == "1",
     "virtual_starting_balance": float(os.getenv("BETS_VIRTUAL_START", "1000")),
     "virtual_current_balance": float(os.getenv("BETS_VIRTUAL_START", "1000")),
+    # Bank-account mode. Strictly supersedes virtual_mode and bankroll
+    # for sizing when on. The auto-trader runs against db.account_balance()
+    # exclusively: deposits / withdrawals / bet stakes / payouts all flow
+    # through the account_transactions ledger so the dollar number can
+    # always be reconciled against SUM(amount). Live Kalshi cash is
+    # ignored entirely. Default ON (per spec) — but balance starts at $0
+    # so the trader gracefully no-ops until the user makes a deposit.
+    "account_mode": os.getenv("BETS_ACCOUNT_MODE", "1") == "1",
+    "account_balance": float(os.getenv("BETS_ACCOUNT_START", "0")),
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -1012,6 +1021,32 @@ async def _startup() -> None:
         msg = "; ".join(cfg_errors)
         print(f"[auto-trader] WARNING: config invalid at startup: {msg}")
         print("[auto-trader] auto-trader ticks will skip until this is fixed via /api/auto-trade/config")
+    # account_mode integrity check: persisted cached balance MUST equal
+    # SUM(account_transactions.amount). If they drift (manual DB edits,
+    # crash mid-write, file rollback) trust the ledger and refresh the
+    # cache so the next tick sizes from the correct number.
+    if _auto_trade_state.get("account_mode"):
+        ledger_bal = db.account_balance()
+        cached_bal = float(_auto_trade_state.get("account_balance") or 0.0)
+        if abs(ledger_bal - cached_bal) > 0.01:
+            print(f"[account] WARNING: cached balance ${cached_bal:.2f} disagrees "
+                  f"with ledger ${ledger_bal:.2f} — trusting ledger and refreshing cache")
+            try:
+                db.log_ml_event(
+                    "data_quality",
+                    {"scope": "account", "cached": round(cached_bal, 2),
+                     "ledger": round(ledger_bal, 2),
+                     "delta": round(ledger_bal - cached_bal, 2)},
+                    f"account balance drift: cached=${cached_bal:.2f} "
+                    f"vs ledger=${ledger_bal:.2f}; refreshed cache",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        _auto_trade_state["account_balance"] = round(ledger_bal, 2)
+        _persist_auto_trade_state()
+        if ledger_bal <= 0 and db.account_transaction_count() == 0:
+            print("[account] account_mode is ON with zero balance and no transactions — "
+                  "make a deposit via POST /api/account/deposit to start trading")
     global _snapshot_task, _settlement_task, _auto_trader_task, _ml_retrain_task, _ml_incremental_backfill_task
     if not SNAPSHOT_LOOP_DISABLED and _snapshot_task is None:
         _snapshot_task = asyncio.create_task(_snapshot_loop())
@@ -1153,6 +1188,80 @@ async def auto_trade_now():
         "placed": placed,
         "count": len(placed),
     }
+
+
+# ── Virtual account endpoints ─────────────────────────────────────────
+
+class _AccountAmount(BaseModel):
+    amount: float = Field(..., gt=0, description="USD amount; must be > 0")
+    note: Optional[str] = None
+
+
+def _refresh_account_cache_after_tx(tx: Dict) -> Dict:
+    _auto_trade_state["account_balance"] = round(float(tx["balance_after"]), 2)
+    _persist_auto_trade_state()
+    return {
+        "balance": _auto_trade_state["account_balance"],
+        "transaction": tx,
+    }
+
+
+@app.post("/api/account/deposit")
+def account_deposit(body: _AccountAmount):
+    """Add funds to the virtual account. Always succeeds (no upper cap).
+    Returns the new balance and the inserted transaction row."""
+    try:
+        tx = db.account_deposit(body.amount, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return _refresh_account_cache_after_tx(tx)
+
+
+@app.post("/api/account/withdraw")
+def account_withdraw(body: _AccountAmount):
+    """Pull funds out of the virtual account. Refused with 400 if it
+    would push the balance below $0."""
+    try:
+        tx = db.account_withdraw(body.amount, note=body.note)
+    except db.InsufficientFundsError as exc:
+        raise HTTPException(400, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return _refresh_account_cache_after_tx(tx)
+
+
+@app.get("/api/account/balance")
+def account_balance_endpoint():
+    """Authoritative balance read. Pulls from the ledger so the caller
+    can never see a stale cached number, and also returns when the most
+    recent transaction landed (useful for "last updated 2m ago" UIs)."""
+    bal = db.account_balance()
+    txs = db.list_account_transactions(limit=1)
+    last_ts = txs[0]["created_at"] if txs else None
+    # Refresh the cached cfg balance so subsequent /api/auto-trade/info
+    # calls see the same number without an extra round trip.
+    _auto_trade_state["account_balance"] = round(bal, 2)
+    return {
+        "balance": round(bal, 2),
+        "last_updated": last_ts,
+        "account_mode": bool(_auto_trade_state.get("account_mode")),
+        "min_balance_usd": float(_auto_trade_state.get("min_balance_usd") or 0),
+        "transaction_count": db.account_transaction_count(),
+    }
+
+
+@app.get("/api/account/transactions")
+def account_transactions(limit: int = 50):
+    """Most recent transactions, newest first. Default 50, capped at
+    1000 for safety on the wire."""
+    capped = max(1, min(int(limit or 50), 1000))
+    return db.list_account_transactions(limit=capped)
+
+
+@app.get("/api/account/history")
+def account_history():
+    """Time-ordered (created_at, balance_after) for the P&L page chart."""
+    return db.account_balance_history()
 
 
 class PlaceBetIn(BaseModel):
@@ -1483,9 +1592,23 @@ def place_bet(b: PlaceBetIn):
         entry_cents=b.entry_cents,
         target_date=target_date,
     )
-    # Mirror the auto-trader's virtual-mode debit for manual placements
-    # so the simulated bankroll tracks ALL bets, not just the auto ones.
-    if _auto_trade_state.get("virtual_mode"):
+    # account_mode: debit the stake from the ledger. Manual placements
+    # are funded from the same account as the auto-trader; failure rolls
+    # the bet back. Falls through to virtual_mode for legacy setups.
+    if _auto_trade_state.get("account_mode"):
+        try:
+            db.account_record_bet_placed(
+                row["id"], int(size),
+                min_balance=float(_auto_trade_state.get("min_balance_usd") or 0),
+            )
+        except db.InsufficientFundsError as exc:
+            db.delete_bet(row["id"])
+            raise HTTPException(400, str(exc))
+        _auto_trade_state["account_balance"] = round(db.account_balance(), 2)
+        _persist_auto_trade_state()
+    elif _auto_trade_state.get("virtual_mode"):
+        # Mirror the auto-trader's virtual-mode debit for manual placements
+        # so the simulated bankroll tracks ALL bets, not just the auto ones.
         _auto_trade_state["virtual_current_balance"] = round(
             float(_auto_trade_state.get("virtual_current_balance") or 0) - int(size), 2,
         )
@@ -1531,10 +1654,26 @@ async def _settle_open_bets(client: httpx.AsyncClient) -> List[Dict]:
             in_bracket = _bet_in_bracket(bet, actual_max)
             pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
             db.settle_bet(bet["id"], pl, actual_max)
-            # Virtual mode: stake was already debited at placement, so
-            # only winners get money back — credit the GROSS payout
-            # (stake + profit). Loss = no-op, stake stays gone.
-            if _auto_trade_state.get("virtual_mode") and pl > 0:
+            # account_mode: only bets we actually funded out of the
+            # ledger touch the ledger on settle. Bets placed before
+            # account_mode was enabled stay invisible to the account.
+            if db.account_bet_was_funded(bet["id"]):
+                stake = float(bet["size"])
+                if pl > 0:
+                    gross_payout = stake + float(pl)
+                    db.account_record_bet_won(bet["id"], gross_payout)
+                    _auto_trade_state["account_balance"] = round(db.account_balance(), 2)
+                    _persist_auto_trade_state()
+                    print(f"[auto-trader] [account] settled WIN bet#{bet['id']} "
+                          f"+${gross_payout:.2f} → balance="
+                          f"${_auto_trade_state['account_balance']:.2f}")
+                else:
+                    db.account_record_bet_lost(bet["id"])
+                    print(f"[auto-trader] [account] settled LOSS bet#{bet['id']} "
+                          f"stake ${stake:.2f} already debited at placement")
+            # Virtual mode (legacy, only relevant when account_mode is off
+            # and the bet wasn't account-funded): credit gross payout on win.
+            elif _auto_trade_state.get("virtual_mode") and pl > 0:
                 stake = float(bet["size"])
                 gross_payout = stake + float(pl)
                 _auto_trade_state["virtual_current_balance"] = round(
@@ -1601,6 +1740,7 @@ _AUTO_TRADE_PERSIST_KEYS = (
     "require_peak_in_bracket", "prevent_overlapping_brackets",
     "min_balance_usd", "bet_sizing_mode", "size_tiers",
     "virtual_mode", "virtual_starting_balance", "virtual_current_balance",
+    "account_mode", "account_balance",
 )
 
 
@@ -1637,13 +1777,23 @@ def _load_auto_trade_state() -> None:
 def _sizing_balance(cfg: Dict, total_equity: float, available_cash: float) -> tuple:
     """Pick the (equity, cash) pair the sizer should use.
 
-    Virtual mode → both come from virtual_current_balance. The auto-
-    trader's bank-account model already debits stake at placement and
-    credits payout at settlement, so virtual_current_balance is BOTH
-    "what's in the account" and "what's deployable" simultaneously.
+    account_mode → both come from db.account_balance(). The ledger debits
+    the stake at placement and credits the gross payout at settlement, so
+    one number is simultaneously "what's in the account" and "what's
+    deployable." Bankroll, virtual_current_balance, and live Kalshi cash
+    are ignored. The persisted cfg["account_balance"] mirrors the ledger
+    for fast read paths and is reconciled on startup.
+
+    virtual_mode → both come from virtual_current_balance (legacy path).
 
     Real mode → equity = starting cash + realized P/L, cash = equity − open
     stakes. Old behavior preserved for non-virtual setups."""
+    if cfg.get("account_mode"):
+        # Trust the ledger; refresh the cached cfg value at the same time
+        # so the next config-read sees the same number the sizer used.
+        bal = db.account_balance()
+        cfg["account_balance"] = round(bal, 2)
+        return bal, bal
     if cfg.get("virtual_mode"):
         v = float(cfg.get("virtual_current_balance") or 0)
         return v, v
@@ -1872,22 +2022,25 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
     cfg["total_equity"] = round(real_total_equity, 2)
     cfg["realized_pl"] = stats["realizedPl"]
     cfg["open_stakes"] = stats["openStakes"]
-    # Pick the balance the sizer should see. Virtual mode swaps in the
-    # simulated bankroll; real mode uses the bank-account math above.
+    # Pick the balance the sizer should see. account_mode → ledger;
+    # virtual_mode → simulated bankroll; real mode → bank-account math.
     total_equity, available_cash = _sizing_balance(cfg, real_total_equity, real_available_cash)
-    if cfg.get("virtual_mode"):
-        # Halt entirely if the simulated bankroll has run out.
-        if available_cash < float(cfg.get("min_balance_usd") or 0):
-            print(f"[auto-trader] virtual bankroll exhausted: "
-                  f"balance=${available_cash:.2f} < min_balance="
-                  f"${float(cfg.get('min_balance_usd') or 0):.2f}")
+    # Halt the entire run if the funding source is below the floor —
+    # account_mode and virtual_mode both gate on the same min_balance_usd.
+    if cfg.get("account_mode") or cfg.get("virtual_mode"):
+        floor = float(cfg.get("min_balance_usd") or 0)
+        if available_cash <= floor:
+            mode = "account" if cfg.get("account_mode") else "virtual"
+            print(f"[auto-trader] {mode} balance exhausted: "
+                  f"${available_cash:.2f} <= min_balance=${floor:.2f}")
             try:
                 db.log_ml_event(
                     "data_quality",
-                    {"scope": "auto-trader", "virtual_balance": round(available_cash, 2),
-                     "min_balance_usd": float(cfg.get("min_balance_usd") or 0)},
-                    f"virtual bankroll exhausted (${available_cash:.2f}); "
-                    f"reset via /api/auto-trade/virtual/reset",
+                    {"scope": "auto-trader", "mode": mode,
+                     "balance": round(available_cash, 2),
+                     "min_balance_usd": floor},
+                    f"{mode} balance exhausted (${available_cash:.2f}); "
+                    f"deposit via /api/account/deposit to resume",
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -1895,7 +2048,7 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
             cfg["last_run_placed"] = 0
             cfg["last_run_considered"] = len(candidates)
             cfg["last_run_floor_skips"] = 0
-            cfg["last_run_error"] = "virtual_bankroll_exhausted"
+            cfg["last_run_error"] = f"{mode}_balance_exhausted"
             cfg["total_runs"] += 1
             return []
 
@@ -1934,9 +2087,30 @@ async def _auto_trade_tick(client: httpx.AsyncClient) -> List[Dict]:
                     entry_cents=int(bracket.get("yesPrice", 0)),
                     target_date=target,
                 )
-                # Virtual mode: debit stake immediately and persist so the
-                # next tick (or a restart) sees the new balance.
-                if cfg.get("virtual_mode"):
+                # account_mode: debit the stake through the ledger so
+                # /api/account/balance and the chart see the new state
+                # immediately. The ledger is the source of truth; cfg is
+                # a cache. If the debit fails (e.g. concurrent withdrawal
+                # raced us below the floor) roll the bet back to keep
+                # the ledger / bets table consistent.
+                if cfg.get("account_mode"):
+                    try:
+                        db.account_record_bet_placed(
+                            row["id"], size,
+                            min_balance=float(cfg.get("min_balance_usd") or 0),
+                        )
+                    except db.InsufficientFundsError as exc:
+                        print(f"[auto-trader] ledger refused stake for "
+                              f"bet#{row['id']}: {exc} — rolling back")
+                        db.delete_bet(row["id"])
+                        floor_skips += 1
+                        continue
+                    cfg["account_balance"] = round(db.account_balance(), 2)
+                    available_cash = cfg["account_balance"]
+                    _persist_auto_trade_state()
+                # Virtual mode (legacy, ignored when account_mode is on):
+                # debit stake immediately and persist.
+                elif cfg.get("virtual_mode"):
                     cfg["virtual_current_balance"] = round(
                         float(cfg.get("virtual_current_balance") or 0) - size, 2
                     )

@@ -740,7 +740,94 @@ function SignalsView({ signals, state }) {
 }
 
 // ====== P&L ======
+// Lightweight account-balance line chart for the P&L page. Plots
+// balance_after over time straight from /api/account/history — every
+// deposit, withdrawal, and bet outcome is a step on the curve. Uses
+// the same SVG primitives as EquityChart so styling stays consistent.
+function AccountBalanceChart({ history, height = 220 }) {
+  if (!history || history.length === 0) {
+    return (
+      <div style={{ padding: 14, fontSize: 12, color: 'var(--fg-3)' }}>
+        no transactions yet — make a deposit on the Auto-Trade page to start the curve
+      </div>
+    );
+  }
+  const W = 800, H = height, pad = { l: 50, r: 12, t: 12, b: 24 };
+  const ts = history.map(h => h.created_at);
+  const ys = history.map(h => h.balance_after);
+  const xMin = Math.min(...ts), xMax = Math.max(...ts);
+  const yMin = Math.min(0, ...ys), yMax = Math.max(...ys, yMin + 1);
+  const xScale = (x) => pad.l + ((x - xMin) / Math.max(1, xMax - xMin)) * (W - pad.l - pad.r);
+  const yScale = (y) => H - pad.b - ((y - yMin) / Math.max(1, yMax - yMin)) * (H - pad.t - pad.b);
+  const path = history.map((h, i) =>
+    `${i === 0 ? 'M' : 'L'} ${xScale(h.created_at).toFixed(1)} ${yScale(h.balance_after).toFixed(1)}`
+  ).join(' ');
+  // Color the dot by transaction type so deposits stand out from bets.
+  const dotColor = (t) => ({
+    deposit: 'var(--pos)', withdrawal: 'var(--neg)',
+    bet_won: 'var(--pos)', bet_placed: 'var(--accent)', bet_lost: 'var(--fg-3)',
+  }[t] || 'var(--fg-2)');
+  const fmtTick = (t) => new Date(t * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: 'block' }}>
+      {/* Y-axis ticks */}
+      {[yMin, (yMin + yMax) / 2, yMax].map((y, i) => (
+        <g key={i}>
+          <line x1={pad.l} x2={W - pad.r} y1={yScale(y)} y2={yScale(y)} stroke="var(--border)" strokeDasharray="2 3" />
+          <text x={pad.l - 6} y={yScale(y) + 4} textAnchor="end" fontSize="10" fill="var(--fg-3)" fontFamily="var(--mono)">
+            ${Math.round(y).toLocaleString()}
+          </text>
+        </g>
+      ))}
+      {/* X-axis date labels */}
+      <text x={pad.l} y={H - 6} fontSize="10" fill="var(--fg-3)" fontFamily="var(--mono)">{fmtTick(xMin)}</text>
+      <text x={W - pad.r} y={H - 6} textAnchor="end" fontSize="10" fill="var(--fg-3)" fontFamily="var(--mono)">{fmtTick(xMax)}</text>
+      {/* Curve */}
+      <path d={path} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
+      {/* Per-transaction dot */}
+      {history.map((h, i) => (
+        <circle key={i} cx={xScale(h.created_at)} cy={yScale(h.balance_after)}
+          r="2.5" fill={dotColor(h.type)}>
+          <title>{h.type} → ${h.balance_after.toFixed(2)} at {new Date(h.created_at * 1000).toLocaleString()}</title>
+        </circle>
+      ))}
+    </svg>
+  );
+}
+
+
 function PnLView({ history, positions, closedPositions = [], states = [], liveHistory = false, stats = null, autoInfo = null }) {
+  // Pull account-mode + balance + history straight from the ledger so the
+  // P&L page shows the same number the auto-trader is sizing against. Self-
+  // polling so the parent doesn't need to thread props.
+  const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
+    ? window.__BETS_API__ : '';
+  const [accountBalance, setAccountBalance] = useState_v(null);
+  const [accountMode, setAccountMode] = useState_v(false);
+  const [accountHistory, setAccountHistory] = useState_v([]);
+  React.useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [balR, histR] = await Promise.all([
+          fetch(apiBase + '/api/account/balance', { cache: 'no-store' }),
+          fetch(apiBase + '/api/account/history', { cache: 'no-store' }),
+        ]);
+        if (!cancelled && balR.ok) {
+          const j = await balR.json();
+          setAccountBalance(j.balance);
+          setAccountMode(!!j.account_mode);
+        }
+        if (!cancelled && histR.ok) {
+          setAccountHistory(await histR.json());
+        }
+      } catch {}
+    };
+    refresh();
+    const id = setInterval(refresh, 20000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [apiBase]);
+
   const stateByCity = React.useMemo(() => {
     const m = {};
     for (const s of states || []) if (s?.city?.code) m[s.city.code] = s;
@@ -764,18 +851,32 @@ function PnLView({ history, positions, closedPositions = [], states = [], liveHi
     <div className="pnl-layout">
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
         {(() => {
-          // Account-balance model: behaves like a real bank account. The
-          // headline number is total equity (starting cash + realized P/L)
-          // — your true net worth in the system. Open stakes are still
-          // "yours" (just locked until settlement), so they're shown in the
-          // subtitle along with deployable cash. Reads the bankroll seed
-          // from /api/auto-trade/info so the UI stays consistent with what
-          // the auto-trader actually uses for sizing math.
+          // When account_mode is on, the headline IS the ledger balance —
+          // same number the auto-trader sizes against and the same one
+          // shown on the Auto-Trade page's account card. Subtitle still
+          // shows realized/open for context. When account_mode is off, fall
+          // back to the legacy bankroll + realized model so old dashboards
+          // keep working.
           const baseline = (autoInfo && typeof autoInfo.bankroll === 'number')
             ? autoInfo.bankroll
             : 10000;
           const realized = (stats && typeof stats.realizedPl === 'number') ? stats.realizedPl : 0;
           const openStakes = (stats && typeof stats.openStakes === 'number') ? stats.openStakes : 0;
+          if (accountMode) {
+            const headline = accountBalance == null ? 0 : accountBalance;
+            const cls = headline > baseline ? 'pos' : (headline < baseline ? 'neg' : '');
+            return (
+              <div className="signal-card">
+                <div className="label">Account balance <Pill kind="pos">LEDGER</Pill></div>
+                <div className={`big-num ${cls || ''}`}>
+                  {accountBalance == null ? '—' : fmtUSD(headline)}
+                </div>
+                <div className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+                  ${Math.round(openStakes).toLocaleString()} in open stakes · {fmtSign(realized, 0)} realized
+                </div>
+              </div>
+            );
+          }
           const totalEquity = baseline + realized;        // settled net worth
           const cash = totalEquity - openStakes;          // deployable right now
           const ret = (totalEquity - baseline) / baseline;
@@ -861,6 +962,22 @@ function PnLView({ history, positions, closedPositions = [], states = [], liveHi
           </div>
         );
       })()}
+
+      {accountMode && (
+        <div className="panel">
+          <div className="panel-header">
+            <span>Account balance over time <Pill kind="pos">LEDGER</Pill></span>
+            <span className="panel-title-actions">
+              <span><span className="dot" style={{ background: 'var(--pos)' }} /> deposit / win</span>
+              <span><span className="dot" style={{ background: 'var(--accent)' }} /> bet placed</span>
+              <span><span className="dot" style={{ background: 'var(--neg)' }} /> withdraw</span>
+            </span>
+          </div>
+          <div style={{ padding: 14 }}>
+            <AccountBalanceChart history={accountHistory} height={240} />
+          </div>
+        </div>
+      )}
 
       <div className="panel">
         <div className="panel-header">
@@ -2306,6 +2423,179 @@ function AutoTradeSettings({ cfg, draft, setDraft, apply, busy }) {
 }
 
 
+// Bank-account-style virtual balance: deposits, withdrawals, stake debits,
+// payout credits — all flow through /api/account/* and are auditable per
+// row in account_transactions. This panel owns its own polling so the
+// parent doesn't need extra prop plumbing.
+function AccountPanel() {
+  const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
+    ? window.__BETS_API__ : '';
+  const [balance, setBalance] = useState_v(null);
+  const [accountMode, setAccountMode] = useState_v(true);
+  const [minBalance, setMinBalance] = useState_v(0);
+  const [lastUpdated, setLastUpdated] = useState_v(null);
+  const [txs, setTxs] = useState_v([]);
+  const [depositAmt, setDepositAmt] = useState_v('');
+  const [withdrawAmt, setWithdrawAmt] = useState_v('');
+  const [busy, setBusy] = useState_v(false);
+  const [err, setErr] = useState_v(null);
+
+  const refresh = React.useCallback(async () => {
+    try {
+      const [balRes, txRes] = await Promise.all([
+        fetch(apiBase + '/api/account/balance', { cache: 'no-store' }),
+        fetch(apiBase + '/api/account/transactions?limit=10', { cache: 'no-store' }),
+      ]);
+      if (balRes.ok) {
+        const j = await balRes.json();
+        setBalance(j.balance);
+        setAccountMode(j.account_mode);
+        setMinBalance(j.min_balance_usd);
+        setLastUpdated(j.last_updated);
+      }
+      if (txRes.ok) setTxs(await txRes.json());
+    } catch (e) { /* leave previous values */ }
+  }, [apiBase]);
+
+  React.useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 15000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const submit = async (path, amount) => {
+    if (!amount || +amount <= 0) {
+      setErr('amount must be greater than 0');
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      const r = await fetch(apiBase + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: +amount }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setErr(j.detail || j.error || `${path} failed (${r.status})`);
+      } else {
+        setBalance(j.balance);
+        setDepositAmt('');
+        setWithdrawAmt('');
+        await refresh();
+      }
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const txLabel = (t) => ({
+    deposit: 'Deposit', withdrawal: 'Withdraw',
+    bet_placed: 'Bet placed', bet_won: 'Bet won', bet_lost: 'Bet lost',
+  }[t] || t);
+  const txClass = (t, amt) => {
+    if (t === 'deposit' || t === 'bet_won') return 'pos';
+    if (t === 'withdrawal' || t === 'bet_placed') return 'neg';
+    return '';
+  };
+
+  const empty = (txs.length === 0) && (balance === 0 || balance == null);
+
+  return (
+    <div className="panel" style={{ marginBottom: 10 }}>
+      <div className="panel-header">
+        <span>Account</span>
+        <span className="panel-title-actions">
+          {accountMode
+            ? <span className="pos">account_mode ON · sizing from this balance</span>
+            : <span style={{ color: 'var(--fg-3)' }}>account_mode OFF · ledger inactive</span>}
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 14, alignItems: 'end' }}>
+        <div>
+          <div className="label" style={{ marginBottom: 4 }}>Current balance</div>
+          <div className={`big-num ${balance > 0 ? 'pos' : balance < 0 ? 'neg' : ''}`}>
+            {balance == null ? '—' : fmtUSD(balance)}
+          </div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+            min ${Math.round(minBalance)} · {lastUpdated ? `updated ${ago(lastUpdated * 1000)}` : 'no transactions yet'}
+          </div>
+        </div>
+        <div>
+          <div className="label" style={{ marginBottom: 4 }}>Deposit</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <input type="number" value={depositAmt} min={0} step={50} placeholder="$"
+              onChange={e => setDepositAmt(e.target.value)}
+              style={{ flex: 1, fontSize: 14 }} />
+            <button className="btn success" disabled={busy}
+              onClick={() => submit('/api/account/deposit', depositAmt)}>
+              {busy ? '…' : 'Deposit'}
+            </button>
+          </div>
+        </div>
+        <div>
+          <div className="label" style={{ marginBottom: 4 }}>Withdraw</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <input type="number" value={withdrawAmt} min={0} step={50} placeholder="$"
+              onChange={e => setWithdrawAmt(e.target.value)}
+              style={{ flex: 1, fontSize: 14 }} />
+            <button className="btn danger" disabled={busy}
+              onClick={() => submit('/api/account/withdraw', withdrawAmt)}>
+              {busy ? '…' : 'Withdraw'}
+            </button>
+          </div>
+        </div>
+      </div>
+      {err && (
+        <div style={{ padding: '0 14px 10px', fontSize: 12, color: 'var(--neg)' }}>
+          {err}
+        </div>
+      )}
+      {empty && accountMode && (
+        <div style={{ padding: '0 14px 10px', fontSize: 12, color: 'var(--fg-3)' }}>
+          account is empty — make a deposit to start the auto-trader
+        </div>
+      )}
+      <div style={{ padding: '0 14px 14px' }}>
+        <div className="label" style={{ marginBottom: 4 }}>Recent transactions</div>
+        {txs.length === 0 ? (
+          <div style={{ fontSize: 12, color: 'var(--fg-3)' }}>none yet</div>
+        ) : (
+          <table className="tbl" style={{ width: '100%' }}>
+            <thead>
+              <tr>
+                <th>When</th><th>Type</th>
+                <th className="num-r">Amount</th>
+                <th className="num-r">Balance</th>
+                <th>Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {txs.map(t => (
+                <tr key={t.id}>
+                  <td className="mono" style={{ fontSize: 11 }}>{ago(t.created_at * 1000)}</td>
+                  <td>{txLabel(t.type)}</td>
+                  <td className={`num-r mono ${txClass(t.type, t.amount)}`}>
+                    {t.amount > 0 ? '+' : ''}{fmtUSD(t.amount)}
+                  </td>
+                  <td className="num-r mono">{fmtUSD(t.balance_after)}</td>
+                  <td className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                    {t.bet_id ? `bet#${t.bet_id}` : (t.note || '')}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], states = [] }) {
   // Build a lookup so each bet row can show its live "are we hitting?" status.
   // Key = city + bracket label; positions only includes open bets, so settled
@@ -2384,6 +2674,7 @@ function AutoTradeView({ info, bets, onSetConfig, onTriggerNow, positions = [], 
 
   return (
     <div className="pnl-layout">
+      <AccountPanel />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
         <div className="signal-card">
           <div className="label">Status</div>

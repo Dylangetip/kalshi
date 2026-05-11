@@ -199,6 +199,24 @@ CREATE TABLE IF NOT EXISTS ml_historical_predictions (
     PRIMARY KEY (city, target_date, forecast_horizon_hours)
 );
 CREATE INDEX IF NOT EXISTS idx_mlhp_target ON ml_historical_predictions(target_date);
+
+-- Virtual account ledger. The auto-trader runs against a private bank
+-- account: deposits/withdrawals come from the user, bets debit the stake
+-- at placement, winning settlements credit (stake + profit), losing
+-- settlements record a zero-amount row for the audit trail. balance_after
+-- is the running balance AFTER this transaction so the chart can plot
+-- it directly without recomputing the prefix sum on every read.
+CREATE TABLE IF NOT EXISTS account_transactions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    INTEGER NOT NULL,
+    type          TEXT    NOT NULL CHECK(type IN ('deposit','withdrawal','bet_placed','bet_won','bet_lost')),
+    amount        REAL    NOT NULL,
+    balance_after REAL    NOT NULL,
+    note          TEXT,
+    bet_id        INTEGER REFERENCES bets(id)
+);
+CREATE INDEX IF NOT EXISTS idx_acct_tx_created ON account_transactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_acct_tx_bet     ON account_transactions(bet_id);
 """
 
 _lock = threading.Lock()
@@ -298,6 +316,17 @@ def insert_bet(
         c.commit()
         row = c.execute("SELECT * FROM bets WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
+
+
+def delete_bet(bet_id: int) -> int:
+    """Hard-delete a bet row. Used as a rollback when downstream side
+    effects (e.g. account ledger debit) fail after the bet is inserted —
+    keeps the bets table and the ledger consistent. Returns rowcount."""
+    c = _conn_or_init()
+    with _lock:
+        cur = c.execute("DELETE FROM bets WHERE id = ?", (int(bet_id),))
+        c.commit()
+    return int(cur.rowcount)
 
 
 def list_settleable_bets(today_iso: str) -> List[Dict]:
@@ -680,6 +709,160 @@ def recompute_historical_ensemble_max() -> Dict[str, int]:
                 updated += 1
         c.commit()
     return {"updated": updated, "cleared": cleared, "skipped": skipped, "total": len(rows)}
+
+
+# ── Virtual account ledger ─────────────────────────────────────────────
+
+class InsufficientFundsError(ValueError):
+    """Raised when a debit (withdrawal or stake) would push the account
+    below the minimum allowed balance. Caller should surface as 4xx."""
+
+
+_VALID_TX_TYPES = ("deposit", "withdrawal", "bet_placed", "bet_won", "bet_lost")
+
+
+def account_balance() -> float:
+    """Authoritative balance: SUM(amount) over the ledger. The persisted
+    config value mirrors this and the startup integrity check enforces
+    they agree."""
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT COALESCE(SUM(amount), 0.0) AS bal FROM account_transactions"
+    ).fetchone()
+    return float(row["bal"] or 0.0)
+
+
+def _record_account_transaction(
+    tx_type: str,
+    amount: float,
+    note: Optional[str] = None,
+    bet_id: Optional[int] = None,
+    min_balance: float = 0.0,
+    allow_negative: bool = False,
+) -> Dict:
+    """Single-writer entry point for the account ledger. Recomputes the
+    running balance under the lock, refuses any debit that would drop
+    below `min_balance` (unless allow_negative=True for internal admin
+    flows), and writes one row with the post-transaction balance baked
+    in so reads don't have to recompute the prefix sum.
+
+    Returns the inserted row as a dict."""
+    if tx_type not in _VALID_TX_TYPES:
+        raise ValueError(f"invalid tx_type {tx_type!r}; expected one of {_VALID_TX_TYPES}")
+    c = _conn_or_init()
+    with _lock:
+        cur_bal_row = c.execute(
+            "SELECT COALESCE(SUM(amount), 0.0) AS bal FROM account_transactions"
+        ).fetchone()
+        cur_bal = float(cur_bal_row["bal"] or 0.0)
+        new_bal = round(cur_bal + float(amount), 2)
+        if not allow_negative and new_bal < min_balance - 1e-6:
+            raise InsufficientFundsError(
+                f"transaction would leave balance ${new_bal:.2f} below "
+                f"minimum ${min_balance:.2f} (current ${cur_bal:.2f}, "
+                f"requested ${amount:+.2f})"
+            )
+        ts = int(time.time())
+        cur = c.execute(
+            """INSERT INTO account_transactions
+                 (created_at, type, amount, balance_after, note, bet_id)
+                 VALUES (?,?,?,?,?,?)""",
+            (ts, tx_type, float(amount), new_bal, note, bet_id),
+        )
+        c.commit()
+        row = c.execute(
+            "SELECT * FROM account_transactions WHERE id = ?", (cur.lastrowid,),
+        ).fetchone()
+    return dict(row)
+
+
+def account_deposit(amount: float, note: Optional[str] = None) -> Dict:
+    if amount <= 0:
+        raise ValueError(f"deposit amount must be > 0 (got {amount})")
+    return _record_account_transaction("deposit", float(amount), note=note)
+
+
+def account_withdraw(amount: float, note: Optional[str] = None) -> Dict:
+    """Withdraw `amount` (positive). Refused if it would leave a negative
+    balance — the spec calls for >= $0 floor on user-initiated withdrawals."""
+    if amount <= 0:
+        raise ValueError(f"withdrawal amount must be > 0 (got {amount})")
+    return _record_account_transaction(
+        "withdrawal", -float(amount), note=note, min_balance=0.0,
+    )
+
+
+def account_record_bet_placed(bet_id: int, stake: float, min_balance: float = 0.0) -> Dict:
+    """Debit the stake at bet placement. Raises InsufficientFundsError if
+    the debit would breach `min_balance`. Caller should NOT also try to
+    insert the bet row first if this might fail — wrap the bet insert and
+    this call in a guard so we don't end up with a placed bet without a
+    matching ledger entry."""
+    if stake <= 0:
+        raise ValueError(f"stake must be > 0 (got {stake})")
+    return _record_account_transaction(
+        "bet_placed", -float(stake), bet_id=int(bet_id), min_balance=float(min_balance),
+    )
+
+
+def account_record_bet_won(bet_id: int, gross_payout: float) -> Dict:
+    """Credit the gross payout (stake + profit) at settlement. Allowed
+    even if it pushes the balance up (obviously) — credit-only path."""
+    if gross_payout <= 0:
+        raise ValueError(f"gross_payout must be > 0 (got {gross_payout})")
+    return _record_account_transaction(
+        "bet_won", float(gross_payout), bet_id=int(bet_id), allow_negative=True,
+    )
+
+
+def account_record_bet_lost(bet_id: int) -> Dict:
+    """Audit-only zero-amount entry. Stake was already debited at
+    placement, so a loss has no balance impact — but the row gives the
+    transaction log a complete history per bet_id."""
+    return _record_account_transaction(
+        "bet_lost", 0.0, bet_id=int(bet_id), allow_negative=True,
+    )
+
+
+def list_account_transactions(limit: int = 50) -> List[Dict]:
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT * FROM account_transactions ORDER BY created_at DESC, id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def account_balance_history() -> List[Dict]:
+    """Time-ordered (created_at, balance_after) sequence for the chart.
+    Smaller payload than list_account_transactions; ordering is ascending
+    so the frontend can plot directly."""
+    c = _conn_or_init()
+    rows = c.execute(
+        """SELECT created_at, balance_after, type
+             FROM account_transactions
+            ORDER BY created_at ASC, id ASC""",
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def account_bet_was_funded(bet_id: int) -> bool:
+    """True if a bet_placed row exists for this bet_id — i.e. the bet was
+    placed under account_mode and its settlement should hit the ledger.
+    Settlements of bets placed before account_mode was enabled are silently
+    skipped so we don't credit phantom money to the virtual account."""
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT 1 FROM account_transactions WHERE bet_id = ? AND type = 'bet_placed' LIMIT 1",
+        (int(bet_id),),
+    ).fetchone()
+    return row is not None
+
+
+def account_transaction_count() -> int:
+    c = _conn_or_init()
+    row = c.execute("SELECT COUNT(*) AS n FROM account_transactions").fetchone()
+    return int(row["n"] or 0)
 
 
 def upsert_historical_actual(city: str, target_date: str, actual_max_f: float, source: str) -> None:
