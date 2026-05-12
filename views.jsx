@@ -3007,6 +3007,7 @@ function CortexPanel() {
   const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
     ? window.__BETS_API__ : '';
   const containerRef = React.useRef(null);
+  const stageRef = React.useRef(null);
   const graphRef = React.useRef(null);
   const focusBoxRef = React.useRef(null);
   const [data, setData] = useState_v(null);
@@ -3014,6 +3015,18 @@ function CortexPanel() {
   const [libReady, setLibReady] = useState_v(
     typeof window !== 'undefined' && !!window.ForceGraph3D && !!window.THREE
   );
+
+  // Capture wheel events over the 3D stage so scrolling zooms the
+  // visualization instead of scrolling the page. React's synthetic
+  // onWheel is passive in modern React, so we attach a native listener
+  // with {passive: false} to be able to preventDefault().
+  React.useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const handler = (e) => { e.preventDefault(); };
+    el.addEventListener('wheel', handler, { passive: false });
+    return () => el.removeEventListener('wheel', handler);
+  }, []);
 
   // Poll the lib globals — they load async via CDN.
   React.useEffect(() => {
@@ -3240,7 +3253,7 @@ function CortexPanel() {
         </span>
       </div>
       <div className="cortex-wrap" style={{ padding: 12 }}>
-        <div className="cortex-stage">
+        <div className="cortex-stage" ref={stageRef}>
           {!libReady && (
             <div className="cortex-loading">loading three.js…</div>
           )}
