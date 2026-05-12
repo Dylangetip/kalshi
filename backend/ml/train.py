@@ -106,12 +106,42 @@ _GBM_SPACE = {
 }
 
 
+_SPACES_BY_ALGO = {
+    "ridge": _RIDGE_SPACE,
+    "rf":    _RF_SPACE,
+    "gbm":   _GBM_SPACE,
+}
+
+
+def _in_range(values, lo, hi):
+    """Subset of a discrete space inside [lo, hi]. Falls back to the full
+    space if the intersection is empty — defensive against stale focus
+    regions whose bounds no longer match the current search space."""
+    sub = [v for v in values if lo <= v <= hi]
+    return sub if sub else list(values)
+
+
 def sample_random_hyperparams(algorithm_weights: Optional[Dict[str, float]] = None,
-                                rng=None) -> Dict:
+                                rng=None,
+                                focus_region: Optional[Dict] = None,
+                                exploit_pct: float = 0.7) -> Dict:
     """Pick (algorithm, hyperparams) for one sweep candidate.
+
     algorithm_weights: {ridge, rf, gbm} → float; normalised internally.
-    Returns {"algorithm": str, "hyperparams": dict}. Caller is responsible
-    for fingerprint-dedup before training."""
+    focus_region: when present, biases the sampler toward a bounding box
+                  in hyperparam space. Shape:
+                    {algorithm: "gbm", ranges: {k: [lo, hi], ...}}
+                  Only engages when (a) focus_region is supplied AND
+                  (b) the sampled algorithm matches focus_region.algorithm
+                  AND (c) rng.random() < exploit_pct. Otherwise falls
+                  through to the full uniform random search.
+    exploit_pct:  probability of exploiting (sampling from focus region)
+                  when applicable. Default 0.7 keeps a 30% exploration
+                  floor so the sampler can never get permanently stuck.
+
+    Returns {"algorithm": str, "hyperparams": dict, "source": str} where
+    source ∈ {"focus", "explore"} so the sweep loop can log which branch
+    fired. Caller is responsible for fingerprint-dedup before training."""
     import random as _random
     rng = rng or _random
     weights = algorithm_weights or {"ridge": 0.10, "rf": 0.20, "gbm": 0.70}
@@ -119,7 +149,6 @@ def sample_random_hyperparams(algorithm_weights: Optional[Dict[str, float]] = No
     raw = [max(0.0, float(weights[a] or 0.0)) for a in algos]
     total = sum(raw) or 1.0
     probs = [w / total for w in raw]
-    # Weighted choice without numpy (sweep loop runs in worker thread).
     pick = rng.random()
     acc = 0.0
     algo = algos[-1]
@@ -128,13 +157,28 @@ def sample_random_hyperparams(algorithm_weights: Optional[Dict[str, float]] = No
         if pick <= acc:
             algo = a
             break
-    if algo == "ridge":
-        params = {"alpha": rng.choice(_RIDGE_SPACE["alpha"])}
-    elif algo == "rf":
-        params = {k: rng.choice(v) for k, v in _RF_SPACE.items()}
-    else:  # gbm
-        params = {k: rng.choice(v) for k, v in _GBM_SPACE.items()}
-    return {"algorithm": algo, "hyperparams": params}
+    space = _SPACES_BY_ALGO.get(algo) or _GBM_SPACE
+    # Decide focus vs explore.
+    use_focus = (
+        focus_region is not None
+        and focus_region.get("algorithm") == algo
+        and isinstance(focus_region.get("ranges"), dict)
+        and rng.random() < float(exploit_pct)
+    )
+    if use_focus:
+        ranges = focus_region["ranges"]
+        params = {}
+        for k, full_values in space.items():
+            r = ranges.get(k)
+            if r and isinstance(r, (list, tuple)) and len(r) == 2:
+                params[k] = rng.choice(_in_range(full_values, r[0], r[1]))
+            else:
+                params[k] = rng.choice(full_values)
+        source = "focus"
+    else:
+        params = {k: rng.choice(v) for k, v in space.items()}
+        source = "explore"
+    return {"algorithm": algo, "hyperparams": params, "source": source}
 
 
 def _fit_with_params(algorithm: str, params: Dict, X_train, y_train, X_test, y_test) -> Dict:

@@ -2992,6 +2992,352 @@ function MissionControlWhatsWorking({ topRuns }) {
 }
 
 
+// ── Model Cortex (3D sweep visualization) ────────────────────────────
+// Renders every trained sweep candidate as a node in 3D hyperparam
+// space using three.js / 3d-force-graph (CDN globals: THREE,
+// ForceGraph3D). Champion-lineage edges glow, KNN edges form clusters.
+// The current focus region is drawn as a translucent wireframe box.
+//
+// Side panel surfaces:
+//   - aggregate stats (total, best, median, algo breakdown)
+//   - focus region ranges with bars showing how tight each dim is
+//   - selected node card on click
+//   - pattern callouts auto-extracted from top-K
+function CortexPanel() {
+  const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
+    ? window.__BETS_API__ : '';
+  const containerRef = React.useRef(null);
+  const graphRef = React.useRef(null);
+  const focusBoxRef = React.useRef(null);
+  const [data, setData] = useState_v(null);
+  const [selected, setSelected] = useState_v(null);
+  const [libReady, setLibReady] = useState_v(
+    typeof window !== 'undefined' && !!window.ForceGraph3D && !!window.THREE
+  );
+
+  // Poll the lib globals — they load async via CDN.
+  React.useEffect(() => {
+    if (libReady) return;
+    let t = 0;
+    const id = setInterval(() => {
+      t += 200;
+      if (window.ForceGraph3D && window.THREE) {
+        setLibReady(true);
+        clearInterval(id);
+      } else if (t > 8000) {
+        clearInterval(id);
+      }
+    }, 200);
+    return () => clearInterval(id);
+  }, [libReady]);
+
+  // Fetch loop.
+  React.useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const r = await fetch(apiBase + '/api/ml/cortex?limit=600', { cache: 'no-store' });
+        if (!cancelled && r.ok) setData(await r.json());
+      } catch {}
+    };
+    refresh();
+    const id = setInterval(refresh, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [apiBase]);
+
+  // Color ramp: green (low MAE) → red (high MAE).
+  const colorFor = React.useCallback((mae, lo, hi) => {
+    if (mae == null || lo == null || hi == null || hi === lo) return '#7aa674';
+    const t = Math.max(0, Math.min(1, (mae - lo) / (hi - lo)));
+    const hue = (1 - t) * 130;  // 130=green, 0=red
+    return `hsl(${hue.toFixed(0)}, 60%, 55%)`;
+  }, []);
+
+  // Mount the 3D graph once both the container and lib are ready.
+  React.useEffect(() => {
+    if (!libReady || !containerRef.current || graphRef.current) return;
+    const FG = window.ForceGraph3D;
+    const g = FG()(containerRef.current)
+      .backgroundColor('rgba(0,0,0,0)')
+      .showNavInfo(false)
+      .nodeRelSize(4)
+      .nodeOpacity(0.95)
+      .linkOpacity(0.4)
+      .linkWidth(l => l.kind === 'champion_lineage' ? 1.6 : 0.4)
+      .linkColor(l => l.kind === 'champion_lineage' ? '#4a9eff' : '#888888')
+      .nodeLabel(n => {
+        const hp = n.hyperparams ? Object.entries(n.hyperparams).map(([k, v]) => `${k}=${v}`).join(' ') : '';
+        return `${n.algorithm}<br/>wf=${(n.wf_mae || 0).toFixed(3)}<br/>${hp}`;
+      })
+      .onNodeClick(n => {
+        setSelected(n);
+        const d = 100;
+        const distRatio = 1 + d / Math.hypot(n.x || 1, n.y || 1, n.z || 1);
+        g.cameraPosition(
+          { x: (n.x || 0) * distRatio, y: (n.y || 0) * distRatio, z: (n.z || 0) * distRatio },
+          n, 800
+        );
+      });
+    // Slow auto-orbit.
+    let angle = 0;
+    const orbitTimer = setInterval(() => {
+      if (!graphRef.current) return;
+      angle += Math.PI / 600;
+      const dist = 220;
+      try {
+        g.cameraPosition({ x: dist * Math.sin(angle), y: 40, z: dist * Math.cos(angle) });
+      } catch {}
+    }, 50);
+    graphRef.current = { g, orbitTimer };
+    return () => {
+      clearInterval(orbitTimer);
+      try { g._destructor && g._destructor(); } catch {}
+      graphRef.current = null;
+    };
+  }, [libReady]);
+
+  // Push data into the graph each time the response changes.
+  React.useEffect(() => {
+    const wrap = graphRef.current;
+    if (!wrap || !data) return;
+    const g = wrap.g;
+    const THREE = window.THREE;
+    const all = data.nodes.map(n => n.wf_mae).filter(v => v != null);
+    const lo = Math.min(...all);
+    const hi = Math.max(...all);
+    const nodes = data.nodes.map(n => ({
+      ...n,
+      // 3d-force-graph respects pre-set x/y/z if fx/fy/fz are also given.
+      fx: n.x * 12, fy: n.y * 12, fz: n.z * 12,
+      color: n.is_champion ? '#4a9eff' : colorFor(n.wf_mae, lo, hi),
+      val: Math.max(2, 8 / Math.max(0.1, n.wf_mae)),
+    }));
+    g.graphData({ nodes, links: data.edges });
+    // Custom node geometry: cube for rf, tetrahedron for ridge, sphere for gbm.
+    g.nodeThreeObject(n => {
+      let geom;
+      if (n.algo === 'rf') geom = new THREE.BoxGeometry(4, 4, 4);
+      else if (n.algo === 'ridge') geom = new THREE.TetrahedronGeometry(3);
+      else geom = new THREE.SphereGeometry(3, 12, 12);
+      const mat = new THREE.MeshLambertMaterial({
+        color: n.color, emissive: n.color, emissiveIntensity: n.is_champion ? 0.8 : 0.3,
+        transparent: true, opacity: 0.95,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      const scale = n.is_champion ? 1.6 : 1.0;
+      mesh.scale.set(scale, scale, scale);
+      return mesh;
+    });
+    // Draw / update focus-region wireframe.
+    const scene = g.scene();
+    if (focusBoxRef.current) {
+      scene.remove(focusBoxRef.current);
+      focusBoxRef.current = null;
+    }
+    const fr = data.focus_region;
+    if (fr && fr.ranges && fr.algorithm) {
+      // Compute the box corners in scene coords using _cortex_coords-style logic.
+      const log10 = x => Math.log(Math.max(1e-6, x)) / Math.LN10;
+      let xs, ys, zs;
+      if (fr.algorithm === 'gbm') {
+        xs = fr.ranges.max_depth || [2, 5];
+        ys = (fr.ranges.learning_rate || [0.01, 0.1]).map(log10);
+        zs = (fr.ranges.n_estimators || [100, 800]).map(log10);
+      } else if (fr.algorithm === 'rf') {
+        xs = fr.ranges.max_depth || [4, 16];
+        ys = fr.ranges.min_samples_leaf || [1, 5];
+        zs = (fr.ranges.n_estimators || [200, 800]).map(log10);
+      } else {
+        xs = (fr.ranges.alpha || [0.1, 30]).map(log10);
+        ys = [-0.5, 0.5]; zs = [-0.5, 0.5];
+      }
+      const w = (xs[1] - xs[0]) * 12 || 1;
+      const h = (ys[1] - ys[0]) * 12 || 1;
+      const d = (zs[1] - zs[0]) * 12 || 1;
+      const cx = ((xs[0] + xs[1]) / 2) * 12;
+      const cy = ((ys[0] + ys[1]) / 2) * 12;
+      const cz = ((zs[0] + zs[1]) / 2) * 12;
+      const boxGeom = new THREE.BoxGeometry(Math.abs(w), Math.abs(h), Math.abs(d));
+      const edges = new THREE.EdgesGeometry(boxGeom);
+      const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+        color: 0x4a9eff, transparent: true, opacity: 0.5,
+      }));
+      line.position.set(cx, cy, cz);
+      scene.add(line);
+      focusBoxRef.current = line;
+    }
+  }, [data, colorFor]);
+
+  // Pattern callouts: for each hyperparam dim that appears in ≥70% of
+  // the top-K, surface the most-common value.
+  const topK = React.useMemo(() => {
+    if (!data?.nodes) return [];
+    return [...data.nodes].filter(n => n.wf_mae != null && n.hyperparams)
+                          .sort((a, b) => a.wf_mae - b.wf_mae)
+                          .slice(0, 10);
+  }, [data]);
+  const patterns = React.useMemo(() => {
+    if (topK.length < 3) return [];
+    const dimC = {}, dimN = {};
+    topK.forEach(n => {
+      Object.entries(n.hyperparams || {}).forEach(([k, v]) => {
+        dimN[k] = (dimN[k] || 0) + 1;
+        dimC[k] = dimC[k] || {};
+        const s = String(v);
+        dimC[k][s] = (dimC[k][s] || 0) + 1;
+      });
+    });
+    const out = [];
+    Object.entries(dimC).forEach(([k, vals]) => {
+      const sorted = Object.entries(vals).sort((a, b) => b[1] - a[1]);
+      const [val, n] = sorted[0];
+      if (n >= Math.max(3, Math.ceil(topK.length * 0.7))) {
+        out.push({ dim: k, val, n, total: dimN[k] });
+      }
+    });
+    return out;
+  }, [topK]);
+
+  // Render
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span>Model Cortex</span>
+        <span className="panel-title-actions">
+          3D hyperparam space · auto-orbits · click any node
+        </span>
+      </div>
+      <div className="cortex-wrap" style={{ padding: 12 }}>
+        <div className="cortex-stage">
+          {!libReady && (
+            <div className="cortex-loading">loading three.js…</div>
+          )}
+          {libReady && !data && (
+            <div className="cortex-loading">no candidates yet — run sweep</div>
+          )}
+          <div className="cortex-canvas" ref={containerRef} />
+          {data && (
+            <div className="cortex-overlay">
+              <span className="pill info" style={{ background: 'rgba(74,158,255,0.15)' }}>
+                {data.nodes.length} nodes · {data.edges.length} edges
+              </span>
+              {data.focus_region && (
+                <span className="pill pos">
+                  focus engaged · top {data.focus_region.candidate_count}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="cortex-side">
+          <div className="panel">
+            <div className="panel-header">
+              <span>Stats</span>
+              <span className="panel-title-actions">{data?.nodes.length ?? 0} candidates</span>
+            </div>
+            <div>
+              {data?.stats && (
+                <>
+                  <div className="cortex-stat-row"><span className="lbl">best wf MAE</span><span className="pos">{data.stats.best_wf_mae?.toFixed(3) ?? '—'}</span></div>
+                  <div className="cortex-stat-row"><span className="lbl">median</span><span>{data.stats.median_wf_mae?.toFixed(3) ?? '—'}</span></div>
+                  <div className="cortex-stat-row"><span className="lbl">worst</span><span style={{ color: 'var(--fg-3)' }}>{data.stats.worst_wf_mae?.toFixed(3) ?? '—'}</span></div>
+                  <div className="cortex-stat-row" style={{ marginTop: 8 }}><span className="lbl">algo mix</span><span>
+                    {Object.entries(data.stats.algo_breakdown).map(([a, n]) => `${a}:${n}`).join(' · ')}
+                  </span></div>
+                  {(() => {
+                    const total = Object.values(data.stats.algo_breakdown).reduce((a, b) => a + b, 0) || 1;
+                    return (
+                      <div className="cortex-algo-bar">
+                        {['gbm', 'rf', 'ridge'].map(a => {
+                          const n = data.stats.algo_breakdown[a] || 0;
+                          if (!n) return null;
+                          return <span key={a} className={a} style={{ width: `${(n/total*100).toFixed(1)}%` }} />;
+                        })}
+                      </div>
+                    );
+                  })()}
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-header">
+              <span>Focus region</span>
+              <span className="panel-title-actions">
+                {data?.focus_config?.enabled ? `exploit ${Math.round(data.focus_config.exploit_pct * 100)}%` : 'disabled'}
+              </span>
+            </div>
+            <div>
+              {!data?.focus_region ? (
+                <div style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+                  Engages after {data?.focus_config?.min_candidates ?? 50} trained candidates.
+                  Currently {data?.stats?.total ?? 0}.
+                </div>
+              ) : (
+                <>
+                  <div className="cortex-stat-row" style={{ marginBottom: 6 }}>
+                    <span className="lbl">algo</span><span className="mono">{data.focus_region.algorithm}</span>
+                  </div>
+                  <div className="cortex-stat-row" style={{ marginBottom: 8 }}>
+                    <span className="lbl">members</span><span className="mono">{data.focus_region.candidate_count}</span>
+                  </div>
+                  {Object.entries(data.focus_region.ranges).map(([dim, [lo, hi]]) => (
+                    <div key={dim} className="cortex-range-row">
+                      <span>{dim}</span>
+                      <div className="cortex-range-bar">
+                        <span style={{ left: 0, width: '100%' }} />
+                      </div>
+                      <span>{lo}</span>
+                      <span style={{ textAlign: 'right' }}>{hi}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
+
+          {patterns.length > 0 && (
+            <div className="panel">
+              <div className="panel-header"><span>Patterns</span></div>
+              <div>
+                {patterns.map(p => (
+                  <div key={p.dim} className="cortex-callout">
+                    <span className="pos">{p.n}/{p.total}</span> of top-{topK.length} use <span style={{ color: 'var(--fg-1)' }}>{p.dim}={p.val}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {selected && (
+            <div className="panel">
+              <div className="panel-header">
+                <span>Selected</span>
+                <button className="ct-toggle" onClick={() => setSelected(null)} style={{ background: 'transparent', color: 'var(--fg-3)', border: 'none', cursor: 'pointer' }}>×</button>
+              </div>
+              <div>
+                <div className="cortex-stat-row"><span className="lbl">id</span><span className="mono">#{selected.id}</span></div>
+                <div className="cortex-stat-row"><span className="lbl">algo</span><span className="mono">{selected.algorithm}</span></div>
+                <div className="cortex-stat-row"><span className="lbl">wf MAE</span><span className="mono pos">{selected.wf_mae?.toFixed(3)}</span></div>
+                <div className="cortex-stat-row"><span className="lbl">test MAE</span><span className="mono">{selected.test_mae?.toFixed(3) ?? '—'}</span></div>
+                <div className="cortex-stat-row"><span className="lbl">role</span><span className="mono">{selected.role}{selected.is_champion ? ' ★' : ''}</span></div>
+                <div className="cortex-stat-row" style={{ marginTop: 8 }}><span className="lbl">hyperparams</span></div>
+                {selected.hyperparams && Object.entries(selected.hyperparams).map(([k, v]) => (
+                  <div key={k} className="cortex-stat-row mono" style={{ paddingLeft: 8 }}>
+                    <span className="lbl">{k}</span><span>{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill, onMlTrain, onModelConfig }) {
   const apiBase = (typeof window !== 'undefined' && window.__BETS_API__ != null)
     ? window.__BETS_API__ : '';
@@ -3045,6 +3391,7 @@ function MlView({ mlInfo, accuracy, diagnostics, events, modelDiff, onMlBackfill
         onStart={() => sendSweep('start')}
       />
       <MissionControlChampion status={sweepStatus} />
+      <CortexPanel />
       <MissionControlStream events={sweepEvents} />
 
       <MissionControlTrendChart runs={recentRuns} />

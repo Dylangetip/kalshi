@@ -695,3 +695,78 @@ input:focus, select:focus { border-color: var(--accent); }
 /* Algorithm legend */
 .mc-legend { display: flex; gap: 12px; font-size: 11px; color: var(--fg-2); }
 .mc-legend .mc-legend-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+
+/* ── Model Cortex (3D sweep visualization) ────────────────────────────
+   Two-column layout: 3D stage on the left, side rail on the right.
+   The three.js scene fills its container; we set explicit height. */
+
+.cortex-wrap {
+  display: grid;
+  grid-template-columns: 1.6fr 1fr;
+  gap: 14px;
+}
+.cortex-stage {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--rad);
+  position: relative;
+  overflow: hidden;
+  min-height: 520px;
+  height: 580px;
+}
+.cortex-stage .cortex-canvas { width: 100%; height: 100%; }
+.cortex-stage .cortex-overlay {
+  position: absolute; top: 10px; left: 12px;
+  display: flex; gap: 8px; align-items: center;
+  pointer-events: none;
+  z-index: 2;
+}
+.cortex-stage .cortex-overlay .pill { pointer-events: auto; }
+.cortex-stage .cortex-loading {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--fg-3); font-family: var(--mono); font-size: 12px;
+}
+
+.cortex-side {
+  display: flex; flex-direction: column; gap: 10px;
+  font-size: 12px;
+}
+.cortex-side .panel { padding-bottom: 8px; }
+.cortex-side .panel > div:not(.panel-header) { padding: 12px 14px; }
+.cortex-side .cortex-stat-row {
+  display: flex; justify-content: space-between; margin-bottom: 4px;
+  font-family: var(--mono);
+}
+.cortex-side .cortex-stat-row .lbl { color: var(--fg-3); }
+.cortex-side .cortex-range-row {
+  display: grid; grid-template-columns: 110px 1fr 60px 60px;
+  gap: 8px; align-items: center; margin-bottom: 4px;
+  font-family: var(--mono); font-size: 11px;
+}
+.cortex-side .cortex-range-bar {
+  position: relative; height: 6px; background: var(--bg-3);
+  border-radius: 3px; overflow: hidden;
+}
+.cortex-side .cortex-range-bar > span {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--accent); opacity: 0.7;
+  border-radius: 3px;
+}
+
+.cortex-side .cortex-algo-bar {
+  height: 6px; background: var(--bg-3); border-radius: 3px;
+  overflow: hidden; display: flex; margin-top: 4px;
+}
+.cortex-side .cortex-algo-bar > span { height: 100%; }
+.cortex-side .cortex-algo-bar > span.gbm   { background: var(--accent); }
+.cortex-side .cortex-algo-bar > span.rf    { background: var(--warn); }
+.cortex-side .cortex-algo-bar > span.ridge { background: var(--info); }
+
+.cortex-side .cortex-callout {
+  background: var(--bg-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-2);
+  margin-bottom: 4px;
+}
+.cortex-side .cortex-callout .pos { color: var(--accent); }

@@ -212,6 +212,17 @@ _auto_trade_state: Dict = {
         float(os.getenv("BETS_CITY_CONF_SKIP_ABOVE"))
         if os.getenv("BETS_CITY_CONF_SKIP_ABOVE") else None
     ),
+    # Auto-adaptive sampler. After sweep_focus_min_candidates have been
+    # trained, the next pick is biased toward the bounding box of the
+    # current top-K runs (`sweep_focus_exploit_pct` of the time);
+    # otherwise it samples the full hyperparam space (exploration). The
+    # exploration floor prevents the sampler from getting stuck in a
+    # local basin if the early winners were lucky.
+    "sweep_focus_enabled": os.getenv("BETS_SWEEP_FOCUS_ENABLED", "1") == "1",
+    "sweep_focus_top_k": int(os.getenv("BETS_SWEEP_FOCUS_TOP_K", "10")),
+    "sweep_focus_exploit_pct": float(os.getenv("BETS_SWEEP_FOCUS_EXPLOIT", "0.7")),
+    "sweep_focus_min_candidates": int(os.getenv("BETS_SWEEP_FOCUS_MIN", "50")),
+    "sweep_focus_region": None,
     # Bet-sizing strategy:
     #   "kelly" — size = round(kelly_fraction * available_cash), clamped to
     #             [min_usd, max_usd]. Theoretically optimal but the dollar
@@ -796,6 +807,92 @@ async def _snapshot_loop() -> None:
         await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
 
 
+def _recompute_sweep_focus_region(cfg: Dict) -> Optional[Dict]:
+    """Compute the bounding box of the top-K runs by walk_forward_mae.
+    Returns the focus_region dict (or None) and stores it on cfg.
+
+    Algo-aware: picks the dominant algorithm in the top-K, then takes
+    the min/max of each hyperparam dimension among that algo's top-K
+    rows. The sampler uses these ranges only when it has already chosen
+    the dominant algorithm — RF picks still sample the full RF space.
+
+    Cold-start gate: returns None until at least sweep_focus_min_candidates
+    runs with a non-null walk_forward_mae exist."""
+    min_n = int(cfg.get("sweep_focus_min_candidates") or 50)
+    top_k = max(3, int(cfg.get("sweep_focus_top_k") or 10))
+    c = db._conn_or_init()
+    total = c.execute(
+        "SELECT COUNT(*) AS n FROM ml_runs WHERE walk_forward_mae IS NOT NULL "
+        "AND COALESCE(skipped, 0) = 0"
+    ).fetchone()["n"]
+    if total < min_n:
+        cfg["sweep_focus_region"] = None
+        return None
+    rows = c.execute(
+        """SELECT id, algorithm, walk_forward_mae, hyperparams
+             FROM ml_runs
+            WHERE walk_forward_mae IS NOT NULL
+              AND COALESCE(skipped, 0) = 0
+              AND hyperparams IS NOT NULL
+            ORDER BY walk_forward_mae ASC
+            LIMIT ?""",
+        (top_k,),
+    ).fetchall()
+    if not rows:
+        cfg["sweep_focus_region"] = None
+        return None
+    # Bucket by bare algorithm name (strip the "[a=1.0]" suffix).
+    def _bucket(algo_label: str) -> str:
+        a = (algo_label or "").lower()
+        if a.startswith("ridge"): return "ridge"
+        if a.startswith("rf"):    return "rf"
+        if a.startswith("gbm"):   return "gbm"
+        return "other"
+    by_algo: Dict[str, List[Dict]] = {}
+    for r in rows:
+        bucket = _bucket(r["algorithm"])
+        if bucket == "other":
+            continue
+        try:
+            hp = json.loads(r["hyperparams"]) if r["hyperparams"] else None
+        except Exception:  # noqa: BLE001
+            hp = None
+        if not hp:
+            continue
+        by_algo.setdefault(bucket, []).append({**dict(r), "hp": hp})
+    if not by_algo:
+        cfg["sweep_focus_region"] = None
+        return None
+    # Dominant algo = largest group; ties broken by best (lowest) MAE.
+    dom = max(
+        by_algo.items(),
+        key=lambda kv: (len(kv[1]), -min(r["walk_forward_mae"] for r in kv[1])),
+    )[0]
+    members = by_algo[dom]
+    # Compute per-dim bounding box.
+    dims: Dict[str, List[float]] = {}
+    for m in members:
+        for k, v in (m["hp"] or {}).items():
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                continue
+            d = dims.setdefault(k, [vf, vf])
+            if vf < d[0]: d[0] = vf
+            if vf > d[1]: d[1] = vf
+    region = {
+        "algorithm": dom,
+        "ranges": dims,
+        "candidate_count": len(members),
+        "best_wf_mae": round(float(min(r["walk_forward_mae"] for r in members)), 4),
+        "updated_at": int(time.time()),
+    }
+    cfg["sweep_focus_region"] = region
+    return region
+
+
 def _sweep_reset_today_counters_if_needed(cfg: Dict) -> None:
     """Reset the per-day counters at UTC midnight. Anchor stored as the
     ISO date of the most recent reset; comparing with today's UTC date
@@ -833,11 +930,22 @@ async def _ml_sweep_loop() -> None:
                 await asyncio.sleep(max(5, int(cfg.get("sweep_interval_seconds") or 60)))
                 continue
             # Pick a candidate up-front so the UI sees "currently training" right away.
+            # Auto-adaptive: pass the current focus region so the sampler can
+            # exploit observed good regions (with a 30% exploration floor).
             from .ml import train as _train_mod
-            pick = _train_mod.sample_random_hyperparams(cfg.get("sweep_algorithm_weights"))
+            focus_region = cfg.get("sweep_focus_region")
+            exploit_pct = float(cfg.get("sweep_focus_exploit_pct") or 0.7)
+            if not cfg.get("sweep_focus_enabled"):
+                focus_region = None
+            pick = _train_mod.sample_random_hyperparams(
+                cfg.get("sweep_algorithm_weights"),
+                focus_region=focus_region,
+                exploit_pct=exploit_pct,
+            )
             cfg["sweep_currently_training"] = {
                 "algorithm": pick["algorithm"],
                 "hyperparams": pick["hyperparams"],
+                "source": pick.get("source"),
                 "started_at": int(time.time()),
             }
             # Train in a thread so the event loop stays responsive.
@@ -941,6 +1049,16 @@ async def _ml_sweep_loop() -> None:
                         # archived, nothing to do.
                 except Exception as exc:  # noqa: BLE001
                     print(f"[ml-sweep] promotion logic failed: {exc}")
+                # Recompute the focus region for the NEXT pick. Best-effort —
+                # falling back to None is fine, the sampler defaults to full
+                # exploration when focus_region is None.
+                try:
+                    new_focus = _recompute_sweep_focus_region(cfg)
+                    if new_focus and result.get("status") == "ok":
+                        print(f"[ml-sweep] focus region: algo={new_focus['algorithm']}, "
+                              f"ranges={new_focus['ranges']}, best={new_focus['best_wf_mae']}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[ml-sweep] focus recompute failed: {exc}")
                 # One unified event for every trained candidate (the live
                 # stream in the UI reads from this).
                 db.log_ml_event(
@@ -952,6 +1070,7 @@ async def _ml_sweep_loop() -> None:
                      "walk_forward_mae": run_wf,
                      "test_mae": result.get("test_mae"),
                      "run_id": result.get("run_id"),
+                     "source": pick.get("source"),
                      "improvement_pct": round(-pct, 2) if pct is not None else None,
                      "metric_used": metric_used},
                     (f"sweep ✓ {result.get('algorithm')} "
@@ -1795,6 +1914,8 @@ _AUTO_TRADE_PERSIST_KEYS = (
     "city_confidence_enabled", "city_confidence_alpha",
     "min_city_confidence_factor", "max_city_confidence_factor",
     "max_city_mae_to_trade",
+    "sweep_focus_enabled", "sweep_focus_top_k", "sweep_focus_exploit_pct",
+    "sweep_focus_min_candidates", "sweep_focus_region",
 )
 
 
@@ -2874,6 +2995,155 @@ def ml_champion_rebuild(metric: str = "walk_forward_mae"):
         "new_algorithm": best["algorithm"],
         "rows_archived": archived,
         "metric": metric,
+    }
+
+
+def _cortex_coords(algo: str, hp: Dict) -> tuple:
+    """Map (algorithm, hyperparams) to a 3D coordinate. Algo-aware so each
+    algorithm sits in its own subspace; the frontend overlays all of them.
+    Returns (x, y, z) as floats."""
+    import math as _math
+    def _log10(v):
+        try: return _math.log10(max(1e-6, float(v)))
+        except (TypeError, ValueError): return 0.0
+    def _f(v, d=0.0):
+        try: return float(v)
+        except (TypeError, ValueError): return d
+    hp = hp or {}
+    if algo == "gbm":
+        return (
+            _f(hp.get("max_depth"), 3.0),
+            _log10(hp.get("learning_rate", 0.05)),
+            _log10(hp.get("n_estimators", 300)),
+        )
+    if algo == "rf":
+        return (
+            _f(hp.get("max_depth"), 10.0),
+            _f(hp.get("min_samples_leaf"), 3.0),
+            _log10(hp.get("n_estimators", 300)),
+        )
+    if algo == "ridge":
+        return (_log10(hp.get("alpha", 1.0)), 0.0, 0.0)
+    return (0.0, 0.0, 0.0)
+
+
+def _algo_bucket(algo_label: str) -> str:
+    a = (algo_label or "").lower()
+    if a.startswith("ridge"): return "ridge"
+    if a.startswith("rf"):    return "rf"
+    if a.startswith("gbm"):   return "gbm"
+    return "other"
+
+
+@app.get("/api/ml/cortex")
+def ml_cortex(limit: int = 500):
+    """Sweep visualization payload: every trained candidate as a 3D point
+    in hyperparam space, plus champion-lineage edges, k-nearest-neighbour
+    edges per algo, the current focus region, and aggregate stats.
+
+    The frontend renders this with three.js / 3d-force-graph. Polling
+    cadence is ~5s; the response is small enough (≤500 nodes by default,
+    capped at 2000) that diffing on the client is cheap.
+    """
+    import math as _math
+    capped = max(10, min(int(limit or 500), 2000))
+    c = db._conn_or_init()
+    rows = c.execute(
+        f"""SELECT id, trained_at, algorithm, walk_forward_mae, test_mae,
+                   hyperparams, role
+              FROM ml_runs
+             WHERE COALESCE(skipped, 0) = 0
+               AND walk_forward_mae IS NOT NULL
+             ORDER BY trained_at DESC, id DESC
+             LIMIT ?""",
+        (capped,),
+    ).fetchall()
+    nodes = []
+    for r in rows:
+        try:
+            hp = json.loads(r["hyperparams"]) if r["hyperparams"] else None
+        except Exception:  # noqa: BLE001
+            hp = None
+        algo = _algo_bucket(r["algorithm"])
+        x, y, z = _cortex_coords(algo, hp or {})
+        nodes.append({
+            "id": r["id"],
+            "algo": algo,
+            "algorithm": r["algorithm"],
+            "wf_mae": float(r["walk_forward_mae"]),
+            "test_mae": float(r["test_mae"]) if r["test_mae"] is not None else None,
+            "hyperparams": hp,
+            "trained_at": r["trained_at"],
+            "role": r["role"],
+            "is_champion": (r["role"] == "champion"),
+            "x": round(x, 4), "y": round(y, 4), "z": round(z, 4),
+        })
+    # Edges: champion lineage from model_promoted events.
+    edges: List[Dict] = []
+    node_ids = {n["id"] for n in nodes}
+    try:
+        events = db.list_ml_events(limit=200, kinds=["model_promoted"]) or []
+    except Exception:  # noqa: BLE001
+        events = []
+    for ev in events:
+        p = ev.get("payload") or {}
+        old_id, new_id = p.get("old_id"), p.get("new_id")
+        if old_id and new_id and old_id in node_ids and new_id in node_ids:
+            edges.append({"source": int(old_id), "target": int(new_id),
+                          "kind": "champion_lineage"})
+    # KNN edges per algo bucket. k=3, same algo only — cross-algo edges
+    # would imply spatial proximity that doesn't exist in our overlaid
+    # subspaces.
+    by_algo: Dict[str, List[Dict]] = {}
+    for n in nodes:
+        by_algo.setdefault(n["algo"], []).append(n)
+    for algo, group in by_algo.items():
+        if len(group) < 2:
+            continue
+        for n in group:
+            dists = []
+            for m in group:
+                if m["id"] == n["id"]:
+                    continue
+                dx = n["x"] - m["x"]; dy = n["y"] - m["y"]; dz = n["z"] - m["z"]
+                dists.append((dx*dx + dy*dy + dz*dz, m["id"]))
+            dists.sort()
+            for _, mid in dists[:3]:
+                # Dedup undirected pairs: keep (min,max).
+                a, b = (n["id"], mid) if n["id"] < mid else (mid, n["id"])
+                edges.append({"source": a, "target": b, "kind": "knn"})
+    # Dedup edges (champion_lineage takes priority over knn for the same
+    # pair).
+    seen = {}
+    for e in edges:
+        a, b = sorted((e["source"], e["target"]))
+        key = (a, b)
+        if key not in seen or e["kind"] == "champion_lineage":
+            seen[key] = e
+    edges = list(seen.values())
+    # Stats + algo breakdown.
+    all_wfm = [n["wf_mae"] for n in nodes if n["wf_mae"] is not None]
+    algo_counts: Dict[str, int] = {}
+    for n in nodes:
+        algo_counts[n["algo"]] = algo_counts.get(n["algo"], 0) + 1
+    stats = {
+        "total": len(nodes),
+        "best_wf_mae": round(min(all_wfm), 4) if all_wfm else None,
+        "median_wf_mae": round(sorted(all_wfm)[len(all_wfm) // 2], 4) if all_wfm else None,
+        "worst_wf_mae": round(max(all_wfm), 4) if all_wfm else None,
+        "algo_breakdown": algo_counts,
+    }
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "focus_region": _auto_trade_state.get("sweep_focus_region"),
+        "focus_config": {
+            "enabled": bool(_auto_trade_state.get("sweep_focus_enabled")),
+            "top_k": int(_auto_trade_state.get("sweep_focus_top_k") or 10),
+            "exploit_pct": float(_auto_trade_state.get("sweep_focus_exploit_pct") or 0.7),
+            "min_candidates": int(_auto_trade_state.get("sweep_focus_min_candidates") or 50),
+        },
+        "stats": stats,
     }
 
 
