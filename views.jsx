@@ -3057,40 +3057,49 @@ function CortexPanel() {
   React.useEffect(() => {
     if (!libReady || !containerRef.current || graphRef.current) return;
     const FG = window.ForceGraph3D;
+    const THREE = window.THREE;
     const g = FG()(containerRef.current)
       .backgroundColor('rgba(0,0,0,0)')
       .showNavInfo(false)
-      .nodeRelSize(4)
-      .nodeOpacity(0.95)
-      .linkOpacity(0.4)
+      .nodeOpacity(1)
+      .linkOpacity(0.35)
       .linkWidth(l => l.kind === 'champion_lineage' ? 1.6 : 0.4)
-      .linkColor(l => l.kind === 'champion_lineage' ? '#4a9eff' : '#888888')
+      .linkColor(l => l.kind === 'champion_lineage' ? '#4a9eff' : '#666666')
       .nodeLabel(n => {
         const hp = n.hyperparams ? Object.entries(n.hyperparams).map(([k, v]) => `${k}=${v}`).join(' ') : '';
         return `${n.algorithm}<br/>wf=${(n.wf_mae || 0).toFixed(3)}<br/>${hp}`;
       })
       .onNodeClick(n => {
         setSelected(n);
-        const d = 100;
+        const d = 80;
         const distRatio = 1 + d / Math.hypot(n.x || 1, n.y || 1, n.z || 1);
         g.cameraPosition(
           { x: (n.x || 0) * distRatio, y: (n.y || 0) * distRatio, z: (n.z || 0) * distRatio },
           n, 800
         );
       });
-    // Slow auto-orbit.
-    let angle = 0;
-    const orbitTimer = setInterval(() => {
-      if (!graphRef.current) return;
-      angle += Math.PI / 600;
-      const dist = 220;
-      try {
-        g.cameraPosition({ x: dist * Math.sin(angle), y: 40, z: dist * Math.cos(angle) });
-      } catch {}
-    }, 50);
-    graphRef.current = { g, orbitTimer };
+    // Subtle scene fog so distant nodes fade out — adds depth perception
+    // without darkening close-up clusters.
+    try {
+      g.scene().fog = new THREE.Fog(0x0a0d12, 200, 800);
+    } catch {}
+    // Smooth auto-rotate via OrbitControls' built-in autoRotate. The
+    // controls naturally pause while the user drags / zooms and resume
+    // after a brief idle — no fighting the user's mouse like my prior
+    // setInterval was doing.
+    try {
+      const controls = g.controls();
+      if (controls) {
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = 0.45;       // ~0.45 = leisurely
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.12;         // momentum on release
+        controls.rotateSpeed = 0.7;
+        controls.zoomSpeed = 1.2;
+      }
+    } catch {}
+    graphRef.current = { g };
     return () => {
-      clearInterval(orbitTimer);
       try { g._destructor && g._destructor(); } catch {}
       graphRef.current = null;
     };
@@ -3113,20 +3122,43 @@ function CortexPanel() {
       val: Math.max(2, 8 / Math.max(0.1, n.wf_mae)),
     }));
     g.graphData({ nodes, links: data.edges });
-    // Custom node geometry: cube for rf, tetrahedron for ridge, sphere for gbm.
+    // Glowing orb: a bright solid core wrapped in two additive-blended
+    // halos. Looks like a luminescent neuron without postprocessing.
+    // Algo distinction lives in the side panel + node label; visually
+    // every node reads as the same kind of orb so the scene feels like
+    // a single coherent constellation.
     g.nodeThreeObject(n => {
-      let geom;
-      if (n.algo === 'rf') geom = new THREE.BoxGeometry(4, 4, 4);
-      else if (n.algo === 'ridge') geom = new THREE.TetrahedronGeometry(3);
-      else geom = new THREE.SphereGeometry(3, 12, 12);
-      const mat = new THREE.MeshLambertMaterial({
-        color: n.color, emissive: n.color, emissiveIntensity: n.is_champion ? 0.8 : 0.3,
-        transparent: true, opacity: 0.95,
-      });
-      const mesh = new THREE.Mesh(geom, mat);
-      const scale = n.is_champion ? 1.6 : 1.0;
-      mesh.scale.set(scale, scale, scale);
-      return mesh;
+      const color = new THREE.Color(n.color);
+      const grp = new THREE.Group();
+      // Bright inner core — MeshBasicMaterial ignores lighting so the
+      // color is always saturated regardless of fog / scene lights.
+      const core = new THREE.Mesh(
+        new THREE.SphereGeometry(2.4, 16, 16),
+        new THREE.MeshBasicMaterial({ color })
+      );
+      // Inner halo — additive blending makes overlapping halos bloom
+      // brighter, mimicking real glow.
+      const halo = new THREE.Mesh(
+        new THREE.SphereGeometry(4.4, 16, 16),
+        new THREE.MeshBasicMaterial({
+          color, transparent: true, opacity: 0.28,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        })
+      );
+      // Outer halo — broader and fainter for a soft falloff.
+      const outer = new THREE.Mesh(
+        new THREE.SphereGeometry(8, 16, 16),
+        new THREE.MeshBasicMaterial({
+          color, transparent: true, opacity: 0.09,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        })
+      );
+      grp.add(outer); grp.add(halo); grp.add(core);
+      // Size by quality; champion glows extra-bright via larger scale.
+      const baseScale = Math.max(0.6, Math.min(1.6, 1.1 / Math.max(0.1, n.wf_mae)));
+      const scale = n.is_champion ? baseScale * 1.45 : baseScale;
+      grp.scale.set(scale, scale, scale);
+      return grp;
     });
     // Draw / update focus-region wireframe.
     const scene = g.scene();
