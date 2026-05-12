@@ -889,9 +889,13 @@ async def _ml_sweep_loop() -> None:
                 best_today = cfg.get("sweep_best_today")
                 if wf is not None and (best_today is None or wf < best_today):
                     cfg["sweep_best_today"] = round(float(wf), 4)
-                # Promotion gate — reuse the existing ≥5% / >20% logic.
+                # Promotion gate. The new run was inserted with role='archived'
+                # so the only path to champion is an explicit promote here.
+                # Promote if the new run beats the *current* champion's
+                # walk-forward MAE by ANY amount (no 5% gate — sweep wins
+                # are usually small, gating them away wastes good models).
                 champ_rows = db.list_runs_by_role("champion", limit=1)
-                champion = champ_rows[0] if champ_rows else db.latest_ml_run()
+                champion = champ_rows[0] if champ_rows else None
                 run_wf = wf
                 prev_wf = (champion or {}).get("walk_forward_mae")
                 metric_used = "walk_forward_mae" if (prev_wf is not None and run_wf is not None) else "test_mae"
@@ -899,14 +903,26 @@ async def _ml_sweep_loop() -> None:
                 run_v = run_wf if metric_used == "walk_forward_mae" else result.get("test_mae")
                 promoted = False
                 pct = None
-                if champion and champion.get("id") != result.get("run_id") and prev_v and run_v:
-                    delta = run_v - prev_v
-                    pct = (delta / prev_v) * 100 if prev_v else 0.0
-                    improved_pct = -pct
-                    try:
-                        if improved_pct >= 5.0:
+                try:
+                    # Bootstrap: no current champion → promote unconditionally.
+                    if not champion and run_v is not None:
+                        db.update_ml_run_role(result["run_id"], "champion")
+                        promoted = True
+                        cfg["sweep_improvements_today"] = int(cfg.get("sweep_improvements_today") or 0) + 1
+                        db.log_ml_event(
+                            "model_promoted",
+                            {"new_id": result["run_id"], "old_id": None,
+                             "bootstrap": True, "metric_used": metric_used},
+                            f"bootstrap champion — first run with {metric_used}",
+                        )
+                    elif champion and prev_v is not None and run_v is not None:
+                        delta = run_v - prev_v
+                        pct = (delta / prev_v) * 100 if prev_v else 0.0
+                        improved_pct = -pct
+                        if run_v < prev_v:
+                            # Strict improvement — promote new, archive old.
                             db.update_ml_run_role(champion["id"], "archived")
-                            # New run was inserted as champion default; archive siblings.
+                            db.update_ml_run_role(result["run_id"], "champion")
                             db.archive_other_champions(result["run_id"])
                             cfg["sweep_improvements_today"] = int(cfg.get("sweep_improvements_today") or 0) + 1
                             promoted = True
@@ -914,24 +930,17 @@ async def _ml_sweep_loop() -> None:
                                 "model_promoted",
                                 {"new_id": result["run_id"], "old_id": champion["id"],
                                  "improvement_pct": round(improved_pct, 2),
-                                 "metric_used": metric_used},
+                                 "metric_used": metric_used,
+                                 "from_mae": round(prev_v, 4),
+                                 "to_mae":   round(run_v, 4)},
                                 f"challenger promoted to champion "
-                                f"(+{improved_pct:.1f}% {metric_used} improvement)",
+                                f"({metric_used} {prev_v:.4f} → {run_v:.4f}, "
+                                f"+{improved_pct:.2f}%)",
                             )
-                        elif improved_pct < -20.0:
-                            db.update_ml_run_role(result["run_id"], "archived")
-                            db.update_ml_run_role(champion["id"], "champion")
-                            db.log_ml_event(
-                                "model_rolled_back",
-                                {"reverted_to_id": champion["id"], "rejected_id": result["run_id"],
-                                 "regression_pct": round(-improved_pct, 2)},
-                                f"sweep candidate rejected — {-improved_pct:.1f}% worse",
-                            )
-                        else:
-                            # Marginal — leave champion in place, mark new as archived.
-                            db.update_ml_run_role(result["run_id"], "archived")
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[ml-sweep] promotion logic failed: {exc}")
+                        # else: new run is not better — already inserted as
+                        # archived, nothing to do.
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[ml-sweep] promotion logic failed: {exc}")
                 # One unified event for every trained candidate (the live
                 # stream in the UI reads from this).
                 db.log_ml_event(
@@ -2806,6 +2815,66 @@ def ml_sweep_pause():
     db.log_ml_event("sweep_paused", {"enabled": False},
                     "sweep paused via /api/ml/sweep/pause")
     return _sweep_status_payload()
+
+
+@app.post("/api/ml/champion/rebuild")
+def ml_champion_rebuild(metric: str = "walk_forward_mae"):
+    """Re-elect the champion based on the best-ever recorded metric.
+    Fixes the bug where the sweep loop was silently making every fresh
+    run champion (because insert_ml_run defaulted role='champion' and
+    the promotion guard's `champion.id != new.id` check then skipped).
+
+    Idempotent: archives every other persisted run, promotes the single
+    row with the lowest `metric` value to champion. Returns the new
+    champion's identity + the previous one so the caller can see what
+    actually changed.
+    """
+    metric = "walk_forward_mae" if metric not in ("walk_forward_mae", "test_mae") else metric
+    c = db._conn_or_init()
+    # Find the best persisted run by the chosen metric.
+    best = c.execute(
+        f"""SELECT * FROM ml_runs
+             WHERE {metric} IS NOT NULL
+               AND COALESCE(skipped, 0) = 0
+               AND model_path IS NOT NULL
+               AND model_path != '(not-persisted)'
+             ORDER BY {metric} ASC, trained_at DESC
+             LIMIT 1""",
+    ).fetchone()
+    if not best:
+        raise HTTPException(404, "no runs with the requested metric")
+    prev_rows = db.list_runs_by_role("champion", limit=1)
+    prev = prev_rows[0] if prev_rows else None
+    if prev and prev["id"] == best["id"]:
+        # Already correct; still run archive_other_champions for safety.
+        db.archive_other_champions(best["id"])
+        return {"already_correct": True,
+                "champion_id": best["id"],
+                "metric": metric,
+                "value": best[metric]}
+    # Promote the best, archive everyone else.
+    db.update_ml_run_role(best["id"], "champion")
+    archived = db.archive_other_champions(best["id"])
+    db.log_ml_event(
+        "model_promoted",
+        {"new_id": best["id"], "old_id": prev["id"] if prev else None,
+         "metric_used": metric,
+         "from_mae": (prev[metric] if prev else None),
+         "to_mae": best[metric],
+         "rebuild": True},
+        f"champion rebuilt from {metric}: "
+        f"{(prev[metric] if prev else 'none')} → {best[metric]}",
+    )
+    return {
+        "already_correct": False,
+        "previous_champion_id": prev["id"] if prev else None,
+        "previous_value": prev[metric] if prev else None,
+        "new_champion_id": best["id"],
+        "new_value": best[metric],
+        "new_algorithm": best["algorithm"],
+        "rows_archived": archived,
+        "metric": metric,
+    }
 
 
 @app.get("/api/ml/city-confidence")

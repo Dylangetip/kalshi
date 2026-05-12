@@ -252,6 +252,12 @@ def train_random_candidate(
             walk_forward_mae_v=wf,
             hyperparams=params,
             fingerprint=fp,
+            # Sweep candidates default to archived — the explicit promotion
+            # gate in main._ml_sweep_loop is the only path to champion. This
+            # closes the bug where every new run silently became champion
+            # because insert_ml_run defaulted role='champion' and the
+            # promotion guard's "champion.id != new.id" check then skipped.
+            role="archived",
         )
         # Record per-city test MAE so the auto-trader can scale bet
         # sizing / skip cities the model is bad at. Best-effort —
@@ -723,13 +729,12 @@ def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
              extra_payload: Optional[Dict] = None,
              walk_forward_mae_v: Optional[float] = None,
              hyperparams: Optional[Dict] = None,
-             fingerprint: Optional[str] = None) -> Dict:
+             fingerprint: Optional[str] = None,
+             role: str = "champion") -> Dict:
     """Save a fitted model to disk and record the run in ml_runs.
-    `fingerprint` lets the sweep loop pre-compute the dedup hash from
-    the BARE algorithm name (e.g. 'ridge') and reuse it on persist —
-    otherwise insert_ml_run rebuilds the hash from fit['algorithm']
-    which is the formatted label ('ridge[a=1.0]'), so the next sweep
-    iteration's dedup lookup would miss this row."""
+    `role` defaults to 'champion' to preserve the single-shot /api/ml/train
+    behaviour. The continuous sweep passes role='archived' so the
+    explicit promotion gate in main.py is the only path to champion."""
     import joblib  # type: ignore
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
@@ -754,6 +759,7 @@ def _persist(fit: Dict, feature_cols: List[str], n_train: int, n_test: int,
         walk_forward_mae=walk_forward_mae_v,
         hyperparams=hyperparams,
         fingerprint=fingerprint,
+        role=role,
     )
 
 
