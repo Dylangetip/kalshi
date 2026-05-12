@@ -3015,6 +3015,7 @@ function CortexPanel() {
   const [libReady, setLibReady] = useState_v(
     typeof window !== 'undefined' && !!window.ForceGraph3D && !!window.THREE
   );
+  const [autoRotate, setAutoRotate] = useState_v(false);
 
   // Capture wheel events over the 3D stage so scrolling zooms the
   // visualization instead of scrolling the page. React's synthetic
@@ -3077,7 +3078,7 @@ function CortexPanel() {
       .nodeOpacity(1)
       .linkOpacity(0.35)
       .linkWidth(l => l.kind === 'champion_lineage' ? 1.6 : 0.4)
-      .linkColor(l => l.kind === 'champion_lineage' ? '#4a9eff' : '#666666')
+      .linkColor(l => l.kind === 'champion_lineage' ? '#d49a3e' : '#666666')
       .nodeLabel(n => {
         const hp = n.hyperparams ? Object.entries(n.hyperparams).map(([k, v]) => `${k}=${v}`).join(' ') : '';
         return `${n.algorithm}<br/>wf=${(n.wf_mae || 0).toFixed(3)}<br/>${hp}`;
@@ -3100,15 +3101,19 @@ function CortexPanel() {
     // controls naturally pause while the user drags / zooms and resume
     // after a brief idle — no fighting the user's mouse like my prior
     // setInterval was doing.
+    // OrbitControls — user drives. Auto-rotate is off by default so the
+    // camera doesn't keep moving while you're trying to inspect a node;
+    // a toggle button on the overlay flips it back on if wanted.
     try {
       const controls = g.controls();
       if (controls) {
-        controls.autoRotate = true;
-        controls.autoRotateSpeed = 0.45;       // ~0.45 = leisurely
+        controls.autoRotate = false;
+        controls.autoRotateSpeed = 0.5;
         controls.enableDamping = true;
-        controls.dampingFactor = 0.12;         // momentum on release
-        controls.rotateSpeed = 0.7;
+        controls.dampingFactor = 0.1;
+        controls.rotateSpeed = 1.1;            // snappier drag-to-orbit
         controls.zoomSpeed = 1.2;
+        controls.panSpeed = 0.9;
       }
     } catch {}
     graphRef.current = { g };
@@ -3117,6 +3122,16 @@ function CortexPanel() {
       graphRef.current = null;
     };
   }, [libReady]);
+
+  // Reactive autoRotate toggle.
+  React.useEffect(() => {
+    const wrap = graphRef.current;
+    if (!wrap) return;
+    try {
+      const c = wrap.g.controls();
+      if (c) c.autoRotate = autoRotate;
+    } catch {}
+  }, [autoRotate, libReady]);
 
   // Push data into the graph each time the response changes.
   React.useEffect(() => {
@@ -3131,7 +3146,7 @@ function CortexPanel() {
       ...n,
       // 3d-force-graph respects pre-set x/y/z if fx/fy/fz are also given.
       fx: n.x * 12, fy: n.y * 12, fz: n.z * 12,
-      color: n.is_champion ? '#4a9eff' : colorFor(n.wf_mae, lo, hi),
+      color: n.is_champion ? '#d49a3e' : colorFor(n.wf_mae, lo, hi),
       val: Math.max(2, 8 / Math.max(0.1, n.wf_mae)),
     }));
     g.graphData({ nodes, links: data.edges });
@@ -3149,20 +3164,20 @@ function CortexPanel() {
         new THREE.SphereGeometry(2.4, 16, 16),
         new THREE.MeshBasicMaterial({ color })
       );
-      // Inner halo — additive blending makes overlapping halos bloom
-      // brighter, mimicking real glow.
+      // Inner halo — additive blending; toned down so dense clusters
+      // don't wash out into a featureless blob.
       const halo = new THREE.Mesh(
-        new THREE.SphereGeometry(4.4, 16, 16),
+        new THREE.SphereGeometry(3.6, 16, 16),
         new THREE.MeshBasicMaterial({
-          color, transparent: true, opacity: 0.28,
+          color, transparent: true, opacity: 0.15,
           blending: THREE.AdditiveBlending, depthWrite: false,
         })
       );
-      // Outer halo — broader and fainter for a soft falloff.
+      // Outer halo — very subtle falloff so individual nodes still read.
       const outer = new THREE.Mesh(
-        new THREE.SphereGeometry(8, 16, 16),
+        new THREE.SphereGeometry(5.5, 16, 16),
         new THREE.MeshBasicMaterial({
-          color, transparent: true, opacity: 0.09,
+          color, transparent: true, opacity: 0.05,
           blending: THREE.AdditiveBlending, depthWrite: false,
         })
       );
@@ -3205,7 +3220,7 @@ function CortexPanel() {
       const boxGeom = new THREE.BoxGeometry(Math.abs(w), Math.abs(h), Math.abs(d));
       const edges = new THREE.EdgesGeometry(boxGeom);
       const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-        color: 0x4a9eff, transparent: true, opacity: 0.5,
+        color: 0xd49a3e, transparent: true, opacity: 0.5,
       }));
       line.position.set(cx, cy, cz);
       scene.add(line);
@@ -3262,16 +3277,46 @@ function CortexPanel() {
           )}
           <div className="cortex-canvas" ref={containerRef} />
           {data && (
-            <div className="cortex-overlay">
-              <span className="pill info" style={{ background: 'rgba(74,158,255,0.15)' }}>
-                {data.nodes.length} nodes · {data.edges.length} edges
-              </span>
-              {data.focus_region && (
-                <span className="pill pos">
-                  focus engaged · top {data.focus_region.candidate_count}
+            <>
+              <div className="cortex-overlay">
+                <span className="pill info" style={{ background: 'rgba(212,154,62,0.15)' }}>
+                  {data.nodes.length} nodes · {data.edges.length} edges
                 </span>
-              )}
-            </div>
+                {data.focus_region && (
+                  <span className="pill pos">
+                    focus engaged · top {data.focus_region.candidate_count}
+                  </span>
+                )}
+                <button
+                  className="cortex-overlay-btn"
+                  onClick={() => setAutoRotate(v => !v)}
+                  title={autoRotate ? 'Stop auto-rotate' : 'Start auto-rotate'}>
+                  {autoRotate ? '⏸ rotating' : '↻ orbit'}
+                </button>
+              </div>
+              <div className="cortex-legend">
+                <div className="cortex-legend-title">Legend</div>
+                <div className="cortex-legend-row">
+                  <span className="cortex-legend-grad" />
+                  <span>low MAE → high MAE</span>
+                </div>
+                <div className="cortex-legend-row">
+                  <span className="cortex-legend-dot champion" />
+                  <span>current champion (larger, blue)</span>
+                </div>
+                <div className="cortex-legend-row">
+                  <span className="cortex-legend-line champion" />
+                  <span>champion lineage</span>
+                </div>
+                <div className="cortex-legend-row">
+                  <span className="cortex-legend-line neighbor" />
+                  <span>nearby configs (3-NN)</span>
+                </div>
+                <div className="cortex-legend-row" style={{ marginTop: 6, color: 'var(--fg-3)', fontSize: 10 }}>
+                  drag = orbit · wheel = zoom · right-drag = pan · click node = focus
+                </div>
+              </div>
+            </>
           )}
         </div>
         <div className="cortex-side">
