@@ -168,6 +168,31 @@ CREATE TABLE IF NOT EXISTS ml_events (
 );
 CREATE INDEX IF NOT EXISTS idx_mlevents_ts ON ml_events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_mlevents_kind ON ml_events(kind, ts DESC);
+
+-- Tiny key/value store for runtime state that doesn't belong in env or
+-- _auto_trade_state. Currently holds 'virtual_current_balance', a stored
+-- bankroll that's mutated explicitly when bets settle (vs. derived).
+CREATE TABLE IF NOT EXISTS kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    ts    INTEGER NOT NULL
+);
+
+-- One row per settlement poller run. Lets the UI surface "last checked X
+-- minutes ago, settled Y, P/L from batch Z" without recomputing.
+CREATE TABLE IF NOT EXISTS settlement_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           INTEGER NOT NULL,
+    source       TEXT    NOT NULL,   -- 'loop' | 'manual' | 'backfill'
+    checked      INTEGER NOT NULL,
+    settled      INTEGER NOT NULL,
+    batch_pl     REAL    NOT NULL,
+    via_kalshi   INTEGER NOT NULL DEFAULT 0,
+    via_nws      INTEGER NOT NULL DEFAULT 0,
+    duration_ms  INTEGER,
+    note         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_runs_ts ON settlement_runs(ts DESC);
 """
 
 _lock = threading.Lock()
@@ -275,10 +300,11 @@ def list_settleable_bets(today_iso: str) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
-def settle_bet(bet_id: int, settled_pl: float, settled_max_f: int) -> None:
-    """Mark a bet settled. Also writes a final position_mark at settled_at
-    so the equity timeline picks up the settlement-snap from the latest
-    Kalshi mark to the realized P/L."""
+def settle_bet(bet_id: int, settled_pl: float, settled_max_f: Optional[int]) -> None:
+    """Mark a bet settled. `settled_max_f` may be None when settlement
+    came from Kalshi's resolution (which gives us yes/no, not the actual
+    high temp) — in that case we leave the column null and skip the
+    accuracy join until the NWS/IEM actual is available."""
     c = _conn_or_init()
     with _lock:
         ts = int(time.time())
@@ -304,6 +330,102 @@ def list_open_bets() -> List[Dict]:
         "SELECT * FROM bets WHERE status='open' ORDER BY placed_at DESC"
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── kv store: virtual_current_balance + similar runtime state ──────────
+
+def get_kv(key: str, default: Optional[str] = None) -> Optional[str]:
+    c = _conn_or_init()
+    row = c.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_kv(key: str, value: str) -> None:
+    c = _conn_or_init()
+    with _lock:
+        c.execute(
+            "INSERT INTO kv (key, value, ts) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts=excluded.ts",
+            (key, value, int(time.time())),
+        )
+        c.commit()
+
+
+_VBAL_KEY = "virtual_current_balance"
+
+
+def get_virtual_balance(starting_cash: float) -> float:
+    """Stored virtual balance, lazily initialized to `starting_cash` on
+    first read. The caller (main.py) passes the configured bankroll so we
+    don't need to know about env wiring in here."""
+    raw = get_kv(_VBAL_KEY)
+    if raw is None:
+        set_kv(_VBAL_KEY, f"{starting_cash:.2f}")
+        return float(starting_cash)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(starting_cash)
+
+
+def apply_settlement_to_balance(settled_pl: float, starting_cash: float) -> float:
+    """User-specified semantics: add settled_pl only when it's positive
+    (win). Losses already came out of balance at placement time, so
+    don't double-deduct. Returns the new balance."""
+    bal = get_virtual_balance(starting_cash)
+    if settled_pl > 0:
+        bal += settled_pl
+        set_kv(_VBAL_KEY, f"{bal:.2f}")
+    return bal
+
+
+def reset_virtual_balance(starting_cash: float) -> float:
+    """Reset to starting_cash. Used by /api/settle/recompute-balance to
+    re-derive after the formula has been changed or after bad data."""
+    set_kv(_VBAL_KEY, f"{starting_cash:.2f}")
+    return float(starting_cash)
+
+
+# ── settlement_runs log ────────────────────────────────────────────────
+
+def log_settlement_run(
+    source: str,
+    checked: int,
+    settled: int,
+    batch_pl: float,
+    via_kalshi: int = 0,
+    via_nws: int = 0,
+    duration_ms: Optional[int] = None,
+    note: Optional[str] = None,
+) -> int:
+    c = _conn_or_init()
+    with _lock:
+        cur = c.execute(
+            """INSERT INTO settlement_runs (
+                ts, source, checked, settled, batch_pl,
+                via_kalshi, via_nws, duration_ms, note
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (int(time.time()), source, checked, settled, batch_pl,
+             via_kalshi, via_nws, duration_ms, note),
+        )
+        c.commit()
+        return int(cur.lastrowid)
+
+
+def list_settlement_runs(limit: int = 50) -> List[Dict]:
+    c = _conn_or_init()
+    rows = c.execute(
+        "SELECT * FROM settlement_runs ORDER BY ts DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_settlement_run() -> Optional[Dict]:
+    c = _conn_or_init()
+    row = c.execute(
+        "SELECT * FROM settlement_runs ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def reset() -> None:

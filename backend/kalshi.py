@@ -537,3 +537,112 @@ async def place_order(
 
 async def fetch_balance(client: httpx.AsyncClient) -> Optional[Dict]:
     return await _client.fetch_balance(client)
+
+
+# ── Settlement lookup ──────────────────────────────────────────────────
+# Daily-high events are named "{series}-{YY}{MMM}{DD}" (e.g.
+# "KXHIGHNY-25MAY03"). Given a bet's (city series_ticker, target_date,
+# bracket_lo, bracket_hi) we reconstruct the event ticker, fetch its
+# markets, match the bracket, and read the resolved result.
+
+from datetime import date as _date
+
+
+def event_ticker_for_date(series_ticker: str, target_date_iso: str) -> Optional[str]:
+    """Build the Kalshi event_ticker for a given series + ISO date.
+    Returns None on a malformed date string."""
+    try:
+        d = _date.fromisoformat(target_date_iso)
+    except ValueError:
+        return None
+    suffix = f"{d.year % 100:02d}{d.strftime('%b').upper()}{d.day:02d}"
+    return f"{series_ticker}-{suffix}"
+
+
+def _bracket_matches(market: Dict, lo: int, hi: int) -> bool:
+    rng = parse_bracket_range(market)
+    if rng is None:
+        return False
+    m_lo, m_hi = rng
+    # Open-tail brackets get widened by ±20° in parse_bracket_range, but
+    # the actual cap or floor is what defines the bracket on Kalshi. The
+    # bets table stores the same widened (lo, hi) the recommender saw,
+    # so an exact match works for two-sided brackets. For tails the
+    # widened end may not match precisely if the ladder builder shifted
+    # the window — accept a match when the strike side lines up.
+    has_floor = market.get("floor_strike") is not None
+    has_cap = market.get("cap_strike") is not None
+    if has_floor and has_cap:
+        return m_lo == lo and m_hi == hi
+    if has_cap and not has_floor:
+        return m_hi == hi  # lower-tail: cap_strike is the defining edge
+    if has_floor and not has_cap:
+        return m_lo == lo  # upper-tail: floor_strike is the defining edge
+    return m_lo == lo and m_hi == hi
+
+
+def _market_is_finalized(m: Dict) -> bool:
+    """A Kalshi market is settled when status indicates final state.
+    Different snapshots of the API use different status strings; accept
+    any that imply 'no more trading, outcome known'."""
+    status = (m.get("status") or "").lower()
+    return status in {"finalized", "settled", "determined", "closed"} and bool(m.get("result"))
+
+
+def _market_result(m: Dict) -> Optional[str]:
+    """'yes' or 'no' if the market has a final outcome, else None."""
+    res = (m.get("result") or "").lower()
+    if res in ("yes", "no"):
+        return res
+    return None
+
+
+async def fetch_market_resolution(
+    client: httpx.AsyncClient,
+    series_ticker: str,
+    target_date_iso: str,
+    bracket_lo: int,
+    bracket_hi: int,
+) -> Dict:
+    """Look up a single bet's market on Kalshi and report its resolution.
+
+    Returns a dict:
+      {
+        "ok": bool,                # did we get a usable response
+        "resolved": bool,          # market is finalized
+        "result": "yes"|"no"|None, # final outcome (when resolved)
+        "ticker": str|None,        # the matched market ticker
+        "event_ticker": str|None,
+        "error": str|None,         # diagnostic, never raised
+      }
+    Never raises — settlement code shouldn't blow up on a single
+    market lookup failure."""
+    out: Dict = {
+        "ok": False, "resolved": False, "result": None,
+        "ticker": None, "event_ticker": None, "error": None,
+    }
+    event_ticker = event_ticker_for_date(series_ticker, target_date_iso)
+    if event_ticker is None:
+        out["error"] = f"bad target_date {target_date_iso!r}"
+        return out
+    out["event_ticker"] = event_ticker
+
+    if not _client.configured():
+        out["error"] = "kalshi not configured"
+        return out
+
+    markets = await _client.fetch_event_markets(client, event_ticker)
+    if markets is None:
+        out["error"] = _client.last_error or "fetch_event_markets returned None"
+        return out
+    out["ok"] = True
+
+    for m in markets:
+        if _bracket_matches(m, bracket_lo, bracket_hi):
+            out["ticker"] = m.get("ticker")
+            if _market_is_finalized(m):
+                out["resolved"] = True
+                out["result"] = _market_result(m)
+            return out
+    out["error"] = f"no bracket match for [{bracket_lo}, {bracket_hi}] in {event_ticker}"
+    return out

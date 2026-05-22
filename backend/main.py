@@ -97,7 +97,7 @@ def _city_target_date(city: Dict, when: Optional[datetime] = None) -> str:
 
 SNAPSHOT_INTERVAL_SECONDS = int(os.getenv("BETS_SNAPSHOT_INTERVAL", "300"))  # 5 min default
 SNAPSHOT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SNAPSHOT_LOOP") == "1"
-SETTLEMENT_INTERVAL_SECONDS = int(os.getenv("BETS_SETTLEMENT_INTERVAL", "3600"))  # 1 hour default
+SETTLEMENT_INTERVAL_SECONDS = int(os.getenv("BETS_SETTLEMENT_INTERVAL", "1800"))  # 30 min default
 SETTLEMENT_LOOP_DISABLED = os.getenv("BETS_DISABLE_SETTLEMENT_LOOP") == "1"
 
 # Auto paper-trader. Initial config from env, runtime-mutable via
@@ -1017,79 +1017,252 @@ def get_bets(limit: int = 200):
     return [_bet_row_to_log(b) for b in db.list_bets(limit)]
 
 
-async def _settle_open_bets(client: httpx.AsyncClient) -> List[Dict]:
+def _city_for_code(code: str) -> Optional[Dict]:
+    return next((c for c in CITIES if c["code"] == code), None)
+
+
+def _starting_cash() -> float:
+    """Configured bankroll — used as the seed for virtual_current_balance
+    and as the divisor for win-rate math."""
+    return float(_auto_trade_state.get("bankroll") or 10000.0)
+
+
+def _apply_settlement(bet: Dict, in_bracket: bool, actual_max: Optional[int]) -> float:
+    """Compute P/L, persist, and update virtual_current_balance. Returns
+    the realized P/L. `actual_max` may be None when Kalshi told us the
+    outcome but we don't have the temperature yet."""
+    pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
+    db.settle_bet(bet["id"], pl, actual_max)
+    db.apply_settlement_to_balance(pl, _starting_cash())
+    return pl
+
+
+async def _try_settle_via_kalshi(
+    client: httpx.AsyncClient,
+    bet: Dict,
+) -> Optional[Dict]:
+    """Query Kalshi for this bet's market resolution. Returns a result
+    dict on successful settlement, None if Kalshi can't (yet) settle it.
+
+    Per the user formula:
+      - YES bet + market resolved YES → size * (100 - entry) / entry
+      - any other "wrong side" outcome → -size
+    settle_pl() already encodes this and also handles NO bets correctly."""
+    city = _city_for_code(bet["city"])
+    if not city:
+        return None
+    series = city.get("kalshi_series")
+    if not series:
+        return None
+    res = await kalshi.fetch_market_resolution(
+        client, series, bet["target_date"], bet["bracket_lo"], bet["bracket_hi"],
+    )
+    if not res.get("resolved") or res.get("result") not in ("yes", "no"):
+        return None
+    market_yes = res["result"] == "yes"
+    # "in_bracket" means the YES outcome was true on the market. settle_pl
+    # then pays the YES holder iff side==YES & in_bracket (or NO & not).
+    pl = _apply_settlement(bet, in_bracket=market_yes, actual_max=None)
+    return {
+        "id": bet["id"],
+        "city": bet["city"],
+        "bracket": bet["bracket_label"],
+        "side": bet["side"],
+        "source": "kalshi",
+        "market_result": res["result"],
+        "ticker": res.get("ticker"),
+        "actual_max_f": None,
+        "in_bracket": market_yes,
+        "pl": round(pl, 2),
+    }
+
+
+async def _try_settle_via_nws(
+    client: httpx.AsyncClient,
+    bet: Dict,
+    cli_cache: Dict[str, Optional[int]],
+    cli_covers_cache: Dict[str, str],
+) -> Optional[Dict]:
+    """NWS climate-report fallback. Fetches each office's CLI at most
+    once per call (cache shared across bets in the same batch). Only
+    settles when the CLI's YESTERDAY column matches the bet's
+    target_date."""
+    city = _city_for_code(bet["city"])
+    if not city:
+        return None
+    office = city["office"]
+    # The CLI's YESTERDAY column only covers yesterday. Skip the network
+    # call entirely for older bets — they'll fall through to IEM ASOS.
+    expected_cli_date = (
+        datetime.fromisoformat(_city_today(city["tz"])) - timedelta(days=1)
+    ).date().isoformat()
+    if bet["target_date"] != expected_cli_date:
+        return None
+    if office not in cli_cache:
+        try:
+            text = await fetch_climate_report(client, office)
+            cli_cache[office] = parse_climate_max_yesterday(text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[settle] CLI fetch failed for {office}: {exc}")
+            cli_cache[office] = None
+        cli_covers_cache[office] = (
+            datetime.fromisoformat(_city_today(city["tz"])) - timedelta(days=1)
+        ).date().isoformat()
+    actual_max = cli_cache.get(office)
+    if actual_max is None:
+        return None
+    if bet["target_date"] != cli_covers_cache.get(office):
+        return None  # CLI covers a different day than this bet
+
+    in_bracket = bet["bracket_lo"] <= actual_max <= bet["bracket_hi"]
+    pl = _apply_settlement(bet, in_bracket=in_bracket, actual_max=actual_max)
+    # Data-quality cross-check against IEM ASOS archive.
+    try:
+        ha = db.get_historical_actual(bet["city"], cli_covers_cache[office])
+        if ha is not None and ha.get("actual_max_f") is not None:
+            iem = float(ha["actual_max_f"])
+            if abs(iem - actual_max) > 0.5:
+                db.log_ml_event(
+                    "data_quality",
+                    {"city": bet["city"], "date": cli_covers_cache[office],
+                     "nws_climate": actual_max, "iem_asos": iem,
+                     "delta": round(iem - actual_max, 2)},
+                    f"data quality: {bet['city']} {cli_covers_cache[office]} "
+                    f"NWS={actual_max}° vs IEM={iem}° (Δ{iem - actual_max:+.1f}°)",
+                )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[settle] data_quality check failed: {exc}")
+    return {
+        "id": bet["id"],
+        "city": bet["city"],
+        "bracket": bet["bracket_label"],
+        "side": bet["side"],
+        "source": "nws",
+        "actual_max_f": actual_max,
+        "in_bracket": in_bracket,
+        "pl": round(pl, 2),
+    }
+
+
+async def _try_settle_via_iem(bet: Dict) -> Optional[Dict]:
+    """Catch-up settlement using the IEM ASOS historical_actuals table
+    that backfills on a separate loop. Only used when Kalshi is silent
+    AND the NWS CLI window has slid past (i.e. days-old bets). Keeps
+    backfill of long-stale bets from depending on a working Kalshi key."""
+    ha = db.get_historical_actual(bet["city"], bet["target_date"])
+    if ha is None or ha.get("actual_max_f") is None:
+        return None
+    actual_max = int(round(float(ha["actual_max_f"])))
+    in_bracket = bet["bracket_lo"] <= actual_max <= bet["bracket_hi"]
+    pl = _apply_settlement(bet, in_bracket=in_bracket, actual_max=actual_max)
+    return {
+        "id": bet["id"],
+        "city": bet["city"],
+        "bracket": bet["bracket_label"],
+        "side": bet["side"],
+        "source": "iem",
+        "actual_max_f": actual_max,
+        "in_bracket": in_bracket,
+        "pl": round(pl, 2),
+    }
+
+
+async def _settle_open_bets(
+    client: httpx.AsyncClient,
+    source: str = "loop",
+) -> Dict:
     """Settle every open bet whose city-local target_date has passed.
 
-    Strategy: bucket settleable bets by city, fetch each office's CLI
-    once, parse the YESTERDAY MAX, then apply realized P/L per bet.
-    Bets whose target_date doesn't match the CLI's coverage day are
-    deferred to a later run."""
+    Per-bet strategy (in order):
+      1. Kalshi API resolution (primary). Reads the market's finalized
+         result. Works for any past date as long as Kalshi has settled.
+      2. NWS Climate Report (fallback). Only matches when the bet's
+         target_date == CLI's YESTERDAY column — i.e. 1-day-stale.
+      3. IEM ASOS historical_actuals (deep-backfill fallback). Catches
+         multi-day-stale bets when Kalshi is misconfigured or silent.
+
+    Returns a summary dict with checked/settled counts + batch P/L, also
+    logged to the settlement_runs table for the UI to surface."""
+    t0 = time.time()
     settled: List[Dict] = []
-    by_city: Dict[str, List[Dict]] = {}
+    cli_cache: Dict[str, Optional[int]] = {}
+    cli_covers_cache: Dict[str, str] = {}
+
+    # Union of city-today dates → consider a bet settleable if its
+    # target_date is before the LATEST city-today (most permissive). This
+    # was buggy in the previous version: it filtered per-city inside the
+    # loop, which meant a bet for city X that pre-dated city Y's today
+    # never matched the per-city scan.
+    bets_to_check: List[Dict] = []
+    seen_ids: set = set()
     for c in CITIES:
         today = _city_today(c["tz"])
         for bet in db.list_settleable_bets(today):
-            if bet["city"] == c["code"]:
-                by_city.setdefault(c["code"], []).append(bet)
+            if bet["id"] in seen_ids:
+                continue
+            seen_ids.add(bet["id"])
+            bets_to_check.append(bet)
 
-    for city in CITIES:
-        bets = by_city.get(city["code"], [])
-        if not bets:
-            continue
-        text = await fetch_climate_report(client, city["office"])
-        actual_max = parse_climate_max_yesterday(text)
-        if actual_max is None:
-            continue  # CLI not yet posted, try again next loop iteration
-        # CLI's YESTERDAY column is for the city-local previous day.
-        cli_covers = (
-            datetime.fromisoformat(_city_today(city["tz"])) - timedelta(days=1)
-        ).date().isoformat()
-        for bet in bets:
-            if bet["target_date"] != cli_covers:
-                continue  # CLI is for a different day than this bet
-            in_bracket = bet["bracket_lo"] <= actual_max <= bet["bracket_hi"]
-            pl = settle_pl(bet["side"], bet["entry_cents"], bet["size"], in_bracket)
-            db.settle_bet(bet["id"], pl, actual_max)
-            # Data-quality cross-check: NWS Climate Report's actual_max
-            # should match the IEM ASOS hourly archive value we
-            # backfilled into historical_actuals. If they disagree by
-            # more than 0.5°F, log a data_quality event so the user
-            # knows there's a discrepancy worth investigating.
-            try:
-                ha = db.get_historical_actual(bet["city"], cli_covers)
-                if ha is not None and ha.get("actual_max_f") is not None:
-                    iem = float(ha["actual_max_f"])
-                    if abs(iem - actual_max) > 0.5:
-                        db.log_ml_event(
-                            "data_quality",
-                            {"city": bet["city"], "date": cli_covers,
-                             "nws_climate": actual_max, "iem_asos": iem,
-                             "delta": round(iem - actual_max, 2)},
-                            f"data quality: {bet['city']} {cli_covers} "
-                            f"NWS={actual_max}° vs IEM={iem}° (Δ{iem - actual_max:+.1f}°)",
-                        )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[settle] data_quality check failed: {exc}")
-            settled.append({
-                "id": bet["id"],
-                "city": bet["city"],
-                "bracket": bet["bracket_label"],
-                "side": bet["side"],
-                "actual_max_f": actual_max,
-                "in_bracket": in_bracket,
-                "pl": round(pl, 2),
-            })
-    return settled
+    checked = len(bets_to_check)
+    via_kalshi = via_nws = via_iem = 0
+
+    for bet in bets_to_check:
+        try:
+            r = await _try_settle_via_kalshi(client, bet)
+            if r is not None:
+                settled.append(r)
+                via_kalshi += 1
+                continue
+            r = await _try_settle_via_nws(client, bet, cli_cache, cli_covers_cache)
+            if r is not None:
+                settled.append(r)
+                via_nws += 1
+                continue
+            r = await _try_settle_via_iem(bet)
+            if r is not None:
+                settled.append(r)
+                via_iem += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[settle] bet {bet.get('id')} failed: {exc}")
+
+    batch_pl = round(sum(s["pl"] for s in settled), 2)
+    duration_ms = int((time.time() - t0) * 1000)
+    note = f"kalshi={via_kalshi} nws={via_nws} iem={via_iem}"
+    db.log_settlement_run(
+        source=source,
+        checked=checked,
+        settled=len(settled),
+        batch_pl=batch_pl,
+        via_kalshi=via_kalshi,
+        via_nws=via_nws,
+        duration_ms=duration_ms,
+        note=note,
+    )
+    print(
+        f"[settle/{source}] checked={checked} settled={len(settled)} "
+        f"({note}) batch_pl=${batch_pl:+.2f} took {duration_ms}ms"
+    )
+    return {
+        "checked": checked,
+        "settled_count": len(settled),
+        "batch_pl": batch_pl,
+        "via_kalshi": via_kalshi,
+        "via_nws": via_nws,
+        "via_iem": via_iem,
+        "duration_ms": duration_ms,
+        "settled": settled,
+        "virtual_current_balance": db.get_virtual_balance(_starting_cash()),
+    }
 
 
 async def _settlement_loop() -> None:
-    """Background settlement: fires hourly, idempotent. CLI bulletins for a
-    given day are typically out by mid-morning local time, so an hourly
-    cadence catches them within an hour of availability."""
+    """Background settlement: fires every SETTLEMENT_INTERVAL_SECONDS
+    (default 30 min). Idempotent — already-settled bets are skipped by
+    list_settleable_bets's WHERE status='open' clause."""
     while True:
         try:
             async with httpx.AsyncClient() as client:
-                await _settle_open_bets(client)
+                await _settle_open_bets(client, source="loop")
         except Exception as exc:  # noqa: BLE001
             print(f"[bets] settlement loop error: {exc}")
         await asyncio.sleep(SETTLEMENT_INTERVAL_SECONDS)
@@ -1226,8 +1399,49 @@ async def settle_now():
     """Manual trigger for the settlement job. Useful for testing and for
     forcing a check after the morning CLI is known to have posted."""
     async with httpx.AsyncClient() as client:
-        results = await _settle_open_bets(client)
-    return {"settled": results, "count": len(results)}
+        result = await _settle_open_bets(client, source="manual")
+    return result
+
+
+@app.post("/api/settle/backfill")
+async def settle_backfill():
+    """One-shot catch-up that processes every open bet whose target_date
+    is in the past. Same Kalshi → NWS → IEM cascade as the periodic loop,
+    just runs immediately. Use after a long downtime where the loop
+    missed many days."""
+    async with httpx.AsyncClient() as client:
+        result = await _settle_open_bets(client, source="backfill")
+    return result
+
+
+@app.get("/api/settle/status")
+def settle_status():
+    """Current state of the settlement engine. The UI uses this to show
+    'last checked X min ago, Y bets still pending'."""
+    open_bets = db.list_open_bets()
+    stale: List[Dict] = []
+    now_iso = datetime.now(timezone.utc).date().isoformat()
+    for b in open_bets:
+        if b.get("target_date") and b["target_date"] < now_iso:
+            stale.append({
+                "id": b["id"],
+                "city": b["city"],
+                "bracket": b["bracket_label"],
+                "side": b["side"],
+                "size": b["size"],
+                "target_date": b["target_date"],
+            })
+    return {
+        "interval_seconds": SETTLEMENT_INTERVAL_SECONDS,
+        "loop_disabled": SETTLEMENT_LOOP_DISABLED,
+        "open_count": len(open_bets),
+        "stale_count": len(stale),
+        "stale_bets": stale[:200],
+        "last_run": db.latest_settlement_run(),
+        "recent_runs": db.list_settlement_runs(limit=20),
+        "virtual_current_balance": db.get_virtual_balance(_starting_cash()),
+        "starting_cash": _starting_cash(),
+    }
 
 
 @app.post("/api/settle/recompute")
@@ -1251,7 +1465,10 @@ def recompute_settled_pl():
 
 @app.get("/api/stats")
 def get_stats():
-    return db.stats_summary()
+    stats = db.stats_summary()
+    stats["virtualCurrentBalance"] = db.get_virtual_balance(_starting_cash())
+    stats["startingCash"] = _starting_cash()
+    return stats
 
 
 @app.get("/api/accuracy")
