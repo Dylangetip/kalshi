@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>FundingHub Cart Tracker</title>
+  <style>
+    body { font: 13px/1.45 system-ui, sans-serif; width: 300px; margin: 0; padding: 12px; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #e2e8f0; color: #334155; }
+    .pill.on { background: #ccfbf1; color: #0f766e; }
+    .pill.off { background: #fee2e2; color: #b91c1c; }
+    ul { list-style: none; margin: 8px 0 0; padding: 0; max-height: 220px; overflow: auto; }
+    li { padding: 6px 0; border-top: 1px solid #eef2f7; font-size: 12px; }
+    li .host { font-weight: 600; }
+    li .meta { color: #64748b; }
+    .actions { display: flex; gap: 8px; margin-top: 10px; }
+    button { flex: 1; padding: 7px; border: 0; border-radius: 7px; cursor: pointer;
+             background: #0d9488; color: #fff; font-weight: 600; }
+    button.secondary { background: #475569; }
+    .empty { color: #94a3b8; padding: 10px 0; }
+    a { color: #0d9488; }
+  </style>
+</head>
+<body>
+  <h1>FundingHub Cart Tracker</h1>
+  <div class="row">
+    <span id="state" class="pill">…</span>
+    <span id="endpoint" class="meta" style="font-size:11px;color:#64748b"></span>
+  </div>
+  <div class="row">
+    <span>Pending to send</span><span id="queue" class="pill">0</span>
+  </div>
+
+  <ul id="recent"><li class="empty">No captures yet.</li></ul>
+
+  <div class="actions">
+    <button id="toggle" class="secondary">…</button>
+    <button id="flush">Send now</button>
+  </div>
+  <div style="margin-top:8px;text-align:center">
+    <a href="#" id="opts">Settings</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

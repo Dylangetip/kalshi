@@ -1,0 +1,5 @@
+.venv/
+captures.db
+captures.db-*
+__pycache__/
+.env
