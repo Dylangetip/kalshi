@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>FundingHub Cart Tracker — Options</title>
+  <title>Vendor Capture — Settings</title>
   <style>
     :root { color-scheme: light dark; }
     body { font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -13,7 +13,6 @@
     label { display: block; font-weight: 600; margin: 16px 0 4px; }
     input[type=text], input[type=password] { width: 100%; padding: 8px 10px;
       border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box; }
-    .row { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
     .hint { color: #6b7280; font-size: 12px; margin-top: 4px; }
     button { margin-top: 20px; padding: 9px 16px; border: 0; border-radius: 8px;
       background: #0d9488; color: #fff; font-weight: 600; cursor: pointer; }
@@ -23,24 +22,22 @@
   </style>
 </head>
 <body>
-  <h1>FundingHub Cart Tracker</h1>
-  <p class="sub">Where should captured cart items be sent?</p>
+  <h1>Vendor Capture — Settings</h1>
+  <p class="sub">Connect the extension to your FundingHub platform.</p>
 
-  <label for="endpoint">Endpoint URL</label>
-  <input id="endpoint" type="text" placeholder="https://fundinghubdev.braintree4me.com/api/captures" />
-  <div class="hint">Captures are POSTed here as JSON.</div>
+  <label for="baseUrl">Platform base URL</label>
+  <input id="baseUrl" type="text" placeholder="https://fundinghubdev.braintree4me.com" />
+  <div class="hint">The extension calls <code>&lt;base&gt;/api/draft-lines</code>,
+    <code>/api/preapproval</code>, and <code>/api/drafts</code>.</div>
 
-  <label for="apiKey">API key (optional)</label>
+  <label for="apiKey">Parent session token / API key</label>
   <input id="apiKey" type="password" placeholder="sent as Authorization: Bearer …" />
-
-  <div class="row">
-    <input id="enabled" type="checkbox" />
-    <label for="enabled" style="margin:0">Tracking enabled</label>
-  </div>
+  <div class="hint">In production this comes from the parent's platform login (E2);
+    paste a token here for testing.</div>
 
   <div>
     <button id="save">Save</button>
-    <button id="test" class="secondary">Send test capture</button>
+    <button id="test" class="secondary">Send test draft line</button>
   </div>
   <div id="status"></div>
 

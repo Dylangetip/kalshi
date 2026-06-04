@@ -1,20 +1,28 @@
-/* FundingHub Cart Tracker — background service worker.
+/* FundingHub / AYL Vendor Capture — background service worker.
  *
- * Owns configuration and all network I/O. Content scripts send capture
- * payloads here; we tag them with the install's client id, POST them to the
- * configured endpoint, and buffer to an on-disk retry queue when the network
- * (or config) isn't ready. A periodic alarm flushes the queue.
+ * Owns configuration, the capture-session state (Start / Pause), and all
+ * network I/O. Content scripts ask for state, run pre-approval checks, and
+ * submit draft lines through here. Submissions that can't be delivered are
+ * buffered to an on-disk retry queue and flushed by a periodic alarm.
+ *
+ * Endpoints (relative to the configured platform base URL):
+ *   POST <base>/api/draft-lines       create a draft line
+ *   GET  <base>/api/preapproval       pre-approval lookup (url / asin)
+ *   GET  <base>/api/drafts            list the parent's drafts
  */
 
 const RECENT_MAX = 20;
 const QUEUE_MAX = 300;
 const FLUSH_ALARM = "fh-flush";
 
+const DEFAULT_DRAFT = { id: "default", name: "My Draft" };
+
 chrome.runtime.onInstalled.addListener(async () => {
-  const cur = await chrome.storage.local.get(["clientId", "enabled"]);
+  const cur = await chrome.storage.local.get(["clientId", "capturing", "currentDraft"]);
   const patch = {};
   if (!cur.clientId) patch.clientId = crypto.randomUUID();
-  if (cur.enabled === undefined) patch.enabled = true;
+  if (cur.capturing === undefined) patch.capturing = false; // off until the parent starts
+  if (!cur.currentDraft) patch.currentDraft = DEFAULT_DRAFT;
   if (Object.keys(patch).length) await chrome.storage.local.set(patch);
   chrome.alarms.create(FLUSH_ALARM, { periodInMinutes: 1 });
   refreshBadge();
@@ -31,94 +39,169 @@ chrome.alarms.onAlarm.addListener((a) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg && msg.type === "capture") {
-    handleCapture(msg.payload, sender)
-      .then(() => sendResponse({ ok: true }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true; // keep the channel open for the async response
-  }
-  if (msg && msg.type === "flushNow") {
-    flushQueue().then((n) => sendResponse({ ok: true, sent: n }));
-    return true;
-  }
-  if (msg && msg.type === "sendTest") {
-    sendTest().then((r) => sendResponse(r));
-    return true;
-  }
-  return false;
+  const handlers = {
+    getState: () => getState(),
+    setCapturing: () => setCapturing(!!msg.on),
+    setDraft: () => setDraft(msg.draft),
+    refreshDrafts: () => fetchDrafts(),
+    preapproval: () => preapproval(msg),
+    addToDraft: () => addToDraft(msg.payload, sender),
+    flushNow: () => flushQueue().then((sent) => ({ ok: true, sent })),
+    sendTest: () => sendTest()
+  };
+  const h = handlers[msg && msg.type];
+  if (!h) return false;
+  Promise.resolve(h())
+    .then((r) => sendResponse(r))
+    .catch((e) => sendResponse({ ok: false, error: String(e) }));
+  return true; // async response
 });
 
-async function handleCapture(payload, sender) {
-  const cfg = await chrome.storage.local.get(["endpoint", "apiKey", "clientId", "recent"]);
+/* ------------------------------- session -------------------------------- */
+
+async function getState() {
+  const c = await chrome.storage.local.get(["capturing", "currentDraft", "drafts", "baseUrl", "queue", "startedAt"]);
+  return {
+    ok: true,
+    capturing: !!c.capturing,
+    currentDraft: c.currentDraft || DEFAULT_DRAFT,
+    drafts: Array.isArray(c.drafts) && c.drafts.length ? c.drafts : [DEFAULT_DRAFT],
+    baseUrl: c.baseUrl || "",
+    queueLen: Array.isArray(c.queue) ? c.queue.length : 0,
+    startedAt: c.startedAt || null
+  };
+}
+
+async function setCapturing(on) {
+  await chrome.storage.local.set({
+    capturing: on,
+    startedAt: on ? Date.now() : null,
+    sessionSeen: [] // reset the per-session auto-capture de-dup set
+  });
+  refreshBadge();
+  return { ok: true, capturing: on };
+}
+
+async function setDraft(draft) {
+  if (draft && draft.id) await chrome.storage.local.set({ currentDraft: draft });
+  return { ok: true };
+}
+
+/* ------------------------------- drafts --------------------------------- */
+
+async function fetchDrafts() {
+  const { baseUrl, apiKey } = await chrome.storage.local.get(["baseUrl", "apiKey"]);
+  if (!baseUrl) return { ok: false, error: "No base URL configured" };
+  try {
+    const res = await fetch(baseUrl.replace(/\/$/, "") + "/api/drafts", {
+      headers: authHeaders(apiKey),
+      credentials: "omit"
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const drafts = Array.isArray(data.drafts) ? data.drafts : [];
+    if (drafts.length) await chrome.storage.local.set({ drafts });
+    return { ok: true, drafts };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/* ----------------------------- pre-approval ----------------------------- */
+
+async function preapproval({ url, asin, site }) {
+  const { baseUrl, apiKey } = await chrome.storage.local.get(["baseUrl", "apiKey"]);
+  if (!baseUrl) return { status: "unknown" };
+  try {
+    const q = new URLSearchParams();
+    if (url) q.set("url", url);
+    if (asin) q.set("asin", asin);
+    if (site) q.set("site", site);
+    const res = await fetch(baseUrl.replace(/\/$/, "") + "/api/preapproval?" + q.toString(), {
+      headers: authHeaders(apiKey),
+      credentials: "omit"
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    // Normalize to: preapproved | review | unknown
+    return { status: data.preapproved ? "preapproved" : (data.status || "review") };
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+/* --------------------------- submit draft line -------------------------- */
+
+async function addToDraft(payload, sender) {
+  const cfg = await chrome.storage.local.get(["baseUrl", "apiKey", "clientId", "currentDraft", "recent"]);
   payload.clientId = cfg.clientId || null;
   payload.extensionVersion = chrome.runtime.getManifest().version;
+  if (!payload.draft) payload.draft = cfg.currentDraft || DEFAULT_DRAFT;
   if (sender && sender.tab && sender.tab.url) payload.tabUrl = sender.tab.url;
 
-  // Keep a small recent-captures log for the popup UI.
+  // Recent log for the popup.
   const recent = Array.isArray(cfg.recent) ? cfg.recent : [];
   recent.unshift({
     t: payload.capturedAt,
-    type: payload.type,
+    source: payload.source || "manual",
     site: payload.site,
     host: payload.hostname,
-    asin: (payload.amazon && payload.amazon.asin) || null,
-    items: Array.isArray(payload.items) ? payload.items.length : null
+    title: payload.product && payload.product.title,
+    asin: payload.product && payload.product.asin,
+    qty: payload.quantity || 1,
+    draft: payload.draft && payload.draft.name
   });
   recent.splice(RECENT_MAX);
   await chrome.storage.local.set({ recent });
 
-  if (!cfg.endpoint) {
+  if (!cfg.baseUrl) {
     await enqueue(payload);
-    return;
+    return { ok: true, queued: true, status: payload.preapproval || "unknown" };
   }
   try {
-    await postCapture(cfg.endpoint, cfg.apiKey, payload);
+    const result = await postDraftLine(cfg.baseUrl, cfg.apiKey, payload);
+    refreshBadge();
+    return { ok: true, status: result.status || payload.preapproval || "review", draftName: (payload.draft || {}).name };
   } catch (e) {
     await enqueue(payload);
-    throw e;
+    return { ok: false, queued: true, error: String(e) };
   }
-  refreshBadge();
 }
 
-async function postCapture(endpoint, apiKey, payload) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = "Bearer " + apiKey;
-  if (payload.clientId) headers["X-Client-Id"] = payload.clientId;
-
-  const res = await fetch(endpoint, {
+async function postDraftLine(baseUrl, apiKey, payload) {
+  const res = await fetch(baseUrl.replace(/\/$/, "") + "/api/draft-lines", {
     method: "POST",
-    headers,
+    headers: { "Content-Type": "application/json", ...authHeaders(apiKey, payload.clientId) },
     body: JSON.stringify(payload),
-    // Captures are anonymous telemetry; don't attach the user's site cookies.
     credentials: "omit"
   });
   if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json().catch(() => ({}));
 }
+
+/* ------------------------------ retry queue ----------------------------- */
 
 async function enqueue(payload) {
   const { queue } = await chrome.storage.local.get(["queue"]);
   const q = Array.isArray(queue) ? queue : [];
   q.push(payload);
-  if (q.length > QUEUE_MAX) q.splice(0, q.length - QUEUE_MAX); // drop oldest
+  if (q.length > QUEUE_MAX) q.splice(0, q.length - QUEUE_MAX);
   await chrome.storage.local.set({ queue: q });
   refreshBadge();
 }
 
-// Try to drain the retry queue. Returns the number of payloads sent.
 async function flushQueue() {
-  const cfg = await chrome.storage.local.get(["endpoint", "apiKey", "queue"]);
+  const cfg = await chrome.storage.local.get(["baseUrl", "apiKey", "queue"]);
   let q = Array.isArray(cfg.queue) ? cfg.queue : [];
-  if (!cfg.endpoint || q.length === 0) return 0;
-
+  if (!cfg.baseUrl || q.length === 0) return 0;
   let sent = 0;
   while (q.length) {
-    const item = q[0];
     try {
-      await postCapture(cfg.endpoint, cfg.apiKey, item);
+      await postDraftLine(cfg.baseUrl, cfg.apiKey, q[0]);
       q.shift();
       sent++;
     } catch {
-      break; // still offline / erroring — stop and keep the rest
+      break;
     }
   }
   await chrome.storage.local.set({ queue: q });
@@ -127,34 +210,52 @@ async function flushQueue() {
 }
 
 async function sendTest() {
-  const cfg = await chrome.storage.local.get(["endpoint", "apiKey", "clientId"]);
-  if (!cfg.endpoint) return { ok: false, error: "No endpoint configured" };
+  const cfg = await chrome.storage.local.get(["baseUrl", "apiKey", "clientId", "currentDraft"]);
+  if (!cfg.baseUrl) return { ok: false, error: "No base URL configured" };
   const payload = {
-    type: "test",
+    type: "draft_line",
+    source: "test",
     capturedAt: new Date().toISOString(),
-    url: "https://example.com/test",
+    url: "https://example.com/product/test",
     hostname: "example.com",
-    title: "FundingHub test capture",
     site: "generic",
-    html: "<div>test</div>",
+    quantity: 1,
+    draft: cfg.currentDraft || DEFAULT_DRAFT,
+    product: { title: "AYL test item", price: "1.00", currency: "USD" },
     clientId: cfg.clientId || null,
     extensionVersion: chrome.runtime.getManifest().version
   };
   try {
-    await postCapture(cfg.endpoint, cfg.apiKey, payload);
+    await postDraftLine(cfg.baseUrl, cfg.apiKey, payload);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
 }
 
+/* -------------------------------- helpers ------------------------------- */
+
+function authHeaders(apiKey, clientId) {
+  const h = {};
+  if (apiKey) h["Authorization"] = "Bearer " + apiKey;
+  if (clientId) h["X-Client-Id"] = clientId;
+  return h;
+}
+
 async function refreshBadge() {
-  const { queue } = await chrome.storage.local.get(["queue"]);
-  const n = Array.isArray(queue) ? queue.length : 0;
+  const { capturing, queue } = await chrome.storage.local.get(["capturing", "queue"]);
+  const pending = Array.isArray(queue) ? queue.length : 0;
   try {
-    await chrome.action.setBadgeBackgroundColor({ color: "#b45309" });
-    await chrome.action.setBadgeText({ text: n ? String(n) : "" });
+    if (capturing) {
+      await chrome.action.setBadgeBackgroundColor({ color: "#0d9488" });
+      await chrome.action.setBadgeText({ text: pending ? String(pending) : "ON" });
+    } else if (pending) {
+      await chrome.action.setBadgeBackgroundColor({ color: "#b45309" });
+      await chrome.action.setBadgeText({ text: String(pending) });
+    } else {
+      await chrome.action.setBadgeText({ text: "" });
+    }
   } catch {
-    /* action API not ready */
+    /* action not ready */
   }
 }

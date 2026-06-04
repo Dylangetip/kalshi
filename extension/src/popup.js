@@ -1,4 +1,5 @@
-/* Popup — status at a glance, enable/disable toggle, manual flush. */
+/* Popup — Start/Pause the capture session, pick the active draft, view
+ * recently added items, and flush anything pending. */
 
 const $ = (id) => document.getElementById(id);
 
@@ -10,57 +11,84 @@ function timeAgo(iso) {
   return Math.floor(s / 86400) + "d ago";
 }
 
-function describe(r) {
-  if (r.site === "amazon") {
-    if (r.asin) return "Amazon · ASIN " + r.asin;
-    if (r.items != null) return "Amazon cart · " + r.items + " items";
-    return "Amazon";
-  }
-  if (r.items != null) return "Cart · " + r.items + " items";
-  return "Product HTML";
+function send(msg) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(msg, (r) => {
+      void chrome.runtime.lastError;
+      resolve(r);
+    });
+  });
 }
 
 async function render() {
-  const cfg = await chrome.storage.local.get(["enabled", "endpoint", "recent", "queue"]);
-  const enabled = cfg.enabled !== false;
+  const st = (await send({ type: "getState" })) || {};
+  const { recent } = await chrome.storage.local.get(["recent"]);
 
-  const state = $("state");
-  state.textContent = enabled ? "Tracking on" : "Paused";
-  state.className = "pill " + (enabled ? "on" : "off");
-  $("toggle").textContent = enabled ? "Pause" : "Resume";
-
-  $("endpoint").textContent = cfg.endpoint ? "→ " + new URL(cfg.endpoint).host : "no endpoint set";
-  $("queue").textContent = Array.isArray(cfg.queue) ? cfg.queue.length : 0;
-
-  const recent = Array.isArray(cfg.recent) ? cfg.recent : [];
-  const ul = $("recent");
-  if (!recent.length) {
-    ul.innerHTML = '<li class="empty">No captures yet.</li>';
-    return;
+  // Start / Pause
+  const btn = $("start");
+  if (st.capturing) {
+    btn.textContent = "⏸ Pause capturing";
+    btn.className = "start on";
+    const since = st.startedAt ? " · started " + timeAgo(new Date(st.startedAt).toISOString()) : "";
+    $("session").textContent = "Capturing is on" + since;
+  } else {
+    btn.textContent = "▶ Start capturing";
+    btn.className = "start off";
+    $("session").textContent = "Paused — nothing is captured";
   }
-  ul.innerHTML = "";
-  recent.forEach((r) => {
-    const li = document.createElement("li");
-    const tag = r.type === "cart_snapshot" ? "cart" : r.type === "add_to_cart" ? "add" : r.type;
-    li.innerHTML =
-      '<span class="host"></span> <span class="meta"></span>';
-    li.querySelector(".host").textContent = r.host || "";
-    li.querySelector(".meta").textContent = `· ${tag} · ${describe(r)} · ${timeAgo(r.t)}`;
-    ul.appendChild(li);
+
+  // Draft selector
+  const sel = $("draft");
+  const drafts = (st.drafts && st.drafts.length) ? st.drafts : [{ id: "default", name: "My Draft" }];
+  const currentId = (st.currentDraft && st.currentDraft.id) || drafts[0].id;
+  sel.innerHTML = "";
+  drafts.forEach((d) => {
+    const o = document.createElement("option");
+    o.value = d.id;
+    o.textContent = d.name;
+    if (d.id === currentId) o.selected = true;
+    sel.appendChild(o);
   });
+
+  // Queue + endpoint
+  $("queue").textContent = st.queueLen || 0;
+  $("endpoint").textContent = st.baseUrl ? new URL(st.baseUrl).host : "no platform set";
+
+  // Recently added
+  const ul = $("recent");
+  const list = Array.isArray(recent) ? recent : [];
+  if (!list.length) {
+    ul.innerHTML = '<li class="empty">Nothing yet this session.</li>';
+  } else {
+    ul.innerHTML = "";
+    list.forEach((r) => {
+      const li = document.createElement("li");
+      const what =
+        r.site === "amazon" && r.asin ? "ASIN " + r.asin : r.title ? String(r.title).slice(0, 48) : r.host;
+      li.innerHTML = '<span class="t"></span><div class="m"></div>';
+      li.querySelector(".t").textContent = what;
+      li.querySelector(".m").textContent =
+        `${r.source === "auto" ? "auto" : "added"} · qty ${r.qty || 1} · ${r.draft || ""} · ${timeAgo(r.t)}`;
+      ul.appendChild(li);
+    });
+  }
 }
 
-$("toggle").addEventListener("click", async () => {
-  const { enabled } = await chrome.storage.local.get(["enabled"]);
-  await chrome.storage.local.set({ enabled: !(enabled !== false) });
+$("start").addEventListener("click", async () => {
+  const st = (await send({ type: "getState" })) || {};
+  await send({ type: "setCapturing", on: !st.capturing });
   render();
 });
 
-$("flush").addEventListener("click", () => {
-  chrome.runtime.sendMessage({ type: "flushNow" }, () => {
-    void chrome.runtime.lastError;
-    setTimeout(render, 400);
-  });
+$("draft").addEventListener("change", async (e) => {
+  const id = e.target.value;
+  const opt = e.target.selectedOptions[0];
+  await send({ type: "setDraft", draft: { id, name: opt.textContent } });
+});
+
+$("flush").addEventListener("click", async () => {
+  await send({ type: "flushNow" });
+  setTimeout(render, 400);
 });
 
 $("opts").addEventListener("click", (e) => {
@@ -68,4 +96,5 @@ $("opts").addEventListener("click", (e) => {
   chrome.runtime.openOptionsPage();
 });
 
-render();
+// Try to refresh the draft list from the platform, then render.
+send({ type: "refreshDrafts" }).finally(render);

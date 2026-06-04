@@ -1,104 +1,117 @@
-# FundingHub Cart Tracker
+# FundingHub Vendor Capture (AYL)
 
-A Chrome (Manifest V3) extension that captures what a user adds to their cart on
-**any** shopping site and forwards it to your FundingHub platform.
+A browser extension that lets a parent add vendor products to their FundingHub
+**draft** directly from any vendor's product page — no copy-pasting URLs or
+retyping titles/prices. Aligns with the *Vendor Capture Browser Extension* scope
+addendum (AYL — Automate Your Life).
 
-- **Amazon** → sends the **ASIN** (plus title/price when available).
-- **Every other site** → sends the relevant **HTML** so the backend can scrape
-  title, price, image, etc.
+- **Amazon** → captures the **URL / ASIN only** (no scraping).
+- **Every other vendor** → extracts **title, price, currency, image,
+  description, variant** (via JSON-LD / OpenGraph / heuristics), and also sends
+  the raw structured data + page HTML so the backend can verify.
 
-Two capture triggers (per the agreed scope):
+## Start / Pause — parent-initiated capture
 
-1. **Add-to-cart clicks** — a heuristic click listener that recognises
-   "Add to cart / bag / basket / Buy now" controls across arbitrary sites.
-2. **Cart / checkout pages** — when the user lands on a `/cart`, `/checkout`,
-   `/basket`, … page, the cart contents are scraped once per view.
+Capture is **off until the parent presses Start**. The popup has the master
+**Start / Pause** control:
+
+- **Start** → a session begins. On vendor product pages the extension now:
+  1. **auto-captures** the product into the parent's current draft (once per
+     product per session), and
+  2. shows a floating **"Add to Draft"** button for a deliberate add with a
+     **quantity** stepper and a **pre-approval badge**.
+- **Pause** → nothing is captured; the floating button disappears.
+
+The toolbar badge shows `ON` while a session is active (or the pending-sync
+count). The on-page button can be paused or dismissed per-site, and reflects the
+currently selected draft.
+
+> Cart-level capture (scraping a whole vendor checkout cart) is **out of scope**
+> per §5 of the addendum and is intentionally not implemented. Capture is
+> per-product, parent-initiated.
 
 ```
 extension/
-├── manifest.json
-├── icons/                 generated PNG icons
+├── manifest.json          MV3
+├── icons/
 ├── src/
-│   ├── content.js         detection + scraping (runs on every page)
-│   ├── background.js      config, network POST, retry queue, badge
-│   ├── options.html/js    set endpoint URL + API key, send a test capture
-│   └── popup.html/js      status, recent captures, pause/resume, flush
-└── server/                reference receiving endpoint (FastAPI)
-    ├── app.py             POST /api/captures, GET /api/captures
+│   ├── content.js         product detection, extraction, floating "Add to Draft" UI, auto-capture
+│   ├── background.js      session state, draft submission, pre-approval, retry queue, badge
+│   ├── popup.html/js      Start/Pause, draft selector, recently-added, flush
+│   └── options.html/js    platform base URL + parent token, test submission
+└── server/                reference receiver (FastAPI)
+    ├── app.py             /api/draft-lines, /api/preapproval, /api/drafts
     ├── scrape.py          JSON-LD / OpenGraph / heuristic product scraper
     └── requirements.txt
 ```
 
-## Install the extension (load unpacked)
+## Install (load unpacked)
 
-1. Open `chrome://extensions`.
-2. Toggle **Developer mode** (top right).
-3. Click **Load unpacked** and select the `extension/` folder.
-4. Click the extension icon → **Settings**, set your **Endpoint URL** (e.g.
-   `https://fundinghubdev.braintree4me.com/api/captures`) and an **API key**,
-   then **Save**. Use **Send test capture** to confirm connectivity.
+1. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**,
+   select the `extension/` folder.
+2. Extension icon → **Settings**: set the **Platform base URL** (e.g.
+   `https://fundinghubdev.braintree4me.com`) and a **parent token**, **Save**,
+   then **Send test draft line** to confirm connectivity.
+3. Open the popup, pick a **Draft**, press **▶ Start capturing**, and browse a
+   vendor product page.
 
-The extension works offline: if the endpoint is unreachable, captures are
-queued in local storage and retried automatically (and on demand via the popup
-"Send now" button). The toolbar badge shows the pending count.
+Works offline: submissions that can't be delivered are queued locally and retried
+automatically (and on demand via the popup's **Send pending** button).
 
 ## Endpoint contract
 
-The extension `POST`s JSON to your configured endpoint with these headers:
+Base URL is configured in options. The extension calls:
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| `POST` | `/api/draft-lines` | create a draft line from a captured product |
+| `GET`  | `/api/preapproval?url=&asin=&site=` | pre-approval lookup → `{ "preapproved": bool, "status": "preapproved"\|"review" }` |
+| `GET`  | `/api/drafts` | the parent's drafts → `{ "drafts": [{ "id", "name" }] }` |
+
+Headers on every request:
 
 ```
-Content-Type: application/json
-Authorization: Bearer <your api key>     (only if a key is set)
+Authorization: Bearer <parent token>     (if set)
 X-Client-Id: <anonymous per-install uuid>
 ```
 
-> Requests are sent with `credentials: "omit"` — the visited site's cookies are
-> never attached. Respond `2xx` to acknowledge; any other status makes the
-> extension re-queue and retry.
+Requests use `credentials: "omit"` — the vendor site's cookies are never
+attached. Respond `2xx` to acknowledge; any other status re-queues the line.
 
-### Payload shapes
+### `POST /api/draft-lines` payload
 
-**Amazon — add to cart**
+**Amazon (ASIN only):**
 ```json
 {
-  "type": "add_to_cart",
-  "site": "amazon",
-  "capturedAt": "2026-06-04T12:00:00.000Z",
-  "url": "https://www.amazon.com/dp/B0CXYZ1234",
-  "hostname": "www.amazon.com",
-  "title": "Acme Widget",
-  "amazon": { "asin": "B0CXYZ1234", "title": "Acme Widget", "price": "$19.99" },
-  "clientId": "…", "extensionVersion": "0.1.0"
+  "type": "draft_line", "source": "manual", "site": "amazon",
+  "url": "https://www.amazon.com/dp/B0CXYZ1234", "hostname": "www.amazon.com",
+  "quantity": 3,
+  "draft": { "id": "art-class", "name": "Art class" },
+  "product": { "asin": "B0CXYZ1234", "title": "Pencils", "price": "$9.99", "image": "…" }
 }
 ```
 
-**Non-Amazon — add to cart** (HTML sent for scraping; capped at ~400 KB)
+**Other vendor (extracted + HTML for verification):**
 ```json
 {
-  "type": "add_to_cart",
-  "site": "generic",
-  "url": "https://shop.example.com/p/blue-shoe",
-  "hostname": "shop.example.com",
-  "title": "Blue Shoe",
-  "html": "<div class='product'>…</div>",
-  "structured": { "jsonld": [ … ], "og": { "og:title": "…", "product:price:amount": "49.95" } },
-  "clientId": "…"
+  "type": "draft_line", "source": "auto", "site": "generic",
+  "url": "https://shop.example.com/p/glue", "hostname": "shop.example.com",
+  "quantity": 1,
+  "draft": { "id": "fall-2026", "name": "Fall 2026 supplies" },
+  "product": {
+    "title": "Glue Stick", "price": "2.50", "currency": "USD",
+    "image": "…", "description": "…", "variant": "Color: Clear"
+  },
+  "structured": { "jsonld": [ … ], "og": { … } },
+  "html": "<…trimmed page html…>"
 }
 ```
 
-**Cart / checkout snapshot** (`type: "cart_snapshot"`)
-- Amazon: `items: [{ "asin", "title", "price", "quantity" }]`
-- Generic: `html` of the cart container + best-effort
-  `items: [{ "name", "price", "url", "image" }]`
-
-`structured` carries any schema.org `Product` JSON-LD and OpenGraph/`product:`
-meta tags the page exposed, so your scraper often doesn't need to parse the raw
-HTML at all.
+`source` is `"auto"` (auto-captured on page view) or `"manual"` (the parent
+clicked **Add to Draft**). The server returns
+`{ "ok": true, "id", "status": "preapproved"|"review", "product", "quantity" }`.
 
 ## Reference server
-
-A runnable implementation of the contract above — stores captures in SQLite and
-scrapes generic HTML.
 
 ```bash
 cd extension/server
@@ -107,53 +120,72 @@ pip install -r requirements.txt
 API_TOKEN=dev-secret uvicorn app:app --reload --port 8787
 ```
 
-- `POST /api/captures` — ingest one capture (Amazon → stores ASIN; generic →
-  runs `scrape_product` on the HTML).
-- `GET  /api/captures?limit=50&site=amazon` — list recent captures.
-- `GET  /health`
+- Stores draft lines in SQLite; scrapes generic HTML to fill missing fields.
+- Demo pre-approval: anything on `iew.com` (or ASIN `B0PREAPPROVED`) returns
+  `preapproved`; everything else returns `review`.
+- `GET /api/draft-lines` lists what's been received (debug).
 
-Set the extension's endpoint to `http://localhost:8787/api/captures` and API key
-to `dev-secret` to try it locally. Leave `API_TOKEN` empty to disable auth in
-dev.
+Point the extension at `http://localhost:8787` with token `dev-secret` to try it
+locally (leave `API_TOKEN` empty to disable auth in dev).
 
-### Wiring into the real platform (PHP/Laravel sketch)
-
-The extension only cares about the JSON shape + Bearer token, so on
-`fundinghubdev` you'd add roughly:
+### Wiring into the real platform (Laravel sketch)
 
 ```php
 // routes/api.php
-Route::post('/captures', [CaptureController::class, 'store']);
+Route::middleware('auth.parent')->group(function () {
+    Route::get('/drafts',       [DraftController::class, 'index']);
+    Route::get('/preapproval',  [CatalogController::class, 'check']);
+    Route::post('/draft-lines', [DraftLineController::class, 'store']);
+});
 
-// CaptureController@store
+// DraftLineController@store
 public function store(Request $r) {
-    if ($r->bearerToken() !== config('services.tracker.token')) abort(401);
     $p = $r->all();
-    if (($p['site'] ?? '') === 'amazon') {
-        $asin = $p['amazon']['asin'] ?? null;     // store the ASIN
-    } else {
-        $html = $p['html'] ?? '';                 // queue for scraping
-    }
-    Capture::create([
-        'type'      => $p['type'] ?? null,
-        'site'      => $p['site'] ?? null,
-        'hostname'  => $p['hostname'] ?? null,
-        'url'       => $p['url'] ?? null,
-        'asin'      => $asin ?? null,
-        'client_id' => $r->header('X-Client-Id'),
-        'payload'   => json_encode($p),
+    $asin = $p['product']['asin'] ?? ($p['amazon']['asin'] ?? null);
+    $status = Catalog::isPreapproved($p['url'] ?? null, $asin) ? 'preapproved' : 'review';
+    $line = DraftLine::create([
+        'draft_id' => $p['draft']['id'] ?? null,
+        'source'   => $p['source'] ?? null,
+        'site'     => $p['site'] ?? null,
+        'url'      => $p['url'] ?? null,
+        'asin'     => $asin,
+        'quantity' => $p['quantity'] ?? 1,
+        'fields'   => $p['product'] ?? [],
+        'status'   => $status,
     ]);
-    return response()->json(['ok' => true]);
+    if ($status !== 'preapproved') AiGrade::dispatch($line);   // F2 → staff review (F3)
+    return response()->json(['ok' => true, 'id' => $line->id, 'status' => $status]);
 }
 ```
 
-## Notes & limitations
+## Scope status
 
-- Add-to-cart detection is heuristic (text/aria/class/id keyword matching with a
-  negative list to skip "view cart"/"remove"). Sites with unlabelled custom
-  buttons may be missed; tune `ADD_KEYWORDS` / selectors in `content.js`.
-- HTML payloads are capped at ~400 KB to keep requests reasonable.
-- `clientId` is a random per-install UUID (anonymous), not tied to a user.
-- Make sure users are informed and consent — this extension reports browsing/cart
-  activity to your servers, which Chrome Web Store policy and privacy law require
-  you to disclose.
+Implemented in this repo (front-end + reference backend):
+
+- **E3** floating "Add to Draft" button, current-draft display + inline switch
+  (popup), quantity stepper, per-site dismiss.
+- **E4** pre-approval badge before/after add.
+- **E5** product extraction (title/price/currency/image/description/variant;
+  Amazon via ASIN) with JSON-LD/OpenGraph + heuristic fallback.
+- **E6** draft-line submission; non-catalog items land in the review path.
+- **F1** pre-approval matching (reference catalog) and **F4** Amazon ASIN-only
+  path.
+- Plus the requested **Start / Pause** session control and **auto-capture**.
+
+Larger workstreams represented as stubs / left for the platform team:
+
+- **E1** Chrome Web Store + Firefox Add-ons publishing (needs school-owned
+  developer accounts — §6).
+- **E2** parent SSO into the extension (here: a pasted token).
+- **F2/F3** AI grading + staff-review-queue UI (server marks `review`; grading
+  job is a stub).
+
+## Notes
+
+- Product-page detection and variant extraction are heuristic; recognized
+  vendors (Target, Best Buy, IEW, …) can get tailored paths server-side (F4)
+  without re-shipping the extension.
+- `clientId` is an anonymous per-install UUID.
+- Because the extension reports captured product activity to your servers,
+  ensure parents are informed and consent (Chrome/Firefox store policy + privacy
+  law). Start/Pause keeps capture explicit and parent-controlled.

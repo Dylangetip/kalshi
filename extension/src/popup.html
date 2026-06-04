@@ -2,43 +2,58 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>FundingHub Cart Tracker</title>
+  <title>Vendor Capture</title>
   <style>
-    body { font: 13px/1.45 system-ui, sans-serif; width: 300px; margin: 0; padding: 12px; }
-    h1 { font-size: 14px; margin: 0 0 8px; }
-    .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+    body { font: 13px/1.45 system-ui, sans-serif; width: 320px; margin: 0; padding: 14px; color: #0f172a; }
+    h1 { font-size: 15px; margin: 0 0 2px; }
+    .sub { color: #64748b; font-size: 12px; margin: 0 0 12px; }
+
+    .start { width: 100%; padding: 14px; border: 0; border-radius: 12px; font-size: 15px;
+             font-weight: 800; cursor: pointer; color: #fff; }
+    .start.off { background: #0d9488; }
+    .start.on  { background: #b45309; }
+    .session { text-align: center; color: #64748b; font-size: 12px; margin: 6px 0 12px; min-height: 14px; }
+
+    .field { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0; }
+    .field label { color: #475569; }
+    select { flex: 1; padding: 7px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
     .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #e2e8f0; color: #334155; }
-    .pill.on { background: #ccfbf1; color: #0f766e; }
-    .pill.off { background: #fee2e2; color: #b91c1c; }
-    ul { list-style: none; margin: 8px 0 0; padding: 0; max-height: 220px; overflow: auto; }
+
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #94a3b8; margin: 14px 0 4px; }
+    ul { list-style: none; margin: 0; padding: 0; max-height: 180px; overflow: auto; }
     li { padding: 6px 0; border-top: 1px solid #eef2f7; font-size: 12px; }
-    li .host { font-weight: 600; }
-    li .meta { color: #64748b; }
-    .actions { display: flex; gap: 8px; margin-top: 10px; }
-    button { flex: 1; padding: 7px; border: 0; border-radius: 7px; cursor: pointer;
-             background: #0d9488; color: #fff; font-weight: 600; }
-    button.secondary { background: #475569; }
-    .empty { color: #94a3b8; padding: 10px 0; }
+    li .t { font-weight: 600; }
+    li .m { color: #64748b; }
+    .empty { color: #94a3b8; padding: 8px 0; }
+
+    .row { display: flex; gap: 8px; margin-top: 12px; }
+    .row button { flex: 1; padding: 7px; border: 0; border-radius: 8px; background: #475569; color: #fff;
+                  font-weight: 600; cursor: pointer; }
+    .foot { display: flex; justify-content: space-between; margin-top: 10px; font-size: 12px; color: #64748b; }
     a { color: #0d9488; }
   </style>
 </head>
 <body>
-  <h1>FundingHub Cart Tracker</h1>
-  <div class="row">
-    <span id="state" class="pill">…</span>
-    <span id="endpoint" class="meta" style="font-size:11px;color:#64748b"></span>
-  </div>
-  <div class="row">
-    <span>Pending to send</span><span id="queue" class="pill">0</span>
+  <h1>Vendor Capture</h1>
+  <p class="sub">Press start when you begin ordering, then add items to your draft from any vendor.</p>
+
+  <button id="start" class="start off">▶ Start capturing</button>
+  <div id="session" class="session"></div>
+
+  <div class="field">
+    <label for="draft">Draft</label>
+    <select id="draft"></select>
   </div>
 
-  <ul id="recent"><li class="empty">No captures yet.</li></ul>
+  <h2>Recently added</h2>
+  <ul id="recent"><li class="empty">Nothing yet this session.</li></ul>
 
-  <div class="actions">
-    <button id="toggle" class="secondary">…</button>
-    <button id="flush">Send now</button>
+  <div class="row">
+    <button id="flush">Send pending (<span id="queue">0</span>)</button>
   </div>
-  <div style="margin-top:8px;text-align:center">
+
+  <div class="foot">
+    <span id="endpoint"></span>
     <a href="#" id="opts">Settings</a>
   </div>
 

@@ -1,4 +1,4 @@
-/* Options page logic — load/save settings, run a test capture. */
+/* Options — connect the extension to the FundingHub platform. */
 
 const $ = (id) => document.getElementById(id);
 
@@ -10,27 +10,21 @@ function setStatus(msg, ok = true) {
 }
 
 async function load() {
-  const cfg = await chrome.storage.local.get(["endpoint", "apiKey", "enabled", "clientId", "queue"]);
-  $("endpoint").value = cfg.endpoint || "";
+  const cfg = await chrome.storage.local.get(["baseUrl", "apiKey", "clientId", "queue"]);
+  $("baseUrl").value = cfg.baseUrl || "";
   $("apiKey").value = cfg.apiKey || "";
-  $("enabled").checked = cfg.enabled !== false;
   $("clientId").textContent = cfg.clientId || "(set on install)";
   $("queue").textContent = Array.isArray(cfg.queue) ? cfg.queue.length : 0;
 }
 
 async function save() {
-  let endpoint = $("endpoint").value.trim();
-  if (endpoint && !/^https?:\/\//i.test(endpoint)) {
-    setStatus("Endpoint must start with http(s)://", false);
+  let baseUrl = $("baseUrl").value.trim().replace(/\/$/, "");
+  if (baseUrl && !/^https?:\/\//i.test(baseUrl)) {
+    setStatus("Base URL must start with http(s)://", false);
     return;
   }
-  await chrome.storage.local.set({
-    endpoint,
-    apiKey: $("apiKey").value.trim(),
-    enabled: $("enabled").checked
-  });
+  await chrome.storage.local.set({ baseUrl, apiKey: $("apiKey").value.trim() });
   setStatus("Saved ✓");
-  // Saving a working endpoint is a good moment to drain anything queued.
   chrome.runtime.sendMessage({ type: "flushNow" }, () => void chrome.runtime.lastError);
 }
 
@@ -38,7 +32,7 @@ function test() {
   setStatus("Sending…");
   chrome.runtime.sendMessage({ type: "sendTest" }, (r) => {
     if (chrome.runtime.lastError) { setStatus(chrome.runtime.lastError.message, false); return; }
-    if (r && r.ok) setStatus("Test capture delivered ✓");
+    if (r && r.ok) setStatus("Test draft line delivered ✓");
     else setStatus("Failed: " + ((r && r.error) || "unknown"), false);
   });
 }

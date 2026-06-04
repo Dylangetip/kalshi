@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "FundingHub Cart Tracker",
-  "version": "0.1.0",
-  "description": "Captures items added to cart on any shopping site and forwards them to your FundingHub platform (Amazon → ASIN, everything else → HTML to scrape).",
+  "name": "FundingHub Vendor Capture",
+  "version": "0.2.0",
+  "description": "Parent-initiated capture: press Start, then add vendor products to your FundingHub draft from any site (Amazon → ASIN, everything else → extracted product data).",
   "permissions": ["storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -10,7 +10,7 @@
   },
   "action": {
     "default_popup": "src/popup.html",
-    "default_title": "FundingHub Cart Tracker",
+    "default_title": "FundingHub Vendor Capture",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
