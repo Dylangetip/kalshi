@@ -12,3 +12,7 @@ backend/bets.db-shm
 *.pem
 *.key
 backend/ml/models/*.pkl
+
+# Packaged extension build artifacts
+fundinghub-vendor-capture.zip
+extension/*.zip
